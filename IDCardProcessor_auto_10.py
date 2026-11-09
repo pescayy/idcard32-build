@@ -223,10 +223,109 @@ class CardDetectorAI:
         return [(float(q[0]), float(q[1])) for q in pts_ordered]
 
 
+def _enhance_idcard_bw(pil_img):
+    """身份证黑白增强：BT.601 灰度 + S 曲线 LUT（陡度 k=4，鱼还原配方）"""
+    arr = np.asarray(pil_img.convert('RGB')).astype(np.float32)
+    gray = arr[..., 0] * 0.299 + arr[..., 1] * 0.587 + arr[..., 2] * 0.114
+    i = np.arange(256, dtype=np.float32)
+    x = i / 255.0 - 0.5
+    t = -4.0 * x
+    f = (np.exp(t) - np.exp(-t)) / (np.exp(t) + np.exp(-t) + 1.0)
+    lut = np.clip((f + 1.0) / 2.0 * 255.0, 0, 255).astype(np.uint8)
+    out = lut[np.clip(gray, 0, 255).astype(np.uint8)]
+    return Image.fromarray(np.stack([out] * 3, axis=-1), 'RGB')
+
+
+def _enhance_idcard_color(pil_img):
+    """身份证彩色增强：灰世界白平衡，只统计通道值在 (30,225] 的像素，增益 clamp 到 [1.15, 30]（鱼还原配方）"""
+    arr = np.asarray(pil_img.convert('RGB')).astype(np.float32)
+    means = []
+    for c in range(3):
+        ch = arr[..., c]
+        sel = ch[(ch > 30) & (ch <= 225)]
+        means.append(float(sel.mean()) if sel.size else float(ch.mean()))
+    gray_mean = sum(means) / 3.0
+    out = arr.copy()
+    for c in range(3):
+        if means[c] > 0:
+            gain = min(max(gray_mean / means[c], 1.15), 30.0)
+            out[..., c] = np.clip(arr[..., c] * gain, 0, 255)
+    return Image.fromarray(out.astype(np.uint8), 'RGB')
+
+
+def _doc_three_band(v):
+    """文档模式三段处理：<=215 压黑，>=245 提纯白，中间线性拉伸（鱼还原的 215/245/255 阈值）"""
+    return np.clip((v - 215.0) / 30.0, 0.0, 1.0) * 255.0
+
+
+def _enhance_document_bw(pil_img):
+    """文档黑白：÷4 降采样求亮度均值 → 对比拉伸 → Gamma 2.5 → 三段阈值（鱼还原配方）"""
+    arr = np.asarray(pil_img.convert('L')).astype(np.float32)
+    h, w = arr.shape
+    small = np.asarray(pil_img.convert('L').resize((max(1, w // 4), max(1, h // 4)))).astype(np.float32)
+    mean = float(small.mean()) / 255.0
+    x = arr / 255.0
+    denom = 1.0 - 0.8 * mean
+    if abs(denom) > 1e-6:
+        x = (x - 0.8 * mean) / denom
+    x = np.clip(x, 0.0, 1.0) ** 2.5
+    out = _doc_three_band(x * 255.0).astype(np.uint8)
+    return Image.fromarray(np.stack([out] * 3, axis=-1), 'RGB')
+
+
+def _enhance_document_color(pil_img):
+    """文档彩色：亮度 ×1.2 → 对比拉伸 ×2.2 → Gamma 4 → 三段阈值（鱼还原配方）"""
+    arr = np.asarray(pil_img.convert('RGB')).astype(np.float32) / 255.0
+    x = np.clip(arr * 1.2, 0.0, 1.0)
+    x = np.clip((x - 0.5) * 2.2 + 0.5, 0.0, 1.0)
+    x = x ** 4.0
+    out = _doc_three_band(x * 255.0).astype(np.uint8)
+    return Image.fromarray(out, 'RGB')
+
+
+def _load_cjk_font(px):
+    for p in (r'C:\Windows\Fonts\msyh.ttc', r'C:\Windows\Fonts\simhei.ttf',
+              r'C:\Windows\Fonts\simsun.ttc', '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+              '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc'):
+        try:
+            if os.path.exists(p):
+                return ImageFont.truetype(p, px)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def _apply_watermark(page_img, text, font_px, opacity_pct, rows):
+    """整页平铺斜向水印（对齐 IDCardMerge 的安全水印：文字/字号/透明度/行数）"""
+    base = page_img.convert('RGBA')
+    W, H = base.size
+    overlay = Image.new('RGBA', (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font = _load_cjk_font(font_px)
+    alpha = max(0, min(255, int(opacity_pct * 255 / 100)))
+    color = (110, 110, 110, alpha)
+    try:
+        tw = draw.textlength(text, font=font)
+    except Exception:
+        tw = font_px * len(text)
+    step_x = int(tw + font_px * 2)
+    rows = max(1, rows)
+    for r in range(rows):
+        y = int((r + 0.5) * H / rows - font_px / 2)
+        x = -int((r % 2) * step_x / 2)
+        while x < W:
+            draw.text((x, y), text, font=font, fill=color)
+            x += step_x
+    overlay = overlay.rotate(30, resample=Image.Resampling.BICUBIC, center=(W // 2, H // 2))
+    return Image.alpha_composite(base, overlay).convert('RGB')
+
+
 class IDCardProcessor:
     def __init__(self, root):
         self.root = root
         self.root.title("证件图片处理器V3.0 - By: JuBai 公众号：云雪星球")
+        self.enhance_mode = "color"
+        self.enhance_var = None
         
         # 窗口默认800x900，但允许手动调整大小
         self.root.geometry("800x900")
@@ -240,6 +339,10 @@ class IDCardProcessor:
         self.card_image = None  # 银行卡图片
         self.front_points = []
         self.back_points = []
+        # 批量证件组（对齐 IDCardMerge 批量格子）
+        self.pairs = []
+        self.current_open = None
+        self._pair_photos = {}
         self.card_points = []   # 银行卡角点
         self.front_processed = None
         self.back_processed = None
@@ -347,11 +450,24 @@ class IDCardProcessor:
         
         ttk.Button(button_frame, text="提示操作", 
                   command=self.show_help, width=10).pack(side=tk.LEFT, padx=2)
+
+        # 增强模式选择（对齐 IDCardMerge 的彩色/黑白/文档模式）
+        enhance_frame = ttk.Frame(control_frame)
+        enhance_frame.pack(side=tk.LEFT, padx=(15, 0))
+        ttk.Label(enhance_frame, text="增强:").pack(side=tk.LEFT)
+        self.enhance_var = tk.StringVar(value="color")
+        for text, val in [("原图", "none"), ("彩色", "color"), ("黑白", "bw"), ("文档黑白", "docbw"), ("文档彩色", "doccolor")]:
+            ttk.Radiobutton(enhance_frame, text=text, value=val, variable=self.enhance_var,
+                            command=self._on_enhance_change).pack(side=tk.LEFT)
         
         # 状态标签
         self.status_var = tk.StringVar(value="就绪")
         status_label = ttk.Label(control_frame, textvariable=self.status_var, font=("Arial", 10))
         status_label.pack(side=tk.RIGHT, padx=10)
+        
+        # 批量证件组面板（对齐 IDCardMerge）
+        self.build_pairs_panel(main_frame)
+        self.build_settings_bar(main_frame)
         
         # A4预览区域 - 主工作区
         self.a4_frame = ttk.LabelFrame(main_frame, text="工作区域", padding=10)
@@ -868,6 +984,386 @@ class IDCardProcessor:
             if hasattr(self, 'back_processed') and self.back_processed is not None:
                 self.show_processed_result("back", self.back_processed)
     
+    def _new_slot(self):
+        return {'image': None, 'points': [], 'processed': None, 'path': None}
+
+    def _stash_workspace(self):
+        idx = getattr(self, 'current_open', None)
+        if idx is None or idx >= len(self.pairs):
+            return
+        pair = self.pairs[idx]
+        for side in ('front', 'back'):
+            pair[side]['image'] = getattr(self, side + '_image', None)
+            pts = getattr(self, side + '_points', []) or []
+            pair[side]['points'] = list(pts)
+            pair[side]['processed'] = getattr(self, side + '_processed', None)
+
+    def _load_pair_to_workspace(self, idx):
+        pair = self.pairs[idx]
+        for side in ('front', 'back'):
+            setattr(self, side + '_image', pair[side]['image'])
+            setattr(self, side + '_points', list(pair[side]['points']))
+            setattr(self, side + '_processed', pair[side]['processed'])
+        self.current_open = idx
+        try:
+            self.draw_a4_layout()
+        except Exception:
+            pass
+        for side in ('front', 'back'):
+            if pair[side]['processed'] is not None:
+                try:
+                    self.show_processed_result(side, pair[side]['processed'])
+                except Exception:
+                    pass
+
+    def open_pair(self, idx):
+        if idx < 0 or idx >= len(self.pairs):
+            return
+        self._stash_workspace()
+        self._load_pair_to_workspace(idx)
+        self.refresh_pairs_panel()
+
+    def add_pair(self):
+        self._stash_workspace()
+        self.pairs.append({'front': self._new_slot(), 'back': self._new_slot()})
+        idx = len(self.pairs) - 1
+        self._load_pair_to_workspace(idx)
+        self.refresh_pairs_panel()
+        return idx
+
+    def delete_pair(self, idx):
+        if 0 <= idx < len(self.pairs):
+            del self.pairs[idx]
+            if self.current_open is not None and self.current_open >= idx:
+                self.current_open = None
+            if self.pairs:
+                self._load_pair_to_workspace(min(idx, len(self.pairs) - 1))
+            else:
+                self.current_open = None
+            self.refresh_pairs_panel()
+
+    def swap_pair_sides(self, idx):
+        """正反面互换（青点名要的功能）：整组数据对调，含原图/角点/处理结果"""
+        if 0 <= idx < len(self.pairs):
+            pair = self.pairs[idx]
+            pair['front'], pair['back'] = pair['back'], pair['front']
+            if self.current_open == idx:
+                self._load_pair_to_workspace(idx)
+            self.refresh_pairs_panel()
+            self.update_status('已互换正反面')
+
+    def import_into_slot(self, idx, side, file_path=None):
+        self.open_pair(idx)
+        if not file_path:
+            file_path = filedialog.askopenfilename(
+                title='选择图片',
+                filetypes=[('图像文件', '*.jpg *.jpeg *.png *.bmp *.tiff'), ('所有文件', '*.*')])
+        if not file_path:
+            return
+        try:
+            image = Image.open(file_path)
+            image.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
+            self.pairs[idx][side]['path'] = file_path
+            self.show_image_for_marking(side, image, file_path)
+        except Exception as e:
+            messagebox.showerror('错误', f'加载图片失败: {str(e)}')
+
+    def batch_import(self):
+        """批量导入：按选择顺序两张一组（先正面后反面），逐张自动识别处理"""
+        files = filedialog.askopenfilenames(
+            title='批量选择证件照片（按正反面顺序）',
+            filetypes=[('图像文件', '*.jpg *.jpeg *.png *.bmp *.tiff'), ('所有文件', '*.*')])
+        if not files:
+            return
+        ok, manual = 0, 0
+        for start in range(0, len(files), 2):
+            idx = self.add_pair()
+            for off, side in enumerate(('front', 'back')):
+                if start + off >= len(files):
+                    break
+                path = files[start + off]
+                try:
+                    image = Image.open(path)
+                    image.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
+                except Exception:
+                    continue
+                self.pairs[idx][side]['path'] = path
+                setattr(self, side + '_image', image)
+                setattr(self, side + '_points', [])
+                corners = None
+                try:
+                    corners = self.ai_detect_corners(image) or self.detect_card_corners(image)
+                except Exception:
+                    corners = None
+                if corners:
+                    setattr(self, side + '_points', corners)
+                    self.finish_marking(side)
+                    ok += 1
+                else:
+                    manual += 1
+            self._stash_workspace()
+        self.refresh_pairs_panel()
+        self.update_status(f'批量导入完成：自动处理 {ok} 张，待手动标角 {manual} 张')
+
+    def on_slot_click(self, idx, side):
+        slot = self.pairs[idx][side]
+        if slot['image'] is None:
+            self.import_into_slot(idx, side)
+        elif slot['processed'] is not None:
+            self.open_pair(idx)
+            self.reopen_for_adjustment(side)
+        else:
+            self.open_pair(idx)
+            self.show_image_for_marking(side, slot['image'], slot['path'])
+
+    def build_pairs_panel(self, parent):
+        frame = ttk.LabelFrame(parent, text='证件组（批量）', padding=5)
+        frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
+        bar = ttk.Frame(frame)
+        bar.pack(fill=tk.X)
+        ttk.Button(bar, text='＋ 添加一组', command=self.add_pair, width=12).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text='批量导入', command=self.batch_import, width=12).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text='清空所有组', command=self._clear_pairs, width=12).pack(side=tk.LEFT, padx=2)
+        self.pairs_count_var = tk.StringVar(value='共 0 组')
+        ttk.Label(bar, textvariable=self.pairs_count_var).pack(side=tk.LEFT, padx=10)
+        wrap = ttk.Frame(frame)
+        wrap.pack(fill=tk.X)
+        self.pairs_canvas = tk.Canvas(wrap, height=118, highlightthickness=0)
+        sb = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=self.pairs_canvas.yview)
+        self.pairs_canvas.configure(yscrollcommand=sb.set)
+        self.pairs_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.pairs_list_frame = ttk.Frame(self.pairs_canvas)
+        self.pairs_canvas.create_window((0, 0), window=self.pairs_list_frame, anchor='nw')
+        self.pairs_list_frame.bind('<Configure>', lambda e: self.pairs_canvas.configure(scrollregion=self.pairs_canvas.bbox('all')))
+        self.pairs.append({'front': self._new_slot(), 'back': self._new_slot()})
+        self.current_open = 0
+        self.refresh_pairs_panel()
+
+    def _clear_pairs(self):
+        self.pairs = []
+        self.current_open = None
+        self._pair_photos = {}
+        for side in ('front', 'back'):
+            setattr(self, side + '_image', None)
+            setattr(self, side + '_points', [])
+            setattr(self, side + '_processed', None)
+        self.add_pair()
+        try:
+            self.draw_a4_layout()
+        except Exception:
+            pass
+
+    def refresh_pairs_panel(self):
+        if not hasattr(self, 'pairs_list_frame'):
+            return
+        for child in self.pairs_list_frame.winfo_children():
+            child.destroy()
+        self._pair_photos = {}
+        if hasattr(self, 'pairs_count_var'):
+            self.pairs_count_var.set(f'共 {len(self.pairs)} 组')
+        for idx, pair in enumerate(self.pairs):
+            row = ttk.Frame(self.pairs_list_frame)
+            row.pack(fill=tk.X, pady=2)
+            mark = '●' if self.current_open == idx else '○'
+            ttk.Label(row, text=f'{mark} 组{idx + 1}').pack(side=tk.LEFT, padx=(2, 6))
+            for side, label in (('front', '正面'), ('back', '反面')):
+                slot = pair[side]
+                if slot['processed'] is not None:
+                    state, src_img = '已处理', slot['processed']
+                elif slot['image'] is not None:
+                    state, src_img = '待标角', slot['image']
+                else:
+                    state, src_img = '未导入', None
+                if src_img is not None:
+                    thumb = src_img.copy()
+                    thumb.thumbnail((132, 84), Image.Resampling.LANCZOS)
+                    photo = ImageTk.PhotoImage(thumb)
+                    self._pair_photos[(idx, side)] = photo
+                    w = ttk.Label(row, image=photo)
+                else:
+                    w = ttk.Label(row, text=f'{label}\n{state}', width=14, relief=tk.GROOVE, anchor=tk.CENTER)
+                w.pack(side=tk.LEFT, padx=2)
+                w.bind('<Button-1>', lambda e, i=idx, s=side: self.on_slot_click(i, s))
+                if slot['image'] is not None:
+                    ttk.Label(row, text=state).pack(side=tk.LEFT)
+                if DRAG_DROP_SUPPORTED:
+                    try:
+                        w.drop_target_register(DND_FILES)
+                        w.dnd_bind('<<Drop>>', lambda e, i=idx, s=side: self.import_into_slot(i, s, e.data.strip().strip('{}').split('} {')[0]))
+                    except Exception:
+                        pass
+            ttk.Button(row, text='正反互换', command=lambda i=idx: self.swap_pair_sides(i), width=9).pack(side=tk.LEFT, padx=4)
+            ttk.Button(row, text='打开', command=lambda i=idx: self.open_pair(i), width=6).pack(side=tk.LEFT)
+            ttk.Button(row, text='删', command=lambda i=idx: self.delete_pair(i), width=4).pack(side=tk.LEFT)
+
+
+    def build_settings_bar(self, parent):
+        bar = ttk.LabelFrame(parent, text='输出设置', padding=5)
+        bar.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
+        self.wm_enabled_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text='安全水印', variable=self.wm_enabled_var).pack(side=tk.LEFT)
+        self.wm_text_var = tk.StringVar(value='')
+        ttk.Entry(bar, textvariable=self.wm_text_var, width=22).pack(side=tk.LEFT, padx=2)
+        ttk.Label(bar, text='字号').pack(side=tk.LEFT)
+        self.wm_size_var = tk.IntVar(value=7)
+        ttk.Spinbox(bar, from_=4, to=14, textvariable=self.wm_size_var, width=4).pack(side=tk.LEFT)
+        ttk.Label(bar, text='透明度%').pack(side=tk.LEFT)
+        self.wm_opacity_var = tk.IntVar(value=18)
+        ttk.Spinbox(bar, from_=5, to=60, textvariable=self.wm_opacity_var, width=4).pack(side=tk.LEFT)
+        ttk.Label(bar, text='行数').pack(side=tk.LEFT)
+        self.wm_rows_var = tk.IntVar(value=3)
+        ttk.Spinbox(bar, from_=1, to=6, textvariable=self.wm_rows_var, width=4).pack(side=tk.LEFT)
+        ttk.Label(bar, text='排版').pack(side=tk.LEFT, padx=(12, 0))
+        self.template_var = tk.StringVar(value='标准（每组一页）')
+        ttk.Combobox(bar, textvariable=self.template_var, values=['标准（每组一页）', '紧凑拼版'], width=14, state='readonly').pack(side=tk.LEFT)
+        ttk.Button(bar, text='生成A4并预览', command=self.show_batch_preview, width=14).pack(side=tk.RIGHT, padx=2)
+
+    def _template_key(self):
+        v = self.template_var.get() if hasattr(self, 'template_var') else ''
+        return 'compact' if '紧凑' in v else 'standard'
+
+    def collect_pair_images(self):
+        self._stash_workspace()
+        groups = []
+        for pair in self.pairs:
+            imgs = [pair[s]['processed'] for s in ('front', 'back') if pair[s]['processed'] is not None]
+            if imgs:
+                groups.append(imgs)
+        return groups
+
+    def compose_a4_pages(self):
+        """把所有组的处理结果拼成 A4 页（300dpi），返回 PIL 页列表"""
+        groups = self.collect_pair_images()
+        if not groups:
+            return []
+        s = self.mm_to_pixel
+        pw, ph = int(self.a4_width * s), int(self.a4_height * s)
+        cw, ch = int(self.id_width * s), int(self.id_height * s)
+
+        def prep(img):
+            if img.size != (cw, ch):
+                img = img.resize((cw, ch), Image.Resampling.LANCZOS)
+            if img.mode == 'RGBA':
+                bg = Image.new('RGB', img.size, (255, 255, 255))
+                bg.paste(img, (0, 0), img)
+                return bg
+            return img.convert('RGB')
+
+        pages = []
+        if self._template_key() == 'compact':
+            cards = [prep(im) for g in groups for im in g]
+            margin = int(10 * s)
+            gap_y = int(4 * s)
+            cols = 2
+            gap_x = pw - 2 * margin - cols * cw
+            rows = max(1, int((ph - 2 * margin + gap_y) // (ch + gap_y)))
+            per = cols * rows
+            for start in range(0, len(cards), per):
+                page = Image.new('RGB', (pw, ph), (255, 255, 255))
+                for j, card in enumerate(cards[start:start + per]):
+                    r, c = divmod(j, cols)
+                    x = margin + c * (cw + gap_x)
+                    y = margin + r * (ch + gap_y)
+                    page.paste(card, (x, y))
+                pages.append(page)
+        else:
+            spacing = int(20 * s)
+            for g in groups:
+                imgs = [prep(im) for im in g]
+                page = Image.new('RGB', (pw, ph), (255, 255, 255))
+                total_h = len(imgs) * ch + (len(imgs) - 1) * spacing
+                y = (ph - total_h) // 2
+                x = (pw - cw) // 2
+                for im in imgs:
+                    page.paste(im, (x, y))
+                    y += ch + spacing
+                pages.append(page)
+        if getattr(self, 'wm_enabled_var', None) is not None and self.wm_enabled_var.get():
+            text = self.wm_text_var.get().strip()
+            if text:
+                font_px = int(self.wm_size_var.get() * s)
+                pages = [_apply_watermark(p, text, font_px, self.wm_opacity_var.get(), self.wm_rows_var.get()) for p in pages]
+        self.batch_pages = pages
+        return pages
+
+    def show_batch_preview(self):
+        pages = self.compose_a4_pages()
+        if not pages:
+            messagebox.showwarning('提示', '还没有已处理的证件，请先导入并处理至少一张')
+            return
+        win = ToplevelWithIcon(self.root)
+        win.title('A4 拼版预览')
+        win.geometry('860x1020')
+        state = {'idx': 0, 'photo': None}
+        canvas = tk.Canvas(win, bg='gray')
+        canvas.pack(fill=tk.BOTH, expand=True)
+
+        def render():
+            img = pages[state['idx']].copy()
+            img.thumbnail((820, 940), Image.Resampling.LANCZOS)
+            state['photo'] = ImageTk.PhotoImage(img)
+            canvas.delete('all')
+            canvas.create_image(430, 500, image=state['photo'], anchor=tk.CENTER)
+            info.config(text=f"第 {state['idx'] + 1} / {len(pages)} 页")
+
+        bar = ttk.Frame(win)
+        bar.pack(side=tk.BOTTOM, fill=tk.X, pady=6)
+        info = ttk.Label(bar, text='')
+        info.pack(side=tk.LEFT, padx=8)
+        ttk.Button(bar, text='上一页', command=lambda: (state.update(idx=(state['idx'] - 1) % len(pages)), render())).pack(side=tk.LEFT)
+        ttk.Button(bar, text='下一页', command=lambda: (state.update(idx=(state['idx'] + 1) % len(pages)), render())).pack(side=tk.LEFT)
+        ttk.Button(bar, text='保存JPG', command=self._export_pages_jpg, width=10).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(bar, text='保存PDF', command=self._export_pages_pdf, width=10).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(bar, text='打印', command=self._print_pages, width=8).pack(side=tk.RIGHT, padx=2)
+        render()
+
+    def _export_pages_jpg(self):
+        pages = getattr(self, 'batch_pages', None) or self.compose_a4_pages()
+        if not pages:
+            return
+        folder = filedialog.askdirectory(title='选择保存文件夹')
+        if not folder:
+            return
+        for i, p in enumerate(pages):
+            p.save(os.path.join(folder, f'证件拼版_{i + 1:02d}.jpg'), quality=95, dpi=(self.dpi, self.dpi))
+        messagebox.showinfo('完成', f'已保存 {len(pages)} 页 JPG 到所选文件夹')
+
+    def _pages_to_pdf_bytes(self, pages):
+        tmpdir = tempfile.mkdtemp()
+        paths = []
+        for i, p in enumerate(pages):
+            fp = os.path.join(tmpdir, f'page{i + 1}.jpg')
+            p.save(fp, quality=95, dpi=(self.dpi, self.dpi))
+            paths.append(fp)
+        return img2pdf.convert(*paths)
+
+    def _export_pages_pdf(self):
+        pages = getattr(self, 'batch_pages', None) or self.compose_a4_pages()
+        if not pages:
+            return
+        folder = filedialog.askdirectory(title='选择保存文件夹')
+        if not folder:
+            return
+        with open(os.path.join(folder, '证件拼版.pdf'), 'wb') as f:
+            f.write(self._pages_to_pdf_bytes(pages))
+        messagebox.showinfo('完成', '已保存 证件拼版.pdf 到所选文件夹')
+
+    def _print_pages(self):
+        pages = getattr(self, 'batch_pages', None) or self.compose_a4_pages()
+        if not pages:
+            return
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+            tmp.write(self._pages_to_pdf_bytes(pages))
+            temp_file = tmp.name
+        if platform.system() == 'Windows':
+            os.startfile(temp_file, 'print')
+            messagebox.showinfo('打印', '打印任务已发送到打印机')
+        else:
+            subprocess.run(['lp', temp_file])
+            messagebox.showinfo('打印', '打印任务已发送到打印机')
+
+
     def load_image(self, side):
         """加载图片"""
         file_path = filedialog.askopenfilename(
@@ -2030,6 +2526,28 @@ class IDCardProcessor:
                 if response:
                     self.finish_marking(side)
     
+    def _on_enhance_change(self):
+        if self.enhance_var is not None:
+            self.enhance_mode = self.enhance_var.get()
+
+
+    def apply_enhancement(self, img):
+        """按当前增强模式处理已拉正的证件图；失败时原样返回"""
+        mode = getattr(self, 'enhance_mode', 'color')
+        try:
+            if mode == 'bw':
+                return _enhance_idcard_bw(img)
+            if mode == 'docbw':
+                return _enhance_document_bw(img)
+            if mode == 'doccolor':
+                return _enhance_document_color(img)
+            if mode == 'color':
+                return _enhance_idcard_color(img)
+        except Exception:
+            return img
+        return img
+
+
     def finish_marking(self, side):
         """完成标记并处理图片"""
         if side == "front":
@@ -2056,6 +2574,9 @@ class IDCardProcessor:
             # 执行透视变换
             processed = self.perspective_transform(image, points)
             
+            # 增强处理（对齐 IDCardMerge：透视校正后、圆角前）
+            processed = self.apply_enhancement(processed)
+            
             # 应用3.18mm外圆角效果，透明背景（不再是白色）
             processed_with_rounded = self.add_rounded_corners(processed)
             
@@ -2071,6 +2592,12 @@ class IDCardProcessor:
                 self.mark_window = None
             
             self.update_status(f"{side_name}处理完成")
+            
+            # 批量模式：同步回当前组并刷新格子，不再弹 A4 询问
+            if getattr(self, 'current_open', None) is not None:
+                self._stash_workspace()
+                self.refresh_pairs_panel()
+                return
             
             # 根据不同情况询问用户
             if side in ["front", "back"]:
@@ -3018,6 +3545,11 @@ class IDCardProcessor:
         """清除所有数据"""
         self.front_image = None
         self.back_image = None
+        self.pairs = []
+        self.current_open = None
+        self._pair_photos = {}
+        if hasattr(self, 'pairs_list_frame'):
+            self.refresh_pairs_panel()
         self.card_image = None
         self.front_points = []
         self.back_points = []
