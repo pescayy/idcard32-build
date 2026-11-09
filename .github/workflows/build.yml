@@ -1,0 +1,27 @@
+name: build-idcard32
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10.11'
+          architecture: 'x86'
+      - name: Show python bitness
+        run: python -c "import struct,sys; print(sys.version); print(struct.calcsize('P')*8)"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Build exe with PyInstaller
+        run: pyinstaller --noconfirm --onefile --windowed --name IDCardProcessor32 IDCardProcessor_auto_10.py
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IDCardProcessor32-exe
+          path: dist/IDCardProcessor32.exe
