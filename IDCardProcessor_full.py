@@ -495,7 +495,7 @@ class IDCardProcessor:
             tk._default_root = root
         except Exception:
             pass
-        self.root.title("证件图片处理器·全能版（AI批量） by xm")
+        self.root.title("证件图片处理器·全能版（AI批量） by xm · 1109夜版")
         self.enhance_mode = "color"
         self.enhance_var = None
         
