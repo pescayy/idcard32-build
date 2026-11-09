@@ -495,7 +495,7 @@ class IDCardProcessor:
             tk._default_root = root
         except Exception:
             pass
-        self.root.title("证件图片处理器·全能版（AI批量） by xm · 1110版")
+        self.root.title("证件图片处理器·全能版（AI批量） by xm · 1110拖版")
         self.enhance_mode = "color"
         self.enhance_var = None
         
@@ -1665,10 +1665,11 @@ class IDCardProcessor:
                 groups.append(imgs)
         return groups
 
-    def compose_a4_pages(self):
-        """把所有组的处理结果拼成 A4 页（300dpi），返回 PIL 页列表"""
+    def compute_layout(self):
+        """计算排版位置清单：[[(卡片图, x, y), ...], ...]，坐标为 A4 页 300dpi 像素"""
         groups = self.collect_pair_images()
         if not groups:
+            self.layout_pages = []
             return []
         s = self.mm_to_pixel
         pw, ph = int(self.a4_width * s), int(self.a4_height * s)
@@ -1693,25 +1694,42 @@ class IDCardProcessor:
             rows = max(1, int((ph - 2 * margin + gap_y) // (ch + gap_y)))
             per = cols * rows
             for start in range(0, len(cards), per):
-                page = Image.new('RGB', (pw, ph), (255, 255, 255))
+                placements = []
                 for j, card in enumerate(cards[start:start + per]):
                     r, c = divmod(j, cols)
                     x = margin + c * (cw + gap_x)
                     y = margin + r * (ch + gap_y)
-                    page.paste(card, (x, y))
-                pages.append(page)
+                    placements.append((card, x, y))
+                pages.append(placements)
         else:
             spacing = int(20 * s)
             for g in groups:
                 imgs = [prep(im) for im in g]
-                page = Image.new('RGB', (pw, ph), (255, 255, 255))
                 total_h = len(imgs) * ch + (len(imgs) - 1) * spacing
                 y = (ph - total_h) // 2
                 x = (pw - cw) // 2
+                placements = []
                 for im in imgs:
-                    page.paste(im, (x, y))
+                    placements.append((im, x, y))
                     y += ch + spacing
-                pages.append(page)
+                pages.append(placements)
+        self.layout_pages = pages
+        return pages
+
+    def render_pages(self, layout=None):
+        """按位置清单渲染 A4 页图（含水印），写入 self.batch_pages"""
+        if layout is None:
+            layout = getattr(self, 'layout_pages', None)
+        if not layout:
+            return []
+        s = self.mm_to_pixel
+        pw, ph = int(self.a4_width * s), int(self.a4_height * s)
+        pages = []
+        for placements in layout:
+            page = Image.new('RGB', (pw, ph), (255, 255, 255))
+            for img, x, y in placements:
+                page.paste(img, (int(x), int(y)))
+            pages.append(page)
         if getattr(self, 'wm_enabled_var', None) is not None and self.wm_enabled_var.get():
             text = self.wm_text_var.get().strip()
             if text:
@@ -1720,38 +1738,103 @@ class IDCardProcessor:
         self.batch_pages = pages
         return pages
 
+    def compose_a4_pages(self):
+        """把所有组的处理结果拼成 A4 页（300dpi），返回 PIL 页列表"""
+        layout = self.compute_layout()
+        if not layout:
+            return []
+        return self.render_pages(layout)
+
     def show_batch_preview(self):
-        pages = self.compose_a4_pages()
-        if not pages:
+        layout = self.compute_layout()
+        if not layout:
             messagebox.showwarning('提示', '还没有已处理的证件，请先导入并处理至少一张')
             return
+        self.render_pages(layout)
+        s = self.mm_to_pixel
+        pw, ph = int(self.a4_width * s), int(self.a4_height * s)
+        cw, ch = int(self.id_width * s), int(self.id_height * s)
+        scale = min(820 / pw, 940 / ph)
+        dw, dh = int(pw * scale), int(ph * scale)
+        dcw, dch = max(10, int(cw * scale)), max(10, int(ch * scale))
+        ox, oy = 430 - dw // 2, 495 - dh // 2
         win = ToplevelWithIcon(self.root)
-        win.title('A4 拼版预览')
+        win.title('A4 拼版预览（可拖动卡片调整位置）')
         win.geometry('860x1020')
-        state = {'idx': 0, 'photo': None}
+        state = {'idx': 0, 'photos': [], 'drag': None}
         canvas = tk.Canvas(win, bg='gray')
         canvas.pack(fill=tk.BOTH, expand=True)
 
         def render():
-            img = pages[state['idx']].copy()
-            img.thumbnail((820, 940), Image.Resampling.LANCZOS)
-            state['photo'] = ImageTk.PhotoImage(img, master=self.root)
             canvas.delete('all')
-            canvas.create_image(430, 500, image=state['photo'], anchor=tk.CENTER)
-            info.config(text=f"第 {state['idx'] + 1} / {len(pages)} 页")
+            state['photos'] = []
+            canvas.create_rectangle(ox, oy, ox + dw, oy + dh, fill='white', outline='black')
+            for i, (img, x, y) in enumerate(layout[state['idx']]):
+                dx, dy = ox + int(x * scale), oy + int(y * scale)
+                tag = f'card{i}'
+                canvas.create_rectangle(dx, dy, dx + dcw, dy + dch, outline='#999999', tags=(tag,))
+                thumb = img.resize((dcw, dch), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(thumb, master=self.root)
+                state['photos'].append(photo)
+                canvas.create_image(dx, dy, image=photo, anchor=tk.NW, tags=(tag,))
+            info.config(text=f"第 {state['idx'] + 1} / {len(layout)} 页 · 拖动卡片可调整位置，保存/打印按新位置")
 
+        def on_press(event):
+            items = canvas.find_withtag('current')
+            if not items:
+                return
+            for t in canvas.gettags(items[0]):
+                if t.startswith('card'):
+                    state['drag'] = (int(t[4:]), event.x, event.y)
+                    return
+
+        def on_motion(event):
+            if not state['drag']:
+                return
+            i, lx, ly = state['drag']
+            dx, dy = event.x - lx, event.y - ly
+            tag = f'card{i}'
+            box = canvas.bbox(tag)
+            if box:
+                if box[0] + dx < ox:
+                    dx = ox - box[0]
+                if box[2] + dx > ox + dw:
+                    dx = ox + dw - box[2]
+                if box[1] + dy < oy:
+                    dy = oy - box[1]
+                if box[3] + dy > oy + dh:
+                    dy = oy + dh - box[3]
+            if dx or dy:
+                canvas.move(tag, dx, dy)
+                state['drag'] = (i, lx + dx, ly + dy)
+
+        def on_release(event):
+            if not state['drag']:
+                return
+            i = state['drag'][0]
+            state['drag'] = None
+            box = canvas.bbox(f'card{i}')
+            if box:
+                img, _x, _y = layout[state['idx']][i]
+                layout[state['idx']][i] = (img, (box[0] - ox) / scale, (box[1] - oy) / scale)
+
+        canvas.bind('<ButtonPress-1>', on_press)
+        canvas.bind('<B1-Motion>', on_motion)
+        canvas.bind('<ButtonRelease-1>', on_release)
         bar = ttk.Frame(win)
         bar.pack(side=tk.BOTTOM, fill=tk.X, pady=6)
         info = ttk.Label(bar, text='')
         info.pack(side=tk.LEFT, padx=8)
-        ttk.Button(bar, text='上一页', command=lambda: (state.update(idx=(state['idx'] - 1) % len(pages)), render())).pack(side=tk.LEFT)
-        ttk.Button(bar, text='下一页', command=lambda: (state.update(idx=(state['idx'] + 1) % len(pages)), render())).pack(side=tk.LEFT)
+        ttk.Button(bar, text='上一页', command=lambda: (state.update(idx=(state['idx'] - 1) % len(layout)), render())).pack(side=tk.LEFT)
+        ttk.Button(bar, text='下一页', command=lambda: (state.update(idx=(state['idx'] + 1) % len(layout)), render())).pack(side=tk.LEFT)
         ttk.Button(bar, text='保存JPG', command=self._export_pages_jpg, width=10).pack(side=tk.RIGHT, padx=2)
         ttk.Button(bar, text='保存PDF', command=self._export_pages_pdf, width=10).pack(side=tk.RIGHT, padx=2)
         ttk.Button(bar, text='打印', command=self._print_pages, width=8).pack(side=tk.RIGHT, padx=2)
         render()
 
     def _export_pages_jpg(self):
+        if getattr(self, 'layout_pages', None):
+            self.render_pages()
         pages = getattr(self, 'batch_pages', None) or self.compose_a4_pages()
         if not pages:
             return
@@ -1773,6 +1856,8 @@ class IDCardProcessor:
         return img2pdf.convert(*paths)
 
     def _export_pages_pdf(self):
+        if getattr(self, 'layout_pages', None):
+            self.render_pages()
         pages = getattr(self, 'batch_pages', None) or self.compose_a4_pages()
         if not pages:
             return
@@ -1785,6 +1870,8 @@ class IDCardProcessor:
         messagebox.showinfo('完成', '已保存 证件拼版.pdf 到所选文件夹')
 
     def _print_pages(self):
+        if getattr(self, 'layout_pages', None):
+            self.render_pages()
         pages = getattr(self, 'batch_pages', None) or self.compose_a4_pages()
         if not pages:
             return
