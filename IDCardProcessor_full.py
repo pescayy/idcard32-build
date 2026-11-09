@@ -1319,7 +1319,7 @@ class IDCardProcessor:
                 if src_img is not None:
                     thumb = src_img.copy()
                     thumb.thumbnail((132, 84), Image.Resampling.LANCZOS)
-                    photo = ImageTk.PhotoImage(thumb)
+                    photo = ImageTk.PhotoImage(thumb, master=self.root)
                     self._pair_photos[(idx, side)] = photo
                     w = ttk.Label(row, image=photo)
                 else:
@@ -1529,7 +1529,7 @@ class IDCardProcessor:
         def render():
             img = pages[state['idx']].copy()
             img.thumbnail((820, 940), Image.Resampling.LANCZOS)
-            state['photo'] = ImageTk.PhotoImage(img)
+            state['photo'] = ImageTk.PhotoImage(img, master=self.root)
             canvas.delete('all')
             canvas.create_image(430, 500, image=state['photo'], anchor=tk.CENTER)
             info.config(text=f"第 {state['idx'] + 1} / {len(pages)} 页")
@@ -1645,7 +1645,7 @@ class IDCardProcessor:
             preview_img.thumbnail((int(preview_width), int(preview_height)), Image.Resampling.LANCZOS)
             
             # 转换为PhotoImage
-            photo = ImageTk.PhotoImage(preview_img)
+            photo = ImageTk.PhotoImage(preview_img, master=self.root)
             
             # 保存图片引用
             self.front_preview_img = photo
@@ -1669,7 +1669,7 @@ class IDCardProcessor:
             preview_img.thumbnail((int(preview_width), int(preview_height)), Image.Resampling.LANCZOS)
             
             # 转换为PhotoImage
-            photo = ImageTk.PhotoImage(preview_img)
+            photo = ImageTk.PhotoImage(preview_img, master=self.root)
             
             # 保存图片引用
             self.back_preview_img = photo
@@ -1693,7 +1693,7 @@ class IDCardProcessor:
             preview_img.thumbnail((int(preview_width), int(preview_height)), Image.Resampling.LANCZOS)
             
             # 转换为PhotoImage
-            photo = ImageTk.PhotoImage(preview_img)
+            photo = ImageTk.PhotoImage(preview_img, master=self.root)
             
             # 保存图片引用
             self.card_preview_img = photo
@@ -2569,7 +2569,7 @@ class IDCardProcessor:
                 scaled_image = self.original_image.copy()
             
             # 创建PhotoImage
-            self.mark_photo = ImageTk.PhotoImage(scaled_image)
+            self.mark_photo = ImageTk.PhotoImage(scaled_image, master=self.root)
             
             # 在画布上显示图像
             self.mark_canvas.create_image(0, 0, image=self.mark_photo, anchor=tk.NW)
@@ -2874,7 +2874,7 @@ class IDCardProcessor:
             preview_img.thumbnail((int(preview_width), int(preview_height)), Image.Resampling.LANCZOS)
             
             # 转换为PhotoImage
-            photo = ImageTk.PhotoImage(preview_img)
+            photo = ImageTk.PhotoImage(preview_img, master=self.root)
             
             # 保存图片引用
             self.preview_images['front'] = photo
@@ -2916,7 +2916,7 @@ class IDCardProcessor:
             preview_img.thumbnail((int(preview_width), int(preview_height)), Image.Resampling.LANCZOS)
             
             # 转换为PhotoImage
-            photo = ImageTk.PhotoImage(preview_img)
+            photo = ImageTk.PhotoImage(preview_img, master=self.root)
             
             # 保存图片引用
             self.preview_images['back'] = photo
@@ -2958,7 +2958,7 @@ class IDCardProcessor:
             preview_img.thumbnail((int(preview_width), int(preview_height)), Image.Resampling.LANCZOS)
             
             # 转换为PhotoImage
-            photo = ImageTk.PhotoImage(preview_img)
+            photo = ImageTk.PhotoImage(preview_img, master=self.root)
             
             # 保存图片引用
             self.preview_images['card'] = photo
@@ -3195,7 +3195,7 @@ class IDCardProcessor:
         # 缩放图片以适应画布
         display_img = a4_image.copy()
         display_img.thumbnail((canvas_width-20, canvas_height-20), Image.Resampling.LANCZOS)
-        photo = ImageTk.PhotoImage(display_img)
+        photo = ImageTk.PhotoImage(display_img, master=self.root)
         
         # 保存图片引用
         self.a4_preview_img = photo
