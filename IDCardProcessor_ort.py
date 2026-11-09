@@ -249,7 +249,7 @@ def _enhance_idcard_bw(pil_img):
     gray = arr[..., 0] * 0.299 + arr[..., 1] * 0.587 + arr[..., 2] * 0.114
     i = np.arange(256, dtype=np.float32)
     x = i / 255.0 - 0.5
-    t = -4.0 * x
+    t = 4.0 * x
     f = (np.exp(t) - np.exp(-t)) / (np.exp(t) + np.exp(-t) + 1.0)
     lut = np.clip((f + 1.0) / 2.0 * 255.0, 0, 255).astype(np.uint8)
     out = lut[np.clip(gray, 0, 255).astype(np.uint8)]
@@ -1101,6 +1101,12 @@ class IDCardProcessor:
             return
         ok, manual = 0, 0
         bad = []
+        # 启动时自带的那个空组先撤掉，免得导入完平白多出一个空组
+        if len(self.pairs) == 1 and \
+                self.pairs[0]['front']['image'] is None and \
+                self.pairs[0]['back']['image'] is None:
+            self.pairs = []
+            self.current_open = None
         for start in range(0, len(files), 2):
             idx = self.add_pair()
             for off, side in enumerate(('front', 'back')):
@@ -1118,7 +1124,9 @@ class IDCardProcessor:
                 setattr(self, side + '_points', [])
                 corners = None
                 try:
-                    corners = self.ai_detect_corners(image) or self.detect_card_corners(image)
+                    corners = self.ai_detect_corners(image)
+                    if not corners and not getattr(self, '_ai_ran', False):
+                        corners = self.detect_card_corners(image)
                 except Exception:
                     corners = None
                 if corners:
@@ -1385,12 +1393,16 @@ class IDCardProcessor:
         with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
             tmp.write(self._pages_to_pdf_bytes(pages))
             temp_file = tmp.name
-        if platform.system() == 'Windows':
-            os.startfile(temp_file, 'print')
-            messagebox.showinfo('打印', '打印任务已发送到打印机')
-        else:
-            subprocess.run(['lp', temp_file])
-            messagebox.showinfo('打印', '打印任务已发送到打印机')
+        try:
+            if platform.system() == 'Windows':
+                os.startfile(temp_file, 'print')
+            else:
+                subprocess.run(['lp', temp_file], check=True)
+        except Exception as e:
+            messagebox.showerror('打印失败',
+                                 f'没能把打印任务发出去：{e}\n（拼版文件已存到 {temp_file}，可手动打开打印）')
+            return
+        messagebox.showinfo('打印', '打印任务已发送到打印机')
 
 
     def load_image(self, side):
@@ -1762,6 +1774,7 @@ class IDCardProcessor:
             if not detector:
                 return None
             img_cv = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+            self._ai_ran = True
             corners = detector.detect(img_cv)
             if not corners:
                 return None
@@ -1787,7 +1800,9 @@ class IDCardProcessor:
                 image, points = self.card_image, self.card_points
             if image is None or len(points) == 4:
                 return
-            corners = self.ai_detect_corners(image) or self.detect_card_corners(image)
+            corners = self.ai_detect_corners(image)
+            if not corners and not getattr(self, '_ai_ran', False):
+                corners = self.detect_card_corners(image)
             if not corners:
                 self.update_status("自动识别未成功，请手动点击4个角点，或点上方'自动识别'再试")
                 return
