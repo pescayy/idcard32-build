@@ -1104,7 +1104,7 @@ class IDCardProcessor:
         setattr(self, side + '_points', [])
         corners = None
         try:
-            corners = self.ai_detect_corners(image)
+            corners = self.ai_detect_any(image)
             if not corners and not getattr(self, '_ai_ran', False):
                 corners = self.detect_card_corners(image)
         except Exception:
@@ -1168,7 +1168,7 @@ class IDCardProcessor:
                 setattr(self, side + '_points', [])
                 corners = None
                 try:
-                    corners = self.ai_detect_corners(image)
+                    corners = self.ai_detect_any(image)
                     if not corners and not getattr(self, '_ai_ran', False):
                         corners = self.detect_card_corners(image)
                 except Exception:
@@ -1894,6 +1894,83 @@ class IDCardProcessor:
         except Exception:
             return None
 
+    def _ai_band_crop(self, image):
+        """找截图里照片所在的横带（上下大片黑边/纯色时）：返回 (裁剪图, y偏移)，不适用返回 (None, 0)"""
+        try:
+            g = np.asarray(image.convert("L"), dtype=np.float32)
+            rs = g.std(axis=1)
+            mask = rs > 10
+            best, cur = (0, 0), None
+            for i, v in enumerate(mask):
+                if v and cur is None:
+                    cur = i
+                if (not v or i == len(mask) - 1) and cur is not None:
+                    end = i if not v else i + 1
+                    if end - cur > best[1] - best[0]:
+                        best = (cur, end)
+                    cur = None
+            h = image.height
+            if not (h * 0.12 < best[1] - best[0] < h * 0.85):
+                return None, 0
+            y0 = max(0, best[0] - 6)
+            y1 = min(h, best[1] + 6)
+            return image.crop((0, y0, image.width, y1)), y0
+        except Exception:
+            return None, 0
+
+    def ai_detect_any(self, image):
+        """深度识别：全图没认出时的补救链——横带裁剪→旋转90/270→中心裁剪→分块放大。
+        每步仍走 ai_detect_corners（含四边形合理性校验）；全失败返回 None，交给手动标角。
+        AI 模型缺失时第一步后直接返回，保持传统检测兜底的原有门闩不变。"""
+        corners = self.ai_detect_corners(image)
+        if corners or not getattr(self, "_ai_ran", False):
+            return corners
+        W, H = image.size
+        try:
+            band, y0 = self._ai_band_crop(image)
+            if band is not None:
+                c = self.ai_detect_corners(band)
+                if c:
+                    return [[x, y + y0] for x, y in c]
+        except Exception:
+            pass
+        for ang in (90, 270):
+            try:
+                rot = image.rotate(ang, expand=True)
+                c = self.ai_detect_corners(rot)
+                if c:
+                    if ang == 90:
+                        return [[W - 1 - qy, qx] for qx, qy in c]
+                    return [[qy, H - 1 - qx] for qx, qy in c]
+            except Exception:
+                pass
+        try:
+            cw, ch = int(W * 0.79), int(H * 0.79)
+            x0, y0 = (W - cw) // 2, (H - ch) // 2
+            c = self.ai_detect_corners(image.crop((x0, y0, x0 + cw, y0 + ch)))
+            if c:
+                return [[x + x0, y + y0] for x, y in c]
+        except Exception:
+            pass
+        try:
+            tw, th = int(W * 0.62), int(H * 0.62)
+            fallback = None
+            for (tx, ty) in [(0, 0), (W - tw, 0), (0, H - th), (W - tw, H - th), ((W - tw) // 2, (H - th) // 2)]:
+                c = self.ai_detect_corners(image.crop((tx, ty, tx + tw, ty + th)))
+                if not c:
+                    continue
+                pts = [[x + tx, y + ty] for x, y in c]
+                touches = any(x < tw * 0.015 or x > tw * 0.985 or y < th * 0.015 or y > th * 0.985 for x, y in c)
+                if not touches:
+                    return pts
+                if fallback is None:
+                    fallback = pts
+            if fallback:
+                return fallback
+        except Exception:
+            pass
+        return None
+
     def try_auto_finish(self, side):
         """标记窗口打开后静默尝试自动识别：成功直接完成该面处理（不弹窗确认）；
         失败不打扰用户，停留在手动标记流程。"""
@@ -1908,7 +1985,7 @@ class IDCardProcessor:
                 image, points = self.card_image, self.card_points
             if image is None or len(points) == 4:
                 return
-            corners = self.ai_detect_corners(image)
+            corners = self.ai_detect_any(image)
             if not corners and not getattr(self, '_ai_ran', False):
                 corners = self.detect_card_corners(image)
             if not corners:
