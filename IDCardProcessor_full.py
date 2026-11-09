@@ -7,6 +7,8 @@ import os
 import tempfile
 import subprocess
 import sys
+import time
+import traceback
 import platform
 import hashlib
 import img2pdf
@@ -449,6 +451,17 @@ def _parse_id_back(texts):
                 if v:
                     info['有效期限'] = v
     return info
+
+
+def _log_ocr_error(exc):
+    """OCR 异常留痕：写到程序旁边的 ocr_error.log，避免窗口版无声失败。"""
+    try:
+        base = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(base, 'ocr_error.log'), 'a', encoding='utf-8') as f:
+            f.write(time.strftime('%Y-%m-%d %H:%M:%S') + ' ' + repr(exc) + '\n')
+            traceback.print_exc(file=f)
+    except Exception:
+        pass
 
 
 class IDCardProcessor:
@@ -1343,20 +1356,26 @@ class IDCardProcessor:
     # ===== OCR 调度与导出（全能版新增） =====
     def _schedule_ocr(self, idx, side, pil_img):
         def worker():
+            err_text = ''
             try:
                 texts = _ocr_lines(pil_img)
                 info = _parse_id_front(texts) if side == 'front' else _parse_id_back(texts)
-            except Exception:
+            except Exception as e:
                 info = {}
+                err_text = repr(e)
+                _log_ocr_error(e)
             try:
                 if 0 <= idx < len(self.pairs):
                     self.pairs[idx][side]['ocr'] = info
-                self.root.after(0, lambda: self._on_ocr_done(idx, side, info))
+                self.root.after(0, lambda: self._on_ocr_done(idx, side, info, err_text))
             except Exception:
                 pass
         _threading.Thread(target=worker, daemon=True).start()
 
-    def _on_ocr_done(self, idx, side, info):
+    def _on_ocr_done(self, idx, side, info, err_text=''):
+        if not info and err_text:
+            self.update_status('读字没跑起来，原因记在程序旁边的 ocr_error.log')
+            return
         if getattr(self, 'current_open', None) == idx and info:
             if side == 'front' and info.get('姓名'):
                 self.update_status('已识别：%s %s' % (info.get('姓名', ''), info.get('公民身份号码', '')))
