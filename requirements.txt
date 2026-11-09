@@ -4,3 +4,4 @@ opencv-python==4.6.0.66
 img2pdf==0.4.4
 pikepdf==7.2.0
 pyinstaller==5.13.2
+tkinterdnd2==0.4.2

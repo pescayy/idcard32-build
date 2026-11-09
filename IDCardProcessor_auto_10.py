@@ -118,6 +118,111 @@ except ImportError:
     print("提示: tkinterdnd2库未安装，拖拽功能不可用。")
     print("请运行: pip install tkinterdnd2 来启用拖拽功能")
 
+
+def _order_points_np(pts):
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+
+class CardDetectorAI:
+    """SCRFD 证件关键点检测（算法摘自云星球 V7.3.1，经三方对测验证）。
+    用 OpenCV 自带 DNN 加载 ONNX 模型，不依赖 onnxruntime。"""
+
+    def __init__(self, onnxmodel, confThreshold=0.5, nmsThreshold=0.5):
+        self.inpWidth, self.inpHeight = 640, 640
+        self.confThreshold, self.nmsThreshold = confThreshold, nmsThreshold
+        self.net = cv2.dnn.readNet(onnxmodel)
+        self.keep_ratio, self.fmc = True, 3
+        self._feat_stride_fpn, self._num_anchors = [8, 16, 32], 4
+
+    def resize_image(self, srcimg):
+        padh, padw, newh, neww = 0, 0, self.inpHeight, self.inpWidth
+        if self.keep_ratio and srcimg.shape[0] != srcimg.shape[1]:
+            hw_scale = srcimg.shape[0] / srcimg.shape[1]
+            if hw_scale > 1:
+                newh, neww = self.inpHeight, int(self.inpWidth / hw_scale)
+                img = cv2.resize(srcimg, (neww, newh), interpolation=cv2.INTER_AREA)
+                padw = int((self.inpWidth - neww) * 0.5)
+                img = cv2.copyMakeBorder(img, 0, 0, padw, self.inpWidth - neww - padw,
+                                         cv2.BORDER_CONSTANT, value=0)
+            else:
+                newh, neww = int(self.inpHeight * hw_scale) + 1, self.inpWidth
+                img = cv2.resize(srcimg, (neww, newh), interpolation=cv2.INTER_AREA)
+                padh = int((self.inpHeight - newh) * 0.5)
+                img = cv2.copyMakeBorder(img, padh, self.inpHeight - newh - padh, 0, 0,
+                                         cv2.BORDER_CONSTANT, value=0)
+        else:
+            img = cv2.resize(srcimg, (self.inpWidth, self.inpHeight))
+        return img, newh, neww, padh, padw
+
+    def distance2bbox(self, points, distance, max_shape=None):
+        x1 = points[:, 0] - distance[:, 0]; y1 = points[:, 1] - distance[:, 1]
+        x2 = points[:, 0] + distance[:, 2]; y2 = points[:, 1] + distance[:, 3]
+        if max_shape is not None:
+            x1 = np.clip(x1, 0, max_shape[1]); y1 = np.clip(y1, 0, max_shape[0])
+            x2 = np.clip(x2, 0, max_shape[1]); y2 = np.clip(y2, 0, max_shape[0])
+        return np.stack([x1, y1, x2, y2], axis=-1)
+
+    def distance2kps(self, points, distance, max_shape=None):
+        preds = []
+        for i in range(0, distance.shape[1], 2):
+            px = points[:, 0] + distance[:, i]; py = points[:, 1] + distance[:, i + 1]
+            if max_shape is not None:
+                px = np.clip(px, 0, max_shape[1]); py = np.clip(py, 0, max_shape[0])
+            preds.append(px); preds.append(py)
+        return np.stack(preds, axis=-1)
+
+    def detect(self, srcimg):
+        img, newh, neww, padh, padw = self.resize_image(srcimg)
+        blob = cv2.dnn.blobFromImage(img, 1.0 / 128, (self.inpWidth, self.inpHeight),
+                                     (127.5, 127.5, 127.5), swapRB=True)
+        self.net.setInput(blob)
+        outs = self.net.forward(self.net.getUnconnectedOutLayersNames())
+        scores_list, bboxes_list, kpss_list = [], [], []
+        for idx, stride in enumerate(self._feat_stride_fpn):
+            scores = outs[idx * self.fmc][0]
+            bbox_preds = outs[idx * self.fmc + 1][0] * stride
+            kps_preds = outs[idx * self.fmc + 2][0] * stride
+            height, width = blob.shape[2] // stride, blob.shape[3] // stride
+            anchor_centers = np.stack(np.mgrid[:height, :width][::-1], axis=-1).astype(np.float32)
+            anchor_centers = (anchor_centers * stride).reshape((-1, 2))
+            if self._num_anchors > 1:
+                anchor_centers = np.stack([anchor_centers] * self._num_anchors, axis=1).reshape((-1, 2))
+            pos_inds = np.where(scores >= self.confThreshold)[0]
+            bboxes = self.distance2bbox(anchor_centers, bbox_preds)
+            scores_list.append(scores[pos_inds]); bboxes_list.append(bboxes[pos_inds])
+            kpss = self.distance2kps(anchor_centers, kps_preds).reshape((-1, 4, 2))
+            kpss_list.append(kpss[pos_inds])
+        if not scores_list:
+            return None
+        scores = np.vstack(scores_list).ravel(); bboxes = np.vstack(bboxes_list); kpss = np.vstack(kpss_list)
+        if len(scores) == 0:
+            return None
+        bboxes[:, 2:4] = bboxes[:, 2:4] - bboxes[:, 0:2]
+        ratioh, ratiow = srcimg.shape[0] / newh, srcimg.shape[1] / neww
+        bboxes[:, 0] = (bboxes[:, 0] - padw) * ratiow; bboxes[:, 1] = (bboxes[:, 1] - padh) * ratioh
+        bboxes[:, 2] = bboxes[:, 2] * ratiow; bboxes[:, 3] = bboxes[:, 3] * ratioh
+        kpss[:, :, 0] = (kpss[:, :, 0] - padw) * ratiow; kpss[:, :, 1] = (kpss[:, :, 1] - padh) * ratioh
+        indices = cv2.dnn.NMSBoxes(bboxes.tolist(), scores.tolist(), self.confThreshold, self.nmsThreshold)
+        if len(indices) == 0:
+            return None
+        indices = np.array(indices).flatten()
+        best, best_score = indices[0], scores[indices[0]]
+        for i in indices:
+            if scores[i] > best_score:
+                best_score, best = scores[i], i
+        pts = kpss[best]
+        pts_list = [(float(pts[i, 0]), float(pts[i, 1])) for i in range(4)]
+        pts_ordered = _order_points_np(np.array(pts_list))
+        return [(float(q[0]), float(q[1])) for q in pts_ordered]
+
+
 class IDCardProcessor:
     def __init__(self, root):
         self.root = root
@@ -1108,6 +1213,41 @@ class IDCardProcessor:
         except Exception:
             return None
 
+    def ai_detect_corners(self, image):
+        """AI 检测：懒加载 SCRFD 模型（exe 同目录或打包内 models 文件夹），
+        模型缺失或检测失败返回 None，由传统检测兜底。"""
+        try:
+            detector = getattr(self, "_ai_detector", None)
+            if detector is None:
+                import os as _os
+                candidates = []
+                if getattr(sys, "frozen", False):
+                    candidates.append(_os.path.join(_os.path.dirname(sys.executable),
+                                      "models", "carddetection_scrfd34gkps.onnx"))
+                    candidates.append(_os.path.join(getattr(sys, "_MEIPASS", ""),
+                                      "models", "carddetection_scrfd34gkps.onnx"))
+                candidates.append(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                  "models", "carddetection_scrfd34gkps.onnx"))
+                model = next((c for c in candidates if c and _os.path.exists(c)), None)
+                if not model:
+                    self._ai_detector = False
+                    return None
+                self._ai_detector = CardDetectorAI(model)
+                detector = self._ai_detector
+            if not detector:
+                return None
+            img_cv = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+            corners = detector.detect(img_cv)
+            if not corners:
+                return None
+            arr = np.array(corners, dtype=np.float32)
+            h, w = img_cv.shape[:2]
+            if not self._validate_quadrilateral(arr.copy(), h, w):
+                return None
+            return [[float(x), float(y)] for x, y in arr]
+        except Exception:
+            return None
+
     def try_auto_finish(self, side):
         """标记窗口打开后静默尝试自动识别：成功直接完成该面处理（不弹窗确认）；
         失败不打扰用户，停留在手动标记流程。"""
@@ -1122,7 +1262,7 @@ class IDCardProcessor:
                 image, points = self.card_image, self.card_points
             if image is None or len(points) == 4:
                 return
-            corners = self.detect_card_corners(image)
+            corners = self.ai_detect_corners(image) or self.detect_card_corners(image)
             if not corners:
                 self.update_status("自动识别未成功，请手动点击4个角点，或点上方'自动识别'再试")
                 return
