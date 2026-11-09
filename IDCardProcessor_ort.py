@@ -357,7 +357,7 @@ class IDCardProcessor:
             tk._default_root = root
         except Exception:
             pass
-        self.root.title("证件图片处理器·复刻版（AI批量） by xm · 1109夜版")
+        self.root.title("证件图片处理器·复刻版（AI批量） by xm · 1110版")
         self.enhance_mode = "color"
         self.enhance_var = None
         
@@ -716,6 +716,7 @@ class IDCardProcessor:
             max_size = (1200, 1200)
             image.thumbnail(max_size, Image.Resampling.LANCZOS)
             
+            self._remember_dir(file_path)
             # 在A4预览区域显示缩略图
             self.show_preview_image(side, image)
             
@@ -1102,6 +1103,11 @@ class IDCardProcessor:
         没认出来返回 False，交给标角窗口手动处理。与批量导入同一条识别线。"""
         setattr(self, side + '_image', image)
         setattr(self, side + '_points', [])
+        try:
+            self.update_status('正在识别，请稍候…')
+            self.root.update_idletasks()
+        except Exception:
+            pass
         corners = None
         try:
             corners = self.ai_detect_any(image)
@@ -1115,14 +1121,54 @@ class IDCardProcessor:
             return True
         return False
 
+    def _settings_file(self):
+        try:
+            if getattr(sys, 'frozen', False):
+                base = os.path.dirname(sys.executable)
+            else:
+                base = os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            base = os.getcwd()
+        return os.path.join(base, 'idcard_settings.json')
+
+    def _get_last_dir(self):
+        d = getattr(self, '_last_dir_cache', None)
+        if d is None:
+            d = ''
+            try:
+                import json as _json
+                with open(self._settings_file(), 'r', encoding='utf-8') as f:
+                    v = _json.load(f).get('last_dir', '')
+                if v and os.path.isdir(v):
+                    d = v
+            except Exception:
+                pass
+            self._last_dir_cache = d
+        return d
+
+    def _remember_dir(self, path):
+        try:
+            if not path:
+                return
+            d = path if os.path.isdir(path) else os.path.dirname(path)
+            if not d or not os.path.isdir(d):
+                return
+            self._last_dir_cache = d
+            import json as _json
+            with open(self._settings_file(), 'w', encoding='utf-8') as f:
+                _json.dump({'last_dir': d}, f, ensure_ascii=False)
+        except Exception:
+            pass
+
     def import_into_slot(self, idx, side, file_path=None):
         self.open_pair(idx)
         if not file_path:
             file_path = filedialog.askopenfilename(
-                title='选择图片',
+                title='选择图片', initialdir=self._get_last_dir() or None,
                 filetypes=[('图像文件', '*.jpg *.jpeg *.png *.bmp *.tiff'), ('所有文件', '*.*')])
         if not file_path:
             return
+        self._remember_dir(file_path)
         try:
             image = Image.open(file_path)
             image.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
@@ -1131,6 +1177,7 @@ class IDCardProcessor:
                 self.refresh_pairs_panel()
                 self.update_status(f"第{idx + 1}组{'正面' if side == 'front' else '反面'}已自动识别处理完成")
             else:
+                self._skip_auto_finish = True
                 self.show_image_for_marking(side, image, file_path)
                 self.update_status('自动识别没成功，请在窗口里手动标4个角点')
         except Exception as e:
@@ -1139,10 +1186,11 @@ class IDCardProcessor:
     def batch_import(self):
         """批量导入：按选择顺序两张一组（先正面后反面），逐张自动识别处理"""
         files = filedialog.askopenfilenames(
-            title='批量选择证件照片（按正反面顺序）',
+            title='批量选择证件照片（按正反面顺序）', initialdir=self._get_last_dir() or None,
             filetypes=[('图像文件', '*.jpg *.jpeg *.png *.bmp *.tiff'), ('所有文件', '*.*')])
         if not files:
             return
+        self._remember_dir(files[0])
         ok, manual = 0, 0
         bad = []
         # 启动时自带的那个空组先撤掉，免得导入完平白多出一个空组
@@ -1199,6 +1247,7 @@ class IDCardProcessor:
                 self.refresh_pairs_panel()
                 self.update_status(f"第{idx + 1}组{'正面' if side == 'front' else '反面'}已自动识别处理完成")
             else:
+                self._skip_auto_finish = True
                 self.show_image_for_marking(side, slot['image'], slot['path'])
 
     def build_pairs_panel(self, parent):
@@ -1464,9 +1513,10 @@ class IDCardProcessor:
         pages = getattr(self, 'batch_pages', None) or self.compose_a4_pages()
         if not pages:
             return
-        folder = filedialog.askdirectory(title='选择保存文件夹')
+        folder = filedialog.askdirectory(title='选择保存文件夹', initialdir=self._get_last_dir() or None)
         if not folder:
             return
+        self._remember_dir(folder)
         for i, p in enumerate(pages):
             p.save(os.path.join(folder, f'证件拼版_{i + 1:02d}.jpg'), quality=95, dpi=(self.dpi, self.dpi))
         messagebox.showinfo('完成', f'已保存 {len(pages)} 页 JPG 到所选文件夹')
@@ -1484,9 +1534,10 @@ class IDCardProcessor:
         pages = getattr(self, 'batch_pages', None) or self.compose_a4_pages()
         if not pages:
             return
-        folder = filedialog.askdirectory(title='选择保存文件夹')
+        folder = filedialog.askdirectory(title='选择保存文件夹', initialdir=self._get_last_dir() or None)
         if not folder:
             return
+        self._remember_dir(folder)
         with open(os.path.join(folder, '证件拼版.pdf'), 'wb') as f:
             f.write(self._pages_to_pdf_bytes(pages))
         messagebox.showinfo('完成', '已保存 证件拼版.pdf 到所选文件夹')
@@ -1513,7 +1564,7 @@ class IDCardProcessor:
     def load_image(self, side):
         """加载图片"""
         file_path = filedialog.askopenfilename(
-            title=f"选择{side}图片",
+            title=f"选择{side}图片", initialdir=self._get_last_dir() or None,
             filetypes=[("图像文件", "*.jpg *.jpeg *.png *.bmp *.tiff"), ("所有文件", "*.*")]
         )
         
@@ -1527,6 +1578,7 @@ class IDCardProcessor:
             max_size = (1200, 1200)
             image.thumbnail(max_size, Image.Resampling.LANCZOS)
             
+            self._remember_dir(file_path)
             # 在A4预览区域显示缩略图
             self.show_preview_image(side, image)
             
@@ -1926,6 +1978,8 @@ class IDCardProcessor:
         if corners or not getattr(self, "_ai_ran", False):
             return corners
         W, H = image.size
+        import time as _time
+        _t0 = _time.time()
         try:
             band, y0 = self._ai_band_crop(image)
             if band is not None:
@@ -1934,6 +1988,8 @@ class IDCardProcessor:
                     return [[x, y + y0] for x, y in c]
         except Exception:
             pass
+        if _time.time() - _t0 > 20:
+            return None
         for ang in (90, 270):
             try:
                 rot = image.rotate(ang, expand=True)
@@ -1944,6 +2000,8 @@ class IDCardProcessor:
                     return [[qy, H - 1 - qx] for qx, qy in c]
             except Exception:
                 pass
+        if _time.time() - _t0 > 20:
+            return None
         try:
             cw, ch = int(W * 0.79), int(H * 0.79)
             x0, y0 = (W - cw) // 2, (H - ch) // 2
@@ -1952,10 +2010,14 @@ class IDCardProcessor:
                 return [[x + x0, y + y0] for x, y in c]
         except Exception:
             pass
+        if _time.time() - _t0 > 20:
+            return None
         try:
             tw, th = int(W * 0.62), int(H * 0.62)
             fallback = None
             for (tx, ty) in [(0, 0), (W - tw, 0), (0, H - th), (W - tw, H - th), ((W - tw) // 2, (H - th) // 2)]:
+                if _time.time() - _t0 > 25:
+                    break
                 c = self.ai_detect_corners(image.crop((tx, ty, tx + tw, ty + th)))
                 if not c:
                     continue
@@ -1975,6 +2037,9 @@ class IDCardProcessor:
         """标记窗口打开后静默尝试自动识别：成功直接完成该面处理（不弹窗确认）；
         失败不打扰用户，停留在手动标记流程。"""
         try:
+            if getattr(self, '_skip_auto_finish', False):
+                self._skip_auto_finish = False
+                return
             if self.mark_window is None or self.current_marking_side != side:
                 return
             if side == "front":
