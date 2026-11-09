@@ -454,7 +454,7 @@ def _parse_id_back(texts):
 class IDCardProcessor:
     def __init__(self, root):
         self.root = root
-        self.root.title("证件图片处理器·全能版（AI批量） - 云雪星球")
+        self.root.title("证件图片处理器·全能版（AI批量） by wc")
         self.enhance_mode = "color"
         self.enhance_var = None
         
