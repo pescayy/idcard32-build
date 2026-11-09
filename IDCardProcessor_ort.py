@@ -119,6 +119,16 @@ except ImportError:
     print("请运行: pip install tkinterdnd2 来启用拖拽功能")
 
 
+def _order_quad_points(pts):
+    """把任意顺序点击的 4 个角点排成 [左上, 右上, 右下, 左下]。"""
+    pts = [tuple(p) for p in pts]
+    tl = min(pts, key=lambda p: p[0] + p[1])
+    br = max(pts, key=lambda p: p[0] + p[1])
+    tr = max(pts, key=lambda p: p[0] - p[1])
+    bl = min(pts, key=lambda p: p[0] - p[1])
+    return [tl, tr, br, bl]
+
+
 def _order_points_np(pts):
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
@@ -352,7 +362,7 @@ class IDCardProcessor:
         self.enhance_var = None
         
         # 窗口默认800x900，但允许手动调整大小
-        self.root.geometry("800x900")
+        self.root.geometry("1200x780")
         
         # 将窗口居中显示
         self.center_window(self.root)
@@ -449,81 +459,76 @@ class IDCardProcessor:
         window.geometry(f'{width}x{height}+{x}+{y}')
     
     def setup_ui(self):
+        # ===== UI 换脸（对齐 IDCardMerge 版式）：白底、顶栏、提示行、状态行 =====
+        try:
+            self.root.configure(bg='white')
+        except Exception:
+            pass
+        try:
+            self.root.option_add('*Font', ('Microsoft YaHei', 10))
+        except Exception:
+            pass
         # 主框架
-        main_frame = ttk.Frame(self.root)
+        main_frame = tk.Frame(self.root, bg='#F5F6F8')
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # 顶部控制面板 - 简化版本
-        control_frame = ttk.Frame(main_frame)
-        control_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
-        
-        # 控制按钮 - 简化布局
-        button_frame = ttk.Frame(control_frame)
-        button_frame.pack(side=tk.LEFT)
-        
-        # 操作按钮 - 简化版本
-        ttk.Button(button_frame, text="生成A4排版", 
-                  command=self.generate_a4_layout, width=12).pack(side=tk.LEFT, padx=2)
-        ttk.Button(button_frame, text="重置所有", 
-                  command=self.clear_all, width=10).pack(side=tk.LEFT, padx=2)
-        
-        # 银行卡功能按钮 - 保存引用以便修改文本
-        self.card_mode_btn = ttk.Button(button_frame, text="银行卡功能", 
-                                       command=self.toggle_card_mode, width=12)
-        self.card_mode_btn.pack(side=tk.LEFT, padx=2)
-        
-        ttk.Button(button_frame, text="提示操作", 
-                  command=self.show_help, width=10).pack(side=tk.LEFT, padx=2)
 
-        # 增强模式选择（对齐 IDCardMerge 的彩色/黑白/文档模式）
-        enhance_frame = ttk.Frame(control_frame)
-        enhance_frame.pack(side=tk.LEFT, padx=(15, 0))
-        ttk.Label(enhance_frame, text="增强:").pack(side=tk.LEFT)
-        self.enhance_var = tk.StringVar(value="color")
-        for text, val in [("原图", "none"), ("彩色", "color"), ("黑白", "bw"), ("文档黑白", "docbw"), ("文档彩色", "doccolor")]:
-            ttk.Radiobutton(enhance_frame, text=text, value=val, variable=self.enhance_var,
-                            command=self._on_enhance_change).pack(side=tk.LEFT)
-        
-        # 状态标签
+        # 顶栏：左侧蓝色「批量导入」，右侧「清空数据」
+        top_bar = tk.Frame(main_frame, bg='#F5F6F8')
+        top_bar.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+        tk.Button(top_bar, text="批量导入", command=self.batch_import,
+                  bg='#2F7CF6', fg='white', activebackground='#2F7CF6',
+                  activeforeground='white', relief=tk.FLAT,
+                  font=("Arial", 11, "bold"), padx=18, pady=6,
+                  cursor='hand2').pack(side=tk.LEFT)
+        tk.Button(top_bar, text="清空数据", command=self._clear_pairs,
+                  bg='#F5F5F7', fg='#333333', activebackground='#E8E8EA',
+                  relief=tk.FLAT, font=("Arial", 10),
+                  padx=14, pady=6, cursor='hand2').pack(side=tk.RIGHT)
+
+        # 居中灰色提示行
+        tk.Label(main_frame,
+                 text='请分别添加证件正面和背面，支持批量导入。点已处理图片可微调角点，每组可一键互换正反面。',
+                 bg='#F5F6F8', fg='#888888',
+                 font=("Arial", 10)).pack(side=tk.TOP, pady=(0, 8))
+
+        # 状态标签：窗口最底部居中（先于其它底部控件 pack，占住最底行）
         self.status_var = tk.StringVar(value="就绪")
-        status_label = ttk.Label(control_frame, textvariable=self.status_var, font=("Arial", 10))
-        status_label.pack(side=tk.RIGHT, padx=10)
-        
-        # 批量证件组面板（对齐 IDCardMerge）
+        tk.Label(main_frame, textvariable=self.status_var,
+                 bg='#F5F6F8', fg='#888888', font=("Arial", 10),
+                 anchor=tk.CENTER).pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+
+        # 银行卡功能按钮：保留对象引用（clear_all 等代码会引用它），不再摆出
+        self.card_mode_btn = ttk.Button(main_frame, text="银行卡功能",
+                                        command=self.toggle_card_mode, width=12)
+
+        # 增强模式变量（选择控件移到输出设置第一行的下拉框）
+        self.enhance_var = tk.StringVar(value="color")
+
+        # 批量证件组面板（主区域）
         self.build_pairs_panel(main_frame)
         self.build_settings_bar(main_frame)
-        
-        # A4预览区域 - 主工作区
+
+        # A4预览区域 - 主工作区：换脸后不再显示。
+        # 画布对象保留创建，供 draw_a4_layout 等旧代码引用；不 pack、不绑
+        # Configure、不注册画布级拖拽（格子上的拖拽保留）。
         self.a4_frame = ttk.LabelFrame(main_frame, text="工作区域", padding=10)
-        self.a4_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        
-        # 创建A4画布
         self.a4_canvas = tk.Canvas(self.a4_frame, bg='white', highlightthickness=0)
-        self.a4_canvas.pack(fill=tk.BOTH, expand=True)
-        
-        # 绑定画布大小变化事件
-        self.a4_canvas.bind("<Configure>", self.on_canvas_resize)
-        
+
         # 银行卡模式标志
         self.card_mode = False
-        
-        # 如果支持拖拽，设置拖拽功能
-        if DRAG_DROP_SUPPORTED:
-            self.setup_drag_drop()
-        
+
         # 标记窗口相关
         self.mark_window = None
         self.mark_canvas = None
         self.mark_scrollbar_x = None
         self.mark_scrollbar_y = None
-        
+
         # 文本编辑相关
         self.text_window = None
         self.text_entry = None
-        
-        # 绘制初始布局
+
+        # 初始布局标记（画布已隐藏，跳过首绘）
         self.is_in_edit_mode = True
-        self.draw_a4_layout()
     
     def toggle_card_mode(self):
         """切换银行卡模式（仅切换显示，不清除身份证图片）"""
@@ -1154,25 +1159,21 @@ class IDCardProcessor:
             self.show_image_for_marking(side, slot['image'], slot['path'])
 
     def build_pairs_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text='证件组（批量）', padding=5)
-        frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
-        bar = ttk.Frame(frame)
-        bar.pack(fill=tk.X)
-        ttk.Button(bar, text='＋ 添加一组', command=self.add_pair, width=12).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text='批量导入', command=self.batch_import, width=12).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text='清空所有组', command=self._clear_pairs, width=12).pack(side=tk.LEFT, padx=2)
-        self.pairs_count_var = tk.StringVar(value='共 0 组')
-        ttk.Label(bar, textvariable=self.pairs_count_var).pack(side=tk.LEFT, padx=10)
-        wrap = ttk.Frame(frame)
-        wrap.pack(fill=tk.X)
-        self.pairs_canvas = tk.Canvas(wrap, height=118, highlightthickness=0)
+        # 换脸：无边框白底，组列表占满主区域
+        frame = tk.Frame(parent, bg='white')
+        frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(0, 6))
+        wrap = tk.Frame(frame, bg='white')
+        wrap.pack(fill=tk.BOTH, expand=True)
+        self.pairs_canvas = tk.Canvas(wrap, bg='white', highlightthickness=0)
         sb = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=self.pairs_canvas.yview)
         self.pairs_canvas.configure(yscrollcommand=sb.set)
-        self.pairs_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.pairs_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.pairs_list_frame = ttk.Frame(self.pairs_canvas)
-        self.pairs_canvas.create_window((0, 0), window=self.pairs_list_frame, anchor='nw')
+        self.pairs_list_frame = tk.Frame(self.pairs_canvas, bg='white')
+        self._pairs_win = self.pairs_canvas.create_window((0, 0), window=self.pairs_list_frame, anchor='nw')
         self.pairs_list_frame.bind('<Configure>', lambda e: self.pairs_canvas.configure(scrollregion=self.pairs_canvas.bbox('all')))
+        self.pairs_canvas.bind('<Configure>', lambda e: self.pairs_canvas.itemconfigure(self._pairs_win, width=e.width))
+        self.pairs_count_var = tk.StringVar(value='共 0 组')
         self.pairs.append({'front': self._new_slot(), 'back': self._new_slot()})
         self.current_open = 0
         self.refresh_pairs_panel()
@@ -1200,10 +1201,11 @@ class IDCardProcessor:
         if hasattr(self, 'pairs_count_var'):
             self.pairs_count_var.set(f'共 {len(self.pairs)} 组')
         for idx, pair in enumerate(self.pairs):
-            row = ttk.Frame(self.pairs_list_frame)
-            row.pack(fill=tk.X, pady=2)
+            row = tk.Frame(self.pairs_list_frame, bg='white')
+            row.pack(fill=tk.X, pady=3)
             mark = '●' if self.current_open == idx else '○'
-            ttk.Label(row, text=f'{mark} 组{idx + 1}').pack(side=tk.LEFT, padx=(2, 6))
+            tk.Label(row, text=f'{mark} 第{idx + 1}组', bg='white',
+                     font=("Arial", 10)).pack(side=tk.LEFT, padx=(2, 8))
             for side, label in (('front', '正面'), ('back', '反面')):
                 slot = pair[side]
                 if slot['processed'] is not None:
@@ -1214,47 +1216,103 @@ class IDCardProcessor:
                     state, src_img = '未导入', None
                 if src_img is not None:
                     thumb = src_img.copy()
-                    thumb.thumbnail((132, 84), Image.Resampling.LANCZOS)
+                    thumb.thumbnail((200, 126), Image.Resampling.LANCZOS)
                     photo = ImageTk.PhotoImage(thumb, master=self.root)
                     self._pair_photos[(idx, side)] = photo
-                    w = ttk.Label(row, image=photo)
+                    w = tk.Label(row, image=photo, bg='white')
+                    w.pack(side=tk.LEFT, padx=2)
                 else:
-                    w = ttk.Label(row, text=f'{label}\n{state}', width=14, relief=tk.GROOVE, anchor=tk.CENTER)
-                w.pack(side=tk.LEFT, padx=2)
+                    # 浅灰描边：外层 #E0E0E0 边框框 + 内层扁平大 Label
+                    slot_outer = tk.Frame(row, bg='#E0E0E0')
+                    w = tk.Label(slot_outer, text=f'导入证件 {label}\n{state}', width=30, height=3,
+                                 bg='#F5F5F7', fg='#666666', relief=tk.FLAT,
+                                 anchor=tk.CENTER, font=("Microsoft YaHei", 11))
+                    w.pack(padx=1, pady=1)
+                    slot_outer.pack(side=tk.LEFT, padx=2)
                 w.bind('<Button-1>', lambda e, i=idx, s=side: self.on_slot_click(i, s))
                 if slot['image'] is not None:
-                    ttk.Label(row, text=state).pack(side=tk.LEFT)
+                    tk.Label(row, text=state, bg='white', fg='#666666').pack(side=tk.LEFT)
                 if DRAG_DROP_SUPPORTED:
                     try:
                         w.drop_target_register(DND_FILES)
                         w.dnd_bind('<<Drop>>', lambda e, i=idx, s=side: self.import_into_slot(i, s, e.data.strip().strip('{}').split('} {')[0]))
                     except Exception:
                         pass
-            ttk.Button(row, text='正反互换', command=lambda i=idx: self.swap_pair_sides(i), width=9).pack(side=tk.LEFT, padx=4)
-            ttk.Button(row, text='打开', command=lambda i=idx: self.open_pair(i), width=6).pack(side=tk.LEFT)
-            ttk.Button(row, text='删', command=lambda i=idx: self.delete_pair(i), width=4).pack(side=tk.LEFT)
+            tk.Button(row, text='正反互换', command=lambda i=idx: self.swap_pair_sides(i),
+                      bg='#F5F5F7', fg='#333333', activebackground='#E8E8EA',
+                      relief=tk.FLAT, padx=10, pady=4,
+                      cursor='hand2').pack(side=tk.LEFT, padx=4)
+            tk.Button(row, text='删', command=lambda i=idx: self.delete_pair(i),
+                      bg='#F5F5F7', fg='#333333', activebackground='#E8E8EA',
+                      relief=tk.FLAT, padx=8, pady=4,
+                      cursor='hand2').pack(side=tk.LEFT)
 
 
     def build_settings_bar(self, parent):
-        bar = ttk.LabelFrame(parent, text='输出设置', padding=5)
-        bar.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
+        # 换脸：两行设置 + 一条橙色大按钮
+        bar = tk.Frame(parent, bg='#EEF0F3')
+        bar.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+
+        # 第一行：左 新增一行 + 批量导入（蓝）；右 增强下拉 + 组数
+        row1 = tk.Frame(bar, bg='#EEF0F3')
+        row1.pack(fill=tk.X, pady=(0, 4))
+        tk.Button(row1, text='＋ 新增一行', command=self.add_pair,
+                  bg='#F5F5F7', fg='#333333', activebackground='#E8E8EA',
+                  relief=tk.FLAT, padx=12, pady=5,
+                  cursor='hand2').pack(side=tk.LEFT, padx=(0, 6))
+        tk.Button(row1, text='批量导入（两张一组）', command=self.batch_import,
+                  bg='#2F7CF6', fg='white', activebackground='#2F7CF6',
+                  activeforeground='white', relief=tk.FLAT,
+                  font=("Arial", 10, "bold"), padx=14, pady=5,
+                  cursor='hand2').pack(side=tk.LEFT)
+        enh_box = tk.Frame(row1, bg='#EEF0F3')
+        enh_box.pack(side=tk.RIGHT)
+        tk.Label(enh_box, text='增强：', bg='#EEF0F3').pack(side=tk.LEFT)
+        self._enhance_text_var = tk.StringVar(value='彩色')
+        _enh_map = {'原图': 'none', '彩色': 'color', '黑白': 'bw',
+                    '文档黑白': 'docbw', '文档彩色': 'doccolor'}
+
+        def _on_enh_combo(event=None):
+            v = _enh_map.get(self._enhance_text_var.get())
+            if v is not None:
+                self.enhance_var.set(v)
+                self._on_enhance_change()
+
+        self._enhance_combo = ttk.Combobox(enh_box, textvariable=self._enhance_text_var,
+                                           values=list(_enh_map.keys()),
+                                           width=10, state='readonly')
+        self._enhance_combo.pack(side=tk.LEFT)
+        self._enhance_combo.bind('<<ComboboxSelected>>', _on_enh_combo)
+        if hasattr(self, 'pairs_count_var'):
+            tk.Label(enh_box, textvariable=self.pairs_count_var, bg='#EEF0F3',
+                     fg='#888888').pack(side=tk.LEFT, padx=(8, 0))
+
+        # 第二行：安全水印参数 + 排版（沿用原有变量与控件）
+        row2 = tk.Frame(bar, bg='#EEF0F3')
+        row2.pack(fill=tk.X, pady=(0, 2))
         self.wm_enabled_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text='安全水印', variable=self.wm_enabled_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(row2, text='安全水印', variable=self.wm_enabled_var).pack(side=tk.LEFT)
         self.wm_text_var = tk.StringVar(value='')
-        ttk.Entry(bar, textvariable=self.wm_text_var, width=22).pack(side=tk.LEFT, padx=2)
-        ttk.Label(bar, text='字号').pack(side=tk.LEFT)
+        ttk.Entry(row2, textvariable=self.wm_text_var, width=22).pack(side=tk.LEFT, padx=2)
+        tk.Label(row2, text='字号', bg='#EEF0F3').pack(side=tk.LEFT)
         self.wm_size_var = tk.IntVar(value=7)
-        ttk.Spinbox(bar, from_=4, to=14, textvariable=self.wm_size_var, width=4).pack(side=tk.LEFT)
-        ttk.Label(bar, text='透明度%').pack(side=tk.LEFT)
+        ttk.Combobox(row2, values=list(range(4, 15)), textvariable=self.wm_size_var, width=4, state='readonly').pack(side=tk.LEFT)
+        tk.Label(row2, text='透明度%', bg='#EEF0F3').pack(side=tk.LEFT)
         self.wm_opacity_var = tk.IntVar(value=18)
-        ttk.Spinbox(bar, from_=5, to=60, textvariable=self.wm_opacity_var, width=4).pack(side=tk.LEFT)
-        ttk.Label(bar, text='行数').pack(side=tk.LEFT)
+        ttk.Combobox(row2, values=[5, 10, 15, 18, 20, 25, 30, 40, 50, 60], textvariable=self.wm_opacity_var, width=4, state='readonly').pack(side=tk.LEFT)
+        tk.Label(row2, text='行数', bg='#EEF0F3').pack(side=tk.LEFT)
         self.wm_rows_var = tk.IntVar(value=3)
-        ttk.Spinbox(bar, from_=1, to=6, textvariable=self.wm_rows_var, width=4).pack(side=tk.LEFT)
-        ttk.Label(bar, text='排版').pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Combobox(row2, values=list(range(1, 7)), textvariable=self.wm_rows_var, width=4, state='readonly').pack(side=tk.LEFT)
+        tk.Label(row2, text='排版', bg='#EEF0F3').pack(side=tk.LEFT, padx=(12, 0))
         self.template_var = tk.StringVar(value='标准（每组一页）')
-        ttk.Combobox(bar, textvariable=self.template_var, values=['标准（每组一页）', '紧凑拼版'], width=14, state='readonly').pack(side=tk.LEFT)
-        ttk.Button(bar, text='生成A4并预览', command=self.show_batch_preview, width=14).pack(side=tk.RIGHT, padx=2)
+        ttk.Combobox(row2, textvariable=self.template_var, values=['标准（每组一页）', '紧凑拼版'], width=14, state='readonly').pack(side=tk.LEFT)
+
+        # 第三行：整条橙色大按钮
+        tk.Button(bar, text='生成 A4 并预览', command=self.show_batch_preview,
+                  bg='#FF9500', fg='white', activebackground='#FF9500',
+                  activeforeground='white', relief=tk.FLAT,
+                  font=("Arial", 13, "bold"), pady=10,
+                  cursor='hand2').pack(fill=tk.X, pady=(6, 0))
 
     def _template_key(self):
         v = self.template_var.get() if hasattr(self, 'template_var') else ''
@@ -1534,7 +1592,7 @@ class IDCardProcessor:
         else:
             side_name = "银行卡"
             
-        self.mark_window.title(f"标记{side_name} - 请依次点击4个角点")
+        self.mark_window.title(f"标记{side_name} - 请点击4个角点（顺序不限）")
         
         # 根据图片大小设置窗口尺寸
         img_width, img_height = image.size
@@ -1573,6 +1631,7 @@ class IDCardProcessor:
         
         # 自动开始标记
         self.is_marking = True
+        self._drag_idx = None
         
         # 创建主框架
         main_frame = ttk.Frame(self.mark_window)
@@ -1646,6 +1705,8 @@ class IDCardProcessor:
         
         # 绑定事件
         self.mark_canvas.bind("<Button-1>", self.mark_point)
+        self.mark_canvas.bind("<B1-Motion>", self.drag_mark_point)
+        self.mark_canvas.bind("<ButtonRelease-1>", self.end_drag_mark_point)
         self.mark_canvas.bind("<Motion>", self.draw_crosshair)
         self.mark_canvas.bind("<Leave>", self.clear_crosshair)
         
@@ -1682,11 +1743,11 @@ class IDCardProcessor:
             
             # 添加说明文本
             self.mark_canvas.create_text(10, 20, anchor="nw",
-                                         text="请依次点击4个角点: 左上→右上→右下→左下 或 点击'自动识别'",
+                                         text="请点击证件4个角点（顺序不限，点偏了可直接拖动）或点击'自动识别'",
                                          fill="white", font=("Arial", 12, "bold"))
             
             side_name = "身份证人像面" if side == "front" else "身份证国徽面" if side == "back" else "银行卡"
-            self.update_status(f"已自动开始标记{side_name}，请依次点击4个角点或使用自动识别")
+            self.update_status(f"已自动开始标记{side_name}，请点击4个角点（顺序不限）或使用自动识别")
             # 新增：标记窗口打开后先静默尝试真自动识别，成功直接完成该面处理、
             # 不弹窗确认；失败则什么都不做，停留在原手动标记流程。
             self.mark_window.after(150, lambda s=side: self.try_auto_finish(s))
@@ -2171,6 +2232,8 @@ class IDCardProcessor:
         self.mark_canvas.bind("<Button-1>", self.mark_point)
         self.mark_canvas.unbind("<B1-Motion>")
         self.mark_canvas.unbind("<ButtonRelease-1>")
+        self.mark_canvas.bind("<B1-Motion>", self.drag_mark_point)
+        self.mark_canvas.bind("<ButtonRelease-1>", self.end_drag_mark_point)
         
         # 更新按钮
         control_frame = self.mark_window.winfo_children()[0].winfo_children()[0]
@@ -2217,6 +2280,8 @@ class IDCardProcessor:
         self.mark_canvas.bind("<Button-1>", self.mark_point)
         self.mark_canvas.unbind("<B1-Motion>")
         self.mark_canvas.unbind("<ButtonRelease-1>")
+        self.mark_canvas.bind("<B1-Motion>", self.drag_mark_point)
+        self.mark_canvas.bind("<ButtonRelease-1>", self.end_drag_mark_point)
         
         # 重新显示原始点
         self.display_image_on_canvas()
@@ -2449,7 +2514,7 @@ class IDCardProcessor:
                     self.finish_marking_btn.config(state="disabled")
                 # 重新添加说明文本
                 self.mark_canvas.create_text(10, 20, anchor="nw",
-                                             text="请依次点击4个角点: 左上→右上→右下→左下 或 点击'自动识别'",
+                                             text="请点击证件4个角点（顺序不限，点偏了可直接拖动）或点击'自动识别'",
                                              fill="white", font=("Arial", 12, "bold"))
     
     def draw_crosshair(self, event):
@@ -2503,6 +2568,7 @@ class IDCardProcessor:
     
     def reset_marking(self, side):
         """重置标记"""
+        self._drag_idx = None
         if side == "front":
             self.front_points = []
         elif side == "back":
@@ -2526,7 +2592,7 @@ class IDCardProcessor:
                 side_name = "身份证国徽面"
             else:
                 side_name = "银行卡"
-            self.update_status(f"已开始标记{side_name}，请依次点击4个角点")
+            self.update_status(f"已开始标记{side_name}，请点击4个角点（顺序不限）")
             
         side = self.current_marking_side
         
@@ -2537,10 +2603,6 @@ class IDCardProcessor:
         else:
             points = self.card_points
         
-        if len(points) >= 4:
-            messagebox.showinfo("提示", "已选择4个点，可以点击'完成标记'或按回车键")
-            return
-            
         # 获取画布坐标（考虑滚动）
         canvas_x = self.mark_canvas.canvasx(event.x)
         canvas_y = self.mark_canvas.canvasy(event.y)
@@ -2548,11 +2610,30 @@ class IDCardProcessor:
         # 转换坐标到原始图像坐标（考虑缩放）
         img_x = canvas_x / self.current_scale
         img_y = canvas_y / self.current_scale
+        # 自由标角：点中已有角点附近 → 抓起该点拖动，不新增点
+        if points:
+            _thr = 14 / self.current_scale if self.current_scale else 14
+            for _i, (_px, _py) in enumerate(points):
+                if ((_px - img_x) ** 2 + (_py - img_y) ** 2) ** 0.5 <= _thr:
+                    self._drag_idx = _i
+                    _iw, _ih = self.original_image.size
+                    points[_i] = (int(max(0, min(img_x, _iw - 1))),
+                                  int(max(0, min(img_y, _ih - 1))))
+                    self.display_image_on_canvas()
+                    self.update_status('正在拖动角点，松开鼠标放开')
+                    return
+        
+        if len(points) >= 4:
+            messagebox.showinfo("提示", "已选择4个点，可以点击'完成标记'或按回车键")
+            return
+            
         
         # 确保坐标在图像范围内
         img_width, img_height = self.original_image.size
         if 0 <= img_x < img_width and 0 <= img_y < img_height:
             points.append((int(img_x), int(img_y)))
+            if len(points) == 4:
+                points[:] = _order_quad_points(points)
             
             # 重新显示图片以更新标记点
             self.display_image_on_canvas()
@@ -2570,6 +2651,53 @@ class IDCardProcessor:
                 if response:
                     self.finish_marking(side)
     
+
+    def drag_mark_point(self, event):
+        """标记模式下拖动已放下的角点（自由标角）"""
+        if getattr(self, '_drag_idx', None) is None or getattr(self, 'adjust_mode', False):
+            return
+        if not self.mark_canvas:
+            return
+        side = self.current_marking_side
+        if side == "front":
+            points = self.front_points
+        elif side == "back":
+            points = self.back_points
+        else:
+            points = self.card_points
+        if self._drag_idx >= len(points):
+            return
+        canvas_x = self.mark_canvas.canvasx(event.x)
+        canvas_y = self.mark_canvas.canvasy(event.y)
+        img_x = canvas_x / self.current_scale
+        img_y = canvas_y / self.current_scale
+        img_width, img_height = self.original_image.size
+        img_x = max(0, min(img_x, img_width - 1))
+        img_y = max(0, min(img_y, img_height - 1))
+        new_point = (int(img_x), int(img_y))
+        old_point = points[self._drag_idx]
+        if abs(new_point[0] - old_point[0]) < 2 and abs(new_point[1] - old_point[1]) < 2:
+            return
+        points[self._drag_idx] = new_point
+        self.display_image_on_canvas()
+    
+    def end_drag_mark_point(self, event):
+        """结束拖动角点"""
+        if getattr(self, '_drag_idx', None) is None:
+            return
+        self._drag_idx = None
+        try:
+            side = self.current_marking_side
+            if side == "front":
+                points = self.front_points
+            elif side == "back":
+                points = self.back_points
+            else:
+                points = self.card_points
+            self.update_status(f"已选择 {len(points)}/4 个点")
+        except Exception:
+            pass
+
     def _on_enhance_change(self):
         if self.enhance_var is not None:
             self.enhance_mode = self.enhance_var.get()
@@ -2613,6 +2741,9 @@ class IDCardProcessor:
         if len(points) != 4:
             messagebox.showwarning("警告", "请先标记4个点")
             return
+
+        # 自由标角：点击顺序不限，统一排成 左上→右上→右下→左下
+        points[:] = _order_quad_points(points)
 
         # 角点合法性把关：四点重合或围出的面积太小，拉正必然失败，先给人话提示
         try:
