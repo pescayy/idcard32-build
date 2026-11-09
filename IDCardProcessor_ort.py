@@ -343,7 +343,7 @@ def _apply_watermark(page_img, text, font_px, opacity_pct, rows):
 class IDCardProcessor:
     def __init__(self, root):
         self.root = root
-        self.root.title("证件图片处理器·复刻版（AI批量） by wc")
+        self.root.title("证件图片处理器·复刻版（AI批量） by xm")
         self.enhance_mode = "color"
         self.enhance_var = None
         
