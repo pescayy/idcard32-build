@@ -323,6 +323,10 @@ def _apply_watermark(page_img, text, font_px, opacity_pct, rows):
 class IDCardProcessor:
     def __init__(self, root):
         self.root = root
+        try:
+            tk._default_root = root
+        except Exception:
+            pass
         self.root.title("证件图片处理器·开发版（AI批量） by xm")
         self.enhance_mode = "color"
         self.enhance_var = None
@@ -3612,7 +3616,14 @@ def main():
             print("TkinterDnD初始化失败，使用标准tkinter")
     else:
         root = tk.Tk()
-    
+
+    # 钉死默认根为实际使用的 root：拖拽根创建中途失败回落时可能留下双根，
+    # PhotoImage 默认挂靠第一个根会与界面所在根不是同一个，导致 image 不存在报错
+    try:
+        tk._default_root = root
+    except Exception:
+        pass
+
     app = IDCardProcessor(root)
     root.mainloop()
 
