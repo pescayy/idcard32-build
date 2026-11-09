@@ -8,6 +8,13 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout model parts
+        uses: actions/checkout@v4
+        with:
+          ref: assets
+          path: modelparts
+      - name: Assemble AI model
+        run: python -c "import base64,glob,hashlib,os; parts=sorted(glob.glob('modelparts/models/b64/model.b64.*')); data=b''.join(open(p,'rb').read() for p in parts); raw=base64.b64decode(data); os.makedirs('models',exist_ok=True); open('models/carddetection_scrfd34gkps.onnx','wb').write(raw); print(len(parts),'parts ->',len(raw),'bytes'); assert hashlib.md5(raw).hexdigest()=='bb47635d61f21d63d3993162c28303ff', 'model md5 mismatch'"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.8.10'
@@ -19,7 +26,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Build exe with PyInstaller
-        run: pyinstaller --noconfirm --onefile --windowed --name IDCardProcessor32 IDCardProcessor_auto_10.py
+        run: pyinstaller --noconfirm --onefile --windowed --name IDCardProcessor32 --collect-all tkinterdnd2 --add-data "models/carddetection_scrfd34gkps.onnx;models" IDCardProcessor_auto_10.py
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
