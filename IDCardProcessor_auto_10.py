@@ -1080,6 +1080,7 @@ class IDCardProcessor:
         if not files:
             return
         ok, manual = 0, 0
+        bad = []
         for start in range(0, len(files), 2):
             idx = self.add_pair()
             for off, side in enumerate(('front', 'back')):
@@ -1090,6 +1091,7 @@ class IDCardProcessor:
                     image = Image.open(path)
                     image.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
                 except Exception:
+                    bad.append(path.replace('\\', '/').split('/')[-1])
                     continue
                 self.pairs[idx][side]['path'] = path
                 setattr(self, side + '_image', image)
@@ -1107,7 +1109,10 @@ class IDCardProcessor:
                     manual += 1
             self._stash_workspace()
         self.refresh_pairs_panel()
-        self.update_status(f'批量导入完成：自动处理 {ok} 张，待手动标角 {manual} 张')
+        _msg = f'批量导入完成：自动处理 {ok} 张，待手动标角 {manual} 张'
+        if bad:
+            _msg += f"，另有 {len(bad)} 张读不了：{'、'.join(bad[:3])}"
+        self.update_status(_msg)
 
     def on_slot_click(self, idx, side):
         slot = self.pairs[idx][side]
@@ -1663,7 +1668,7 @@ class IDCardProcessor:
             h0, w0 = img_cv.shape[:2]
             scale = 800.0 / w0 if w0 > 800 else 1.0
             if scale != 1.0:
-                work = cv2.resize(img_cv, (int(w0 * scale), int(h0 * scale)),
+                work = cv2.resize(img_cv, (max(1, int(w0 * scale)), max(1, int(h0 * scale))),
                                   interpolation=cv2.INTER_AREA)
             else:
                 work = img_cv
@@ -2336,8 +2341,8 @@ class IDCardProcessor:
             img_width, img_height = self.original_image.size
             
             # 计算缩放后的尺寸
-            scaled_width = int(img_width * self.current_scale)
-            scaled_height = int(img_height * self.current_scale)
+            scaled_width = max(1, int(img_width * self.current_scale))
+            scaled_height = max(1, int(img_height * self.current_scale))
             
             # 缩放图片
             if self.current_scale != 1.0:
@@ -2573,6 +2578,20 @@ class IDCardProcessor:
         if len(points) != 4:
             messagebox.showwarning("警告", "请先标记4个点")
             return
+
+        # 角点合法性把关：四点重合或围出的面积太小，拉正必然失败，先给人话提示
+        try:
+            _pts = [(float(p[0]), float(p[1])) for p in points]
+            _area = 0.0
+            for _i in range(4):
+                _x1, _y1 = _pts[_i]
+                _x2, _y2 = _pts[(_i + 1) % 4]
+                _area += _x1 * _y2 - _x2 * _y1
+            if abs(_area) / 2.0 < 200:
+                messagebox.showwarning("警告", "标记的4个角点太挤或有重合，请重新点击4个角")
+                return
+        except Exception:
+            pass
         
         try:
             # 执行透视变换
