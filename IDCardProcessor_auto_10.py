@@ -1045,7 +1045,97 @@ class IDCardProcessor:
             
             side_name = "身份证人像面" if side == "front" else "身份证国徽面" if side == "back" else "银行卡"
             self.update_status(f"已自动开始标记{side_name}，请依次点击4个角点或使用自动识别")
+            # 新增：标记窗口打开后先静默尝试真自动识别，成功直接完成该面处理、
+            # 不弹窗确认；失败则什么都不做，停留在原手动标记流程。
+            self.mark_window.after(150, lambda s=side: self.try_auto_finish(s))
     
+    def detect_card_corners(self, image):
+        """纯检测：返回按左上→右上→右下→左下排序的角点列表（原图坐标），失败返回 None。
+        多路二值化取最大轮廓，凸包近似四边形，近似不成功则退最小外接矩形，
+        最后用原有四边形校验把关，宁可失败也不给错框。"""
+        try:
+            img_cv = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+            h0, w0 = img_cv.shape[:2]
+            scale = 800.0 / w0 if w0 > 800 else 1.0
+            if scale != 1.0:
+                work = cv2.resize(img_cv, (int(w0 * scale), int(h0 * scale)),
+                                  interpolation=cv2.INTER_AREA)
+            else:
+                work = img_cv
+            hw, ww = work.shape[:2]
+            gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+            _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            binaries = [otsu, 255 - otsu, cv2.Canny(gray, 50, 150)]
+
+            kernel = np.ones((5, 5), np.uint8)
+            best = None
+            for binary in binaries:
+                closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+                contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
+                                               cv2.CHAIN_APPROX_SIMPLE)
+                if not contours:
+                    continue
+                contours = sorted(contours, key=cv2.contourArea, reverse=True)[:3]
+                for contour in contours:
+                    area = cv2.contourArea(contour)
+                    if area < hw * ww * 0.12:
+                        continue
+                    hull = cv2.convexHull(contour)
+                    quad = None
+                    for eps_factor in (0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05):
+                        approx = cv2.approxPolyDP(hull, eps_factor * cv2.arcLength(hull, True), True)
+                        if len(approx) == 4:
+                            quad = approx.reshape(4, 2)
+                            break
+                    if quad is None:
+                        quad = cv2.boxPoints(cv2.minAreaRect(hull)).astype(np.float32)
+                    corners = self.order_points(np.array(quad, dtype=np.float32))
+                    # 整幅画面的边框不是卡：面积占满全图的一律跳过（实测假阳性）
+                    if cv2.contourArea(corners.reshape(-1, 1, 2)) > hw * ww * 0.90:
+                        continue
+                    if not cv2.isContourConvex(corners.astype(np.int32).reshape(-1, 1, 2)):
+                        continue
+                    if not self._validate_quadrilateral(corners.copy(), hw, ww):
+                        continue
+                    if best is None or area > best[0]:
+                        best = (area, corners)
+            if best is None:
+                return None
+            corners = best[1] / scale
+            return [[float(x), float(y)] for x, y in corners]
+        except Exception:
+            return None
+
+    def try_auto_finish(self, side):
+        """标记窗口打开后静默尝试自动识别：成功直接完成该面处理（不弹窗确认）；
+        失败不打扰用户，停留在手动标记流程。"""
+        try:
+            if self.mark_window is None or self.current_marking_side != side:
+                return
+            if side == "front":
+                image, points = self.front_image, self.front_points
+            elif side == "back":
+                image, points = self.back_image, self.back_points
+            else:
+                image, points = self.card_image, self.card_points
+            if image is None or len(points) == 4:
+                return
+            corners = self.detect_card_corners(image)
+            if not corners:
+                self.update_status("自动识别未成功，请手动点击4个角点，或点上方'自动识别'再试")
+                return
+            if side == "front":
+                self.front_points = corners
+            elif side == "back":
+                self.back_points = corners
+            else:
+                self.card_points = corners
+            self.finish_marking(side)
+        except Exception:
+            pass
+
     def auto_detect_corners(self, side):
         """改进的自动识别证件角点 - 使用凸包检测与最小四边形判断"""
         try:
@@ -1060,6 +1150,21 @@ class IDCardProcessor:
             if image is None:
                 messagebox.showwarning("警告", "图片未加载")
                 return False
+
+            # 新增快速通道：先用新检测器试一次，成功就不必走旧流程
+            corners_new = self.detect_card_corners(image)
+            if corners_new:
+                if side == "front":
+                    self.front_points = corners_new
+                elif side == "back":
+                    self.back_points = corners_new
+                else:
+                    self.card_points = corners_new
+                self.display_image_on_canvas()
+                if self.finish_marking_btn:
+                    self.finish_marking_btn.config(state="normal")
+                self.update_status("自动识别成功！可直接点击'完成标记'，或拖动角点微调")
+                return True
 
             # 转换图片为OpenCV格式
             img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
@@ -1191,21 +1296,11 @@ class IDCardProcessor:
                 
                 self.update_status("自动识别成功！")
 
-                # 询问用户是否满意，如果不满意，进入调整模式
-                result = messagebox.askyesno("识别结果", 
-                    "已自动识别证件角点！\n\n是否满意当前识别结果？\n\n" +
-                    "点击'是'：使用当前结果\n" +
-                    "点击'否'：手动调整角点位置")
-
-                if not result:
-                    # 进入调整模式
-                    self.enter_adjust_mode(side)
-                    return False
-                else:
-                    # 启用完成标记按钮
-                    if self.finish_marking_btn:
-                        self.finish_marking_btn.config(state="normal")
-                    return True
+                # 不再弹窗询问是否满意：识别成功即启用完成标记，
+                # 用户可直接完成，或自行拖动角点微调。
+                if self.finish_marking_btn:
+                    self.finish_marking_btn.config(state="normal")
+                return True
             else:
                 self.update_status("自动识别失败，请手动标记")
                 messagebox.showwarning("警告", 
