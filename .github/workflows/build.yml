@@ -61,3 +61,32 @@ jobs:
         with:
           name: IDCardProcessor32-win7-fuke
           path: dist/IDCardProcessor32FK.exe
+  build-quanneng:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout model parts
+        uses: actions/checkout@v4
+        with:
+          ref: assets
+          path: modelparts
+      - name: Assemble AI model
+        run: python -c "import base64,glob,hashlib,os; parts=sorted(glob.glob('modelparts/models/b64/model.b64.*')); data=b''.join(open(p,'rb').read() for p in parts); raw=base64.b64decode(data); os.makedirs('models',exist_ok=True); open('models/carddetection_scrfd34gkps.onnx','wb').write(raw); print(len(parts),'parts ->',len(raw),'bytes'); assert hashlib.md5(raw).hexdigest()=='bb47635d61f21d63d3993162c28303ff', 'model md5 mismatch'"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8.10'
+          architecture: 'x86'
+      - name: Show python bitness
+        run: python -c "import struct,sys; print(sys.version); print(struct.calcsize('P')*8)"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install onnxruntime==1.14.1 rapidocr-onnxruntime==1.4.4 openpyxl==3.1.5
+      - name: Build exe with PyInstaller
+        run: pyinstaller --noconfirm --onefile --windowed --name IDCardProcessor32QN --collect-all tkinterdnd2 --collect-all onnxruntime --collect-all rapidocr_onnxruntime --add-data "models/carddetection_scrfd34gkps.onnx;models" IDCardProcessor_full.py
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IDCardProcessor32-win7-quanneng
+          path: dist/IDCardProcessor32QN.exe
