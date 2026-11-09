@@ -1215,6 +1215,22 @@ class IDCardProcessor:
                 self.current_open = None
             self.refresh_pairs_panel()
 
+    def clear_slot(self, idx, side):
+        """只清一面（行尾「删组」是整组）：清掉该槽位的原图/角点/处理结果/读字，可单独重传这一面"""
+        if not (0 <= idx < len(self.pairs)):
+            return
+        self.pairs[idx][side] = self._new_slot()
+        if getattr(self, 'current_open', None) == idx:
+            setattr(self, side + '_image', None)
+            setattr(self, side + '_points', [])
+            setattr(self, side + '_processed', None)
+            try:
+                self.draw_a4_layout()
+            except Exception:
+                pass
+        self.update_status(f"第{idx + 1}组{'正面' if side == 'front' else '反面'}已删除，可以重新导入这一面")
+        self.refresh_pairs_panel()
+
     def swap_pair_sides(self, idx):
         """正反面互换（青点名要的功能）：整组数据对调，含原图/角点/处理结果"""
         if 0 <= idx < len(self.pairs):
@@ -1224,6 +1240,24 @@ class IDCardProcessor:
                 self._load_pair_to_workspace(idx)
             self.refresh_pairs_panel()
             self.update_status('已互换正反面')
+
+    def _auto_process_slot(self, idx, side, image):
+        """放入即自动识别（对齐 IDCardMerge 交互）：识别成功直接处理完返回 True；
+        没认出来返回 False，交给标角窗口手动处理。与批量导入同一条识别线。"""
+        setattr(self, side + '_image', image)
+        setattr(self, side + '_points', [])
+        corners = None
+        try:
+            corners = self.ai_detect_corners(image)
+            if not corners and not getattr(self, '_ai_ran', False):
+                corners = self.detect_card_corners(image)
+        except Exception:
+            corners = None
+        if corners:
+            setattr(self, side + '_points', corners)
+            self.finish_marking(side)
+            return True
+        return False
 
     def import_into_slot(self, idx, side, file_path=None):
         self.open_pair(idx)
@@ -1237,7 +1271,12 @@ class IDCardProcessor:
             image = Image.open(file_path)
             image.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
             self.pairs[idx][side]['path'] = file_path
-            self.show_image_for_marking(side, image, file_path)
+            if self._auto_process_slot(idx, side, image):
+                self.refresh_pairs_panel()
+                self.update_status(f"第{idx + 1}组{'正面' if side == 'front' else '反面'}已自动识别处理完成")
+            else:
+                self.show_image_for_marking(side, image, file_path)
+                self.update_status('自动识别没成功，请在窗口里手动标4个角点')
         except Exception as e:
             messagebox.showerror('错误', f'加载图片失败: {str(e)}')
 
@@ -1300,7 +1339,11 @@ class IDCardProcessor:
             self.reopen_for_adjustment(side)
         else:
             self.open_pair(idx)
-            self.show_image_for_marking(side, slot['image'], slot['path'])
+            if self._auto_process_slot(idx, side, slot['image']):
+                self.refresh_pairs_panel()
+                self.update_status(f"第{idx + 1}组{'正面' if side == 'front' else '反面'}已自动识别处理完成")
+            else:
+                self.show_image_for_marking(side, slot['image'], slot['path'])
 
     def build_pairs_panel(self, parent):
         # 换脸：无边框白底，组列表占满主区域
@@ -1376,6 +1419,10 @@ class IDCardProcessor:
                 w.bind('<Button-1>', lambda e, i=idx, s=side: self.on_slot_click(i, s))
                 if slot['image'] is not None:
                     tk.Label(row, text=state, bg='white', fg='#666666').pack(side=tk.LEFT)
+                    tk.Button(row, text='×', command=lambda i=idx, s=side: self.clear_slot(i, s),
+                              bg='white', fg='#C0392B', activebackground='#FDECEA',
+                              relief=tk.FLAT, padx=2, pady=0,
+                              font=("Arial", 12, "bold"), cursor='hand2').pack(side=tk.LEFT)
                 if DRAG_DROP_SUPPORTED:
                     try:
                         w.drop_target_register(DND_FILES)
@@ -1386,7 +1433,7 @@ class IDCardProcessor:
                       bg='#F5F5F7', fg='#333333', activebackground='#E8E8EA',
                       relief=tk.FLAT, padx=10, pady=4,
                       cursor='hand2').pack(side=tk.LEFT, padx=4)
-            tk.Button(row, text='删', command=lambda i=idx: self.delete_pair(i),
+            tk.Button(row, text='删组', command=lambda i=idx: self.delete_pair(i),
                       bg='#F5F5F7', fg='#333333', activebackground='#E8E8EA',
                       relief=tk.FLAT, padx=8, pady=4,
                       cursor='hand2').pack(side=tk.LEFT)
@@ -3057,7 +3104,7 @@ class IDCardProcessor:
                     self.generate_a4_layout()
             
         except Exception as e:
-            messagebox.showerror("错误", f"处理失败: {str(e)}")
+            messagebox.showerror("错误", "处理失败：角点位置可能交叉或重合，请重新调整角点后再试")
     
     def show_processed_result(self, side, processed_image):
         """在A4区域显示处理结果，并添加点击事件"""
