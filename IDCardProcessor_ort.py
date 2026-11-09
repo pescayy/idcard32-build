@@ -325,7 +325,7 @@ def _load_cjk_font(px):
     return ImageFont.load_default()
 
 
-def _apply_watermark(page_img, text, font_px, opacity_pct, rows):
+def _apply_watermark(page_img, text, font_px, opacity_pct, rows, color_rgb=(110, 110, 110)):
     """整页平铺斜向水印（对齐 IDCardMerge 的安全水印：文字/字号/透明度/行数）"""
     base = page_img.convert('RGBA')
     W, H = base.size
@@ -333,7 +333,7 @@ def _apply_watermark(page_img, text, font_px, opacity_pct, rows):
     draw = ImageDraw.Draw(overlay)
     font = _load_cjk_font(font_px)
     alpha = max(0, min(255, int(opacity_pct * 255 / 100)))
-    color = (110, 110, 110, alpha)
+    color = (color_rgb[0], color_rgb[1], color_rgb[2], alpha)
     try:
         tw = draw.textlength(text, font=font)
     except Exception:
@@ -357,7 +357,7 @@ class IDCardProcessor:
             tk._default_root = root
         except Exception:
             pass
-        self.root.title("证件图片处理器·复刻版（AI批量） by xm · 1110拖版")
+        self.root.title("证件图片处理器·复刻版（AI批量） by xm · 1110打磨版")
         self.enhance_mode = "color"
         self.enhance_var = None
         
@@ -1393,6 +1393,9 @@ class IDCardProcessor:
         tk.Label(row2, text='字号', bg='#EEF0F3').pack(side=tk.LEFT)
         self.wm_size_var = tk.IntVar(value=7)
         ttk.Combobox(row2, values=list(range(4, 15)), textvariable=self.wm_size_var, width=4, state='readonly').pack(side=tk.LEFT)
+        tk.Label(row2, text='颜色', bg='#EEF0F3').pack(side=tk.LEFT)
+        self.wm_color_var = tk.StringVar(value='黑色')
+        ttk.Combobox(row2, values=['黑色', '蓝色', '红色', '灰色'], textvariable=self.wm_color_var, width=4, state='readonly').pack(side=tk.LEFT)
         tk.Label(row2, text='透明度%', bg='#EEF0F3').pack(side=tk.LEFT)
         self.wm_opacity_var = tk.IntVar(value=18)
         ttk.Combobox(row2, values=[5, 10, 15, 18, 20, 25, 30, 40, 50, 60], textvariable=self.wm_opacity_var, width=4, state='readonly').pack(side=tk.LEFT)
@@ -1492,7 +1495,9 @@ class IDCardProcessor:
             text = self.wm_text_var.get().strip()
             if text:
                 font_px = int(self.wm_size_var.get() * s)
-                pages = [_apply_watermark(p, text, font_px, self.wm_opacity_var.get(), self.wm_rows_var.get()) for p in pages]
+                _wm_colors = {'黑色': (0, 0, 0), '蓝色': (30, 90, 200), '红色': (220, 30, 30), '灰色': (110, 110, 110)}
+                _wm_rgb = _wm_colors.get(self.wm_color_var.get() if getattr(self, 'wm_color_var', None) is not None else '黑色', (0, 0, 0))
+                pages = [_apply_watermark(p, text, font_px, self.wm_opacity_var.get(), self.wm_rows_var.get(), _wm_rgb) for p in pages]
         self.batch_pages = pages
         return pages
 
@@ -1512,15 +1517,36 @@ class IDCardProcessor:
         s = self.mm_to_pixel
         pw, ph = int(self.a4_width * s), int(self.a4_height * s)
         cw, ch = int(self.id_width * s), int(self.id_height * s)
-        scale = min(820 / pw, 940 / ph)
+        scale = min(860 / pw, 800 / ph)
         dw, dh = int(pw * scale), int(ph * scale)
         dcw, dch = max(10, int(cw * scale)), max(10, int(ch * scale))
-        ox, oy = 430 - dw // 2, 495 - dh // 2
+        ox, oy = (900 - dw) // 2, (840 - dh) // 2 + 16
         win = ToplevelWithIcon(self.root)
-        win.title('A4 拼版预览（可拖动卡片调整位置）')
-        win.geometry('860x1020')
+        win.title('可交互排版预览（支持拖放）')
+        win.geometry('900x960')
         state = {'idx': 0, 'photos': [], 'drag': None}
-        canvas = tk.Canvas(win, bg='gray')
+
+        # 顶部工具条（对齐 IDCardMerge 交互预览：按钮在上、颜色分工，个个是真功能）
+        toolbar = tk.Frame(win, bg='white')
+        toolbar.pack(side=tk.TOP, fill=tk.X)
+        _btn_font = ('Arial', 10)
+        def _tbtn(text, cmd, bg=None, fg=None):
+            kw = dict(text=text, command=cmd, font=_btn_font, relief=tk.FLAT,
+                      padx=12, pady=5, cursor='hand2')
+            if bg:
+                kw.update(bg=bg, fg=fg or 'white', activebackground=bg, activeforeground=fg or 'white')
+            b = tk.Button(toolbar, **kw)
+            b.pack(side=tk.LEFT, padx=3, pady=5)
+            return b
+        _tbtn('导出裁剪', self._export_crops)
+        _tbtn('导出为 JPG', lambda: self._export_pages_jpg(ask_mode=True), bg='#2E7CF6')
+        _tbtn('导出单页 PDF', self._export_pages_pdf_single, bg='#2E7CF6')
+        _tbtn('导出合并 PDF', self._export_pages_pdf, bg='#43C93B')
+        _tbtn('系统直接打印', self._print_pages)
+
+        header = tk.Label(win, text='', bg='#808080', fg='#F0F0F0', font=('Arial', 10))
+        header.pack(side=tk.TOP, fill=tk.X)
+        canvas = tk.Canvas(win, bg='#808080', highlightthickness=0)
         canvas.pack(fill=tk.BOTH, expand=True)
 
         def render():
@@ -1535,6 +1561,7 @@ class IDCardProcessor:
                 photo = ImageTk.PhotoImage(thumb, master=self.root)
                 state['photos'].append(photo)
                 canvas.create_image(dx, dy, image=photo, anchor=tk.NW, tags=(tag,))
+            header.config(text=f"--- 第 {state['idx'] + 1} 页 A4 画布 ---")
             info.config(text=f"第 {state['idx'] + 1} / {len(layout)} 页 · 拖动卡片可调整位置，保存/打印按新位置")
 
         def on_press(event):
@@ -1579,21 +1606,80 @@ class IDCardProcessor:
         canvas.bind('<ButtonPress-1>', on_press)
         canvas.bind('<B1-Motion>', on_motion)
         canvas.bind('<ButtonRelease-1>', on_release)
-        bar = ttk.Frame(win)
-        bar.pack(side=tk.BOTTOM, fill=tk.X, pady=6)
-        info = ttk.Label(bar, text='')
-        info.pack(side=tk.LEFT, padx=8)
-        ttk.Button(bar, text='上一页', command=lambda: (state.update(idx=(state['idx'] - 1) % len(layout)), render())).pack(side=tk.LEFT)
-        ttk.Button(bar, text='下一页', command=lambda: (state.update(idx=(state['idx'] + 1) % len(layout)), render())).pack(side=tk.LEFT)
-        ttk.Button(bar, text='保存JPG', command=self._export_pages_jpg, width=10).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(bar, text='保存PDF', command=self._export_pages_pdf, width=10).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(bar, text='打印', command=self._print_pages, width=8).pack(side=tk.RIGHT, padx=2)
+        bar = tk.Frame(win, bg='#F0F0F0')
+        bar.pack(side=tk.BOTTOM, fill=tk.X)
+        info = tk.Label(bar, text='', bg='#F0F0F0', fg='#555555', font=('Arial', 9))
+        info.pack(side=tk.LEFT, padx=8, pady=4)
+        ttk.Button(bar, text='下一页', command=lambda: (state.update(idx=(state['idx'] + 1) % len(layout)), render())).pack(side=tk.RIGHT, padx=4, pady=3)
+        ttk.Button(bar, text='上一页', command=lambda: (state.update(idx=(state['idx'] - 1) % len(layout)), render())).pack(side=tk.RIGHT, padx=4, pady=3)
         render()
 
-    def _export_pages_jpg(self):
-        if getattr(self, 'layout_pages', None):
-            self.render_pages()
-        pages = getattr(self, 'batch_pages', None) or self.compose_a4_pages()
+    def _export_crops(self):
+        """导出裁剪：把各组已拉正的证件图逐张存到所选文件夹（真功能）"""
+        items = []
+        for gi, pair in enumerate(self.pairs):
+            for side, sname in (('front', '正面'), ('back', '反面')):
+                img = pair[side].get('processed') if isinstance(pair.get(side), dict) else None
+                if img is not None:
+                    items.append((gi + 1, sname, img))
+        if not items:
+            messagebox.showwarning('提示', '还没有已处理的证件可导出')
+            return
+        folder = filedialog.askdirectory(title='选择保存文件夹', initialdir=self._get_last_dir() or None)
+        if not folder:
+            return
+        self._remember_dir(folder)
+        for gi, sname, img in items:
+            img.convert('RGB').save(os.path.join(folder, f'第{gi}组-{sname}.jpg'), quality=95)
+        messagebox.showinfo('完成', f'已导出 {len(items)} 张裁剪图到所选文件夹')
+
+    def _choose_jpg_mode(self, parent):
+        """JPG 导出模式弹窗（对齐 IDCardMerge 子菜单）：完整 A4 / 紧凑拼图，
+        默认预选当前排版，返回 'full' / 'compact' / None"""
+        result = {'mode': None}
+        dlg = ToplevelWithIcon(parent)
+        dlg.title('选择 JPG 导出模式')
+        dlg.geometry('380x210')
+        dlg.transient(parent)
+        dlg.grab_set()
+        tk.Label(dlg, text='请选择需要导出的画布类型：', font=('Arial', 10)).pack(anchor='w', padx=18, pady=(16, 8))
+        var = tk.StringVar(value='compact' if self._template_key() == 'compact' else 'full')
+        tk.Radiobutton(dlg, text='完整 A4 画布（带白边，适合直接打印）', variable=var, value='full', font=('Arial', 10)).pack(anchor='w', padx=26, pady=3)
+        tk.Radiobutton(dlg, text='紧凑证件拼图（无多余白边，适合插入 Word/Excel）', variable=var, value='compact', font=('Arial', 10)).pack(anchor='w', padx=26, pady=3)
+        brow = tk.Frame(dlg)
+        brow.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=12)
+        tk.Button(brow, text='下一步', bg='#2E7CF6', fg='white', activebackground='#2E7CF6',
+                  activeforeground='white', relief=tk.FLAT, padx=16, pady=4,
+                  command=lambda: (result.update(mode=var.get()), dlg.destroy())).pack(side=tk.RIGHT)
+        tk.Button(brow, text='取消', relief=tk.FLAT, padx=16, pady=4,
+                  command=dlg.destroy).pack(side=tk.RIGHT, padx=8)
+        dlg.wait_window()
+        return result['mode']
+
+    def _export_pages_jpg(self, ask_mode=False):
+        mode = None
+        if ask_mode:
+            mode = self._choose_jpg_mode(self.root)
+            if mode is None:
+                return
+        pages = None
+        if mode is not None and (mode == 'compact') != (self._template_key() == 'compact'):
+            # 按所选模式临时重排导出（不改主界面设置、不动当前拖好的排版）
+            saved_var = self.template_var.get()
+            saved_layout = getattr(self, 'layout_pages', None)
+            saved_pages = getattr(self, 'batch_pages', None)
+            try:
+                self.template_var.set('紧凑拼版' if mode == 'compact' else '标准（每组一页）')
+                lay2 = self.compute_layout()
+                pages = self.render_pages(lay2) if lay2 else []
+            finally:
+                self.template_var.set(saved_var)
+                self.layout_pages = saved_layout
+                self.batch_pages = saved_pages
+        if pages is None:
+            if getattr(self, 'layout_pages', None):
+                self.render_pages()
+            pages = getattr(self, 'batch_pages', None) or self.compose_a4_pages()
         if not pages:
             return
         folder = filedialog.askdirectory(title='选择保存文件夹', initialdir=self._get_last_dir() or None)
@@ -1627,6 +1713,22 @@ class IDCardProcessor:
             f.write(self._pages_to_pdf_bytes(pages))
         messagebox.showinfo('完成', '已保存 证件拼版.pdf 到所选文件夹')
 
+    def _export_pages_pdf_single(self):
+        """导出单页 PDF：每一页 A4 单独存一个 PDF 文件到所选文件夹"""
+        if getattr(self, 'layout_pages', None):
+            self.render_pages()
+        pages = getattr(self, 'batch_pages', None) or self.compose_a4_pages()
+        if not pages:
+            return
+        folder = filedialog.askdirectory(title='选择保存文件夹', initialdir=self._get_last_dir() or None)
+        if not folder:
+            return
+        self._remember_dir(folder)
+        for i, p in enumerate(pages):
+            with open(os.path.join(folder, f'证件拼版_{i + 1:02d}.pdf'), 'wb') as f:
+                f.write(self._pages_to_pdf_bytes([p]))
+        messagebox.showinfo('完成', f'已保存 {len(pages)} 个单页 PDF 到所选文件夹')
+
     def _print_pages(self):
         if getattr(self, 'layout_pages', None):
             self.render_pages()
@@ -1646,7 +1748,6 @@ class IDCardProcessor:
                                  f'没能把打印任务发出去：{e}\n（拼版文件已存到 {temp_file}，可手动打开打印）')
             return
         messagebox.showinfo('打印', '打印任务已发送到打印机')
-
 
     def load_image(self, side):
         """加载图片"""
@@ -1835,7 +1936,7 @@ class IDCardProcessor:
         
         # 创建缩放滑块
         self.scale_var = tk.DoubleVar(value=1.0)
-        scale_slider = ttk.Scale(scale_frame, from_=0.1, to=3.0, 
+        scale_slider = ttk.Scale(scale_frame, from_=0.1, to=6.0, 
                                 variable=self.scale_var, length=150)
         scale_slider.pack(side=tk.LEFT, padx=5)
         scale_slider.bind("<Motion>", self.on_scale_change)
@@ -1844,6 +1945,7 @@ class IDCardProcessor:
         # 显示当前缩放比例
         self.scale_label = ttk.Label(scale_frame, text="100%")
         self.scale_label.pack(side=tk.LEFT, padx=5)
+        ttk.Button(scale_frame, text="适窗", command=self._fit_mark_window).pack(side=tk.LEFT, padx=2)
         
         # 控制按钮区域
         btn_frame = ttk.Frame(control_frame)
@@ -2643,27 +2745,62 @@ class IDCardProcessor:
         
         return rect
     
+    def _fit_mark_window(self):
+        """适窗：把整图缩放至刚好填满标记画布，并回到左上角"""
+        try:
+            if not getattr(self, 'mark_canvas', None) or getattr(self, 'original_image', None) is None:
+                return
+            cw = self.mark_canvas.winfo_width()
+            ch = self.mark_canvas.winfo_height()
+            if cw < 50:
+                cw, ch = 880, 620
+            iw, ih = self.original_image.size
+            fit = min(cw / iw, ch / ih)
+            fit = max(0.1, min(6.0, fit))
+            self.scale_var.set(fit)
+            self.on_scale_change()
+            self.mark_canvas.xview_moveto(0)
+            self.mark_canvas.yview_moveto(0)
+        except Exception:
+            pass
+
     def on_mousewheel(self, event):
-        """鼠标滚轮缩放控制"""
-        # 计算缩放增量
-        scale_increment = 0.1
-        
-        # 不同系统的事件处理
-        if event.num == 4:  # Linux向上滚
-            self.scale_var.set(min(self.scale_var.get() + scale_increment, 3.0))
-        elif event.num == 5:  # Linux向下滚
-            self.scale_var.set(max(self.scale_var.get() - scale_increment, 0.1))
-        elif hasattr(event, 'delta'):  # Windows
-            if event.delta > 0:
-                self.scale_var.set(min(self.scale_var.get() + scale_increment, 3.0))
+        """鼠标滚轮缩放：乘法步进，光标下的图像点保持不动（锚定缩放）"""
+        try:
+            if event.num == 4 or (hasattr(event, 'delta') and getattr(event, 'delta', 0) > 0):
+                factor = 1.25
+            elif event.num == 5 or (hasattr(event, 'delta') and getattr(event, 'delta', 0) < 0):
+                factor = 1 / 1.25
             else:
-                self.scale_var.set(max(self.scale_var.get() - scale_increment, 0.1))
-        
-        self.on_scale_change()
-    
+                return
+            old = self.current_scale
+            new = max(0.1, min(6.0, old * factor))
+            if abs(new - old) < 1e-6:
+                return
+            cv = self.mark_canvas
+            ix = cv.canvasx(event.x) / old
+            iy = cv.canvasy(event.y) / old
+            self.scale_var.set(new)
+            self.on_scale_change()
+            new = self.current_scale
+            sr = cv.cget('scrollregion').split()
+            if len(sr) == 4:
+                sw, sh = float(sr[2]), float(sr[3])
+                if sw > 0 and sh > 0:
+                    cv.xview_moveto(max(0.0, min(1.0, (ix * new - event.x) / sw)))
+                    cv.yview_moveto(max(0.0, min(1.0, (iy * new - event.y) / sh)))
+        except Exception:
+            pass
+
     def on_scale_change(self, event=None):
         """缩放改变事件"""
         scale = self.scale_var.get()
+        _oi = getattr(self, 'original_image', None)
+        if _oi is not None:
+            _cap = 3600 / max(1, max(_oi.size))
+            if scale > _cap:
+                scale = _cap
+                self.scale_var.set(scale)
         self.current_scale = scale
         self.scale_label.config(text=f"{int(scale*100)}%")
         
@@ -2755,7 +2892,7 @@ class IDCardProcessor:
                 
                 # 在画布上标记点
                 self.mark_canvas.create_oval(
-                    scaled_x-5, scaled_y-5, scaled_x+5, scaled_y+5,
+                    scaled_x-8, scaled_y-8, scaled_x+8, scaled_y+8,
                     fill="red", outline="white", width=2
                 )
                 
