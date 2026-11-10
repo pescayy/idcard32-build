@@ -142,6 +142,43 @@ def _order_points_np(pts):
     return rect
 
 
+def _inset_quad(pts, frac=0.003):
+    """Inset each edge of the quad along its inward normal by frac*card width,
+    recomputing corners as intersections. Counters the model's outward corner
+    bias (measured: 47% of edges include >2px background). On any degeneracy,
+    returns the input unchanged."""
+    try:
+        p = [np.array(q, dtype=np.float64) for q in pts]
+        w1 = np.hypot(*(p[1] - p[0])); w2 = np.hypot(*(p[2] - p[3]))
+        d = frac * max(w1, w2)
+        if d <= 0:
+            return pts
+        cen = sum(p) / 4.0
+        lines = []
+        for i in range(4):
+            a, b = p[i], p[(i + 1) % 4]
+            e = b - a
+            L = np.hypot(*e)
+            if L < 1:
+                return pts
+            n = np.array([-e[1], e[0]]) / L
+            if np.dot(n, cen - a) < 0:
+                n = -n
+            lines.append((a + n * d, e))
+        out = []
+        for i in range(4):
+            p1, e1 = lines[i - 1]
+            p2, e2 = lines[i]
+            det_ = e1[0] * e2[1] - e1[1] * e2[0]
+            if abs(det_) < 1e-9:
+                return pts
+            t = ((p2[0] - p1[0]) * e2[1] - (p2[1] - p1[1]) * e2[0]) / det_
+            out.append(p1 + e1 * t)
+        return [(float(q[0]), float(q[1])) for q in out]
+    except Exception:
+        return pts
+
+
 class CardDetectorAI:
     """SCRFD 证件关键点检测（算法摘自云星球 V7.3.1，经三方对测验证）。
     优先用微软 ONNX Runtime 加载模型（与原版同路线），不可用时回落 OpenCV DNN。"""
@@ -251,8 +288,19 @@ class CardDetectorAI:
                 best_score, best = scores[i], i
         pts = kpss[best]
         pts_list = [(float(pts[i, 0]), float(pts[i, 1])) for i in range(4)]
-        pts_ordered = _order_points_np(np.array(pts_list))
-        return [(float(q[0]), float(q[1])) for q in pts_ordered]
+        # 2026-11-10 fix: model keypoints carry card orientation (trained order =
+        # card TL->TR->BR->BL); geometric re-sort flips upside-down shots.
+        # Use raw order; fall back to geometric sort only on self-crossing quads.
+        _arr = np.array(pts_list, dtype=np.float64)
+        def _cr(o, p, q):
+            return (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0])
+        def _cross(a, b, c, d):
+            d1 = _cr(c, d, a); d2 = _cr(c, d, b); d3 = _cr(a, b, c); d4 = _cr(a, b, d)
+            return ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0))
+        if _cross(_arr[0], _arr[1], _arr[2], _arr[3]) or _cross(_arr[1], _arr[2], _arr[3], _arr[0]):
+            pts_ordered = _order_points_np(np.array(pts_list))
+            return [(float(q[0]), float(q[1])) for q in pts_ordered]
+        return pts_list
 
 
 def _enhance_idcard_bw(pil_img):
@@ -495,7 +543,7 @@ class IDCardProcessor:
             tk._default_root = root
         except Exception:
             pass
-        self.root.title("证件图片处理器·全能版（AI批量） by xm · 1110打磨版")
+        self.root.title("证件图片处理器·全能版（AI批量） by xm · 1110修正版")
         self.enhance_mode = "color"
         self.enhance_var = None
         
@@ -1372,6 +1420,8 @@ class IDCardProcessor:
                 else:
                     manual += 1
             self._stash_workspace()
+            import gc as _gc
+            _gc.collect()
         self.refresh_pairs_panel()
         _msg = f'批量导入完成：自动处理 {ok} 张，待手动标角 {manual} 张'
         if bad:
@@ -2201,9 +2251,10 @@ class IDCardProcessor:
                   command=lambda: self.reset_marking(side)).pack(side=tk.LEFT, padx=5)
         
         # 创建完成标记按钮（初始状态）
-        self.finish_marking_btn = ttk.Button(btn_frame, text="完成标记", 
+        self.finish_marking_btn = tk.Button(btn_frame, text="完成标记",
                                           command=lambda: self.finish_marking(side),
-                                          state="normal")
+                                          bg="#2E7CF6", fg="white", activebackground="#5B96F8",
+                                          activeforeground="white", relief="flat", padx=12, pady=3, state="normal")
         self.finish_marking_btn.pack(side=tk.LEFT, padx=5)
         
         ttk.Button(btn_frame, text="取消", 
@@ -2259,6 +2310,9 @@ class IDCardProcessor:
         # 保存原始图片
         self.original_image = image.copy()
         self.current_scale = 1.0
+        # 2026-11-10: open already fitted/zoomed to the window
+        # (subtraction: no manual 'fit' step after opening)
+        self.mark_window.after(60, self._fit_mark_window)
         
         # 如果有传入的点，直接完成标记
         if existing_points is not None and len(existing_points) == 4:
@@ -2373,6 +2427,12 @@ class IDCardProcessor:
             h, w = img_cv.shape[:2]
             if not self._validate_quadrilateral(arr.copy(), h, w):
                 return None
+            # 2026-11-10: inset edges by 1.0% of card width before warping.
+            # Calibrated on synthetic ground truth: model corners overshoot
+            # ~0.9% of card width; 1.0% drives out-of-card pixels to ~0 while
+            # eating only ~10 output px of the card's blank margin per edge.
+            arr = np.array(_inset_quad([[float(x), float(y)] for x, y in arr], 0.010),
+                           dtype=np.float32)
             return [[float(x), float(y)] for x, y in arr]
         except Exception:
             return None
@@ -2464,12 +2524,40 @@ class IDCardProcessor:
             pass
         return None
 
+    def _seed_preset_box(self, side):
+        """Auto-detect failed: pre-place a draggable quad (12% image inset)
+        so the user drags four green handles onto the card corners instead
+        of clicking four points from scratch."""
+        try:
+            if side == "front":
+                image = self.front_image
+            elif side == "back":
+                image = self.back_image
+            else:
+                image = self.card_image
+            if image is None:
+                return
+            w, h = image.size
+            mx, my = max(4, int(w * 0.12)), max(4, int(h * 0.12))
+            pts = [(mx, my), (w - mx, my), (w - mx, h - my), (mx, h - my)]
+            if side == "front":
+                self.front_points = pts
+            elif side == "back":
+                self.back_points = pts
+            else:
+                self.card_points = pts
+            self.display_image_on_canvas()
+            self.update_status("自动识别未成功：已预置一个框，把四个绿点拖到卡片四角，点'完成标记'即可（也可点'自动识别'再试）")
+        except Exception:
+            pass
+
     def try_auto_finish(self, side):
         """标记窗口打开后静默尝试自动识别：成功直接完成该面处理（不弹窗确认）；
         失败不打扰用户，停留在手动标记流程。"""
         try:
             if getattr(self, '_skip_auto_finish', False):
                 self._skip_auto_finish = False
+                self._seed_preset_box(side)
                 return
             if self.mark_window is None or self.current_marking_side != side:
                 return
@@ -2485,7 +2573,7 @@ class IDCardProcessor:
             if not corners and not getattr(self, '_ai_ran', False):
                 corners = self.detect_card_corners(image)
             if not corners:
-                self.update_status("自动识别未成功，请手动点击4个角点，或点上方'自动识别'再试")
+                self._seed_preset_box(side)
                 return
             if side == "front":
                 self.front_points = corners
@@ -2712,7 +2800,7 @@ class IDCardProcessor:
                 for child in widget.winfo_children():
                     if isinstance(child, ttk.Frame):
                         for btn in child.winfo_children():
-                            if isinstance(btn, ttk.Button):
+                            if isinstance(btn, (ttk.Button, tk.Button)):
                                 btn.destroy()
         
         # 重新添加调整模式的按钮
@@ -2721,8 +2809,10 @@ class IDCardProcessor:
         btn_frame.pack(side=tk.RIGHT)
         
         # 创建完成调整按钮
-        self.finish_adjust_btn = ttk.Button(btn_frame, text="完成调整", 
-                                          command=lambda: self.finish_adjust(side))
+        self.finish_adjust_btn = tk.Button(btn_frame, text="完成调整",
+                                          command=lambda: self.finish_adjust(side),
+                                          bg="#2E7CF6", fg="white", activebackground="#5B96F8",
+                                          activeforeground="white", relief="flat", padx=12, pady=3)
         self.finish_adjust_btn.pack(side=tk.LEFT, padx=5)
         
         ttk.Button(btn_frame, text="取消调整", 
@@ -2747,7 +2837,7 @@ class IDCardProcessor:
         self.point_circles = []
         
         # 绘制四个角点（可拖动）
-        colors = ["red", "green", "blue", "orange"]
+        colors = ["#2FBF71", "#2FBF71", "#2FBF71", "#2FBF71"]  # unified green handles, same as IDCardMerge
         labels = ["左上", "右上", "右下", "左下"]
         
         for i, (px, py) in enumerate(self.adjust_points):
@@ -2757,7 +2847,7 @@ class IDCardProcessor:
             
             # 绘制点（可拖动的圆）
             point_id = self.mark_canvas.create_oval(
-                scaled_x-10, scaled_y-10, scaled_x+10, scaled_y+10,
+                scaled_x-11, scaled_y-11, scaled_x+11, scaled_y+11,
                 fill=colors[i], outline="white", width=2,
                 tags=f"point_{i}"
             )
@@ -2872,8 +2962,10 @@ class IDCardProcessor:
                   command=lambda: self.reset_marking(side)).pack(side=tk.LEFT, padx=5)
         
         # 重新创建完成标记按钮
-        self.finish_marking_btn = ttk.Button(btn_frame, text="完成标记", 
-                                          command=lambda: self.finish_marking(side))
+        self.finish_marking_btn = tk.Button(btn_frame, text="完成标记",
+                                          command=lambda: self.finish_marking(side),
+                                          bg="#2E7CF6", fg="white", activebackground="#5B96F8",
+                                          activeforeground="white", relief="flat", padx=12, pady=3)
         self.finish_marking_btn.pack(side=tk.LEFT, padx=5)
         
         ttk.Button(btn_frame, text="取消", 
@@ -2885,10 +2977,8 @@ class IDCardProcessor:
         
         self.update_status(f"{side}角点调整完成，可以继续处理或完成标记")
         
-        # 询问是否完成标记
-        response = messagebox.askyesno("完成调整", "角点调整完成，是否立即完成标记并开始处理？")
-        if response:
-            self.finish_marking(side)
+        # 点了'完成调整'即处理，不再二次弹窗确认（减法）
+        self.finish_marking(side)
     
     def cancel_adjust(self, side):
         """取消调整，恢复原始点"""
@@ -2923,8 +3013,10 @@ class IDCardProcessor:
                   command=lambda: self.reset_marking(side)).pack(side=tk.LEFT, padx=5)
         
         # 重新创建完成标记按钮
-        self.finish_marking_btn = ttk.Button(btn_frame, text="完成标记", 
-                                          command=lambda: self.finish_marking(side))
+        self.finish_marking_btn = tk.Button(btn_frame, text="完成标记",
+                                          command=lambda: self.finish_marking(side),
+                                          bg="#2E7CF6", fg="white", activebackground="#5B96F8",
+                                          activeforeground="white", relief="flat", padx=12, pady=3)
         self.finish_marking_btn.pack(side=tk.LEFT, padx=5)
         
         ttk.Button(btn_frame, text="取消", 
@@ -2944,19 +3036,21 @@ class IDCardProcessor:
                point[1] < 0 or point[1] > img_height:
                 return False
 
-        # 计算长宽比
+        # 计算长宽比：按对边配对，与角点的起止位置、照片旋转方向无关
+        # （角点是沿四边形一周的顺序即可；照片转 90°/270° 时宽高互换，
+        # 用 max/min 归一后再与期望比例比较，避免横拍竖拍误杀）
         width1 = np.linalg.norm(corners[1] - corners[0])
         width2 = np.linalg.norm(corners[2] - corners[3])
         height1 = np.linalg.norm(corners[3] - corners[0])
         height2 = np.linalg.norm(corners[2] - corners[1])
 
-        avg_width = (width1 + width2) / 2
-        avg_height = (height1 + height2) / 2
+        pair_a = (width1 + width2) / 2
+        pair_b = (height1 + height2) / 2
 
-        if avg_height == 0:
+        if pair_a == 0 or pair_b == 0:
             return False
 
-        aspect_ratio = avg_width / avg_height
+        aspect_ratio = max(pair_a, pair_b) / min(pair_a, pair_b)
         expected_ratio = self.id_width / self.id_height
 
         # 允许的比例范围更宽（考虑透视变形）
@@ -3134,13 +3228,13 @@ class IDCardProcessor:
                 
                 # 在画布上标记点
                 self.mark_canvas.create_oval(
-                    scaled_x-8, scaled_y-8, scaled_x+8, scaled_y+8,
-                    fill="red", outline="white", width=2
+                    scaled_x-11, scaled_y-11, scaled_x+11, scaled_y+11,
+                    fill="#2FBF71", outline="white", width=2
                 )
                 
                 # 显示点编号
                 self.mark_canvas.create_text(
-                    scaled_x+15, scaled_y-15,
+                    scaled_x+18, scaled_y-18,
                     text=str(i+1),
                     fill="white", font=("Arial", 12, "bold")
                 )
@@ -3295,16 +3389,14 @@ class IDCardProcessor:
             
             self.update_status(f"已选择 {len(points)}/4 个点")
             
-            # 如果选择了4个点，询问是否完成
+            # 选满4个点：不再弹窗确认（减法），完成按钮已亮起，点它或按回车处理
             if len(points) == 4:
                 # 自动启用完成标记按钮
                 if self.finish_marking_btn:
                     self.finish_marking_btn.config(state="normal")
                 
-                # 提示用户可以使用回车键
-                response = messagebox.askyesno("完成标记", "已选择4个点！\n\n是否完成标记并开始处理？\n\n提示：也可以按回车键完成标记")
-                if response:
-                    self.finish_marking(side)
+                # 不弹窗打扰：状态行提示即可
+                self.update_status("已选满4个点：角点可拖动微调，点'完成标记'或按回车开始处理")
     
 
     def drag_mark_point(self, event):
