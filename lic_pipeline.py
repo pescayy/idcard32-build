@@ -4,8 +4,11 @@
 #   quad detect (SCRFD -> contour -> contour on illumination-flattened)
 #   -> bigdoc.expand_to_paper_edge (flat scans short-circuit to whole image)
 #   -> bigdoc.converge_corners -> perspective warp to output size
-#   -> lic_enhance.enhance_license (skipped for flat scans, per the
-#      measured warm-paper bleaching) -> bigdoc.dark_border_fraction report.
+#   -> bigdoc.dark_border_fraction report.
+# Colour stages (lic_enhance + lic_dehaze) are kept in code but bypassed
+# by default since 2026-11-11 (PS logic: automatic processing moves
+# pixels, it does not change their values); pass tone=True to run them.
+# Flat scans skip them either way (measured warm-paper bleaching).
 # A None from expand_to_paper_edge on every candidate quad (curled corner,
 # heavy shadow) falls back to the best frame quad, flagged via
 # info["expand_fallback"] so the UI can warn and offer manual marking.
@@ -16,6 +19,7 @@ import cv2
 
 from bigdoc import expand_to_paper_edge, converge_corners, dark_border_fraction
 from lic_enhance import enhance_license
+from lic_dehaze import dehaze_license
 
 OUT_A4 = (3508, 2480)  # copy (副本): 297x210mm @300dpi, landscape
 OUT_A3 = (4961, 3508)  # original (正本): 420x297mm @300dpi, landscape
@@ -86,8 +90,14 @@ def detect_license_quad(bgr, detector=None):
     return cands[0]
 
 
-def process_license(bgr, detector=None, out_size=OUT_A4, model_path=None):
+def process_license(bgr, detector=None, out_size=OUT_A4, model_path=None,
+                    tone=False):
     """Process one licence image.
+
+    tone: explicit opt-in for the colour stages (lic_enhance shadow
+    lifting + lic_dehaze washout correction). Default False -- geometry
+    only, pixel values untouched (2026-11-11 PS-logic decision). Flat
+    scans skip the colour stages regardless of this switch.
 
     Returns a dict:
       status: "ok" | "no_quad"
@@ -141,10 +151,17 @@ def process_license(bgr, detector=None, out_size=OUT_A4, model_path=None):
     warped = cv2.warpPerspective(bgr, M, (W, H))
 
     flat = bool(info.get("flat_scan"))
-    info["enhanced"] = not flat
-    if not flat:
+    info["tone_enabled"] = bool(tone)
+    info["enhanced"] = bool(tone) and not flat
+    if tone and not flat:
         warped, einfo = enhance_license(warped)
         info["enhance_info"] = einfo
+        # Overexposure washout stage: LIC_ENH lifts dark paper but cannot
+        # deepen ink that glare has lifted to grey. dehaze_license only
+        # acts when its measured trigger fires; otherwise it returns the
+        # image pixel-identical (see lic_dehaze.py for the criterion).
+        warped, dinfo = dehaze_license(warped)
+        info["dehaze_info"] = dinfo
     info["dark_border"] = dark_border_fraction(warped)
 
     return {"status": "ok", "route": route, "flat": flat,
