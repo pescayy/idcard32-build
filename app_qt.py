@@ -5,9 +5,9 @@ group rows as the main area, settings bar at the bottom, full-width orange
 generate button, centered status line. Small radii: buttons 4px, slots 5px.
 """
 import os, sys, json, threading
-from PySide2.QtCore import Qt, Signal, QUrl, QRectF
+from PySide2.QtCore import Qt, Signal, QUrl, QRectF, QTimer
 from PySide2.QtGui import (QPixmap, QImage, QFont, QPainter, QColor, QPen,
-                         QDesktopServices, QPainterPath)
+                         QDesktopServices, QPainterPath, QGuiApplication)
 from PySide2.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QLabel,
                                QPushButton, QComboBox, QCheckBox, QLineEdit,
                                QVBoxLayout, QHBoxLayout, QScrollArea, QFileDialog,
@@ -717,12 +717,39 @@ class MainWindow(QMainWindow):
 
 
 class PageView(QWidget):
-    """A4 页交互视图：灰底 + 白页 + 布局里的卡片缩略图，卡片可拖。
+    """A4 页交互视图：亮底 + 白页 + 布局里的卡片缩略图，卡片可拖。
 
-    坐标系与 core.compute_layout 一致（A4 页 300dpi 全分辨率）；拖动只限
-    页内，松手即写回本窗持有的布局副本——导出/打印按拖后位置渲染，
-    关窗不保存拖动结果（与现版第 27 次构建口径一致）。
+    几何照原版 v2.2 本体真数（PREVIEW-GEOMETRY.md，本体常量＋照片互证）：
+    页显示宽定版为对话框宽 × 0.567（原版 595/1050），水平居中（左右各
+    ≈21.65%），上边距 0——页顶与画布顶齐平；页高按 A4 比例（宽×297/210）
+    自然溢出画布，由外层 QScrollArea 纵向滚动查看（原版即如此，照片实证
+    页下边被截断），不为塞下整页缩小页宽占比。
+
+    坐标系与 core.compute_layout 一致（A4 页 300dpi 全分辨率）；拖动写回
+    本窗持有的布局副本——导出/打印按拖后位置渲染，关窗不保存拖动结果
+    （与现版第 27 次构建口径一致）。本控件是滚动区的
+    内容控件，控件坐标即内容坐标，滚动不改变 _press/_move 的坐标语义。
+
+    自由排版（照原版 v2.2 语义复刻，PREVIEW-GEOMETRY.md §七/§八）：
+    默认锁定——卡片不可选中、不可拖动，点按无反应；经对话框第六钮
+    开启后，先点选一张卡（冷蓝描边为选中态）才能拖被选中的那张，点
+    另一张改选另一张；拖动任意像素自由放——无吸附、无页界钳制，卡可
+    拖出页外，坐标照存、导出/打印照吃同一套坐标；拖动中显示过被拖卡
+    中心的整页横/竖参考线，松手即隐藏（纯显示）。「全选图片」勾选时
+    本页全部卡视为已选中、可直接拖任意一张，取消则塌回当前单张；
+    退出自由排版连带清选中、收全选。开关状态每次开窗新建、不落盘。
+
+    缩放层（2026-11-11 用户拍板的行业式补齐，非原版口径、与对版清单
+    分开记）：100% 即上述原版几何（页宽 = 对话框宽 × 0.567）；Ctrl+滚
+    轮以光标点为锚在 25%–300% 间缩放，另有「适页」档把整页塞进视口。
+    缩放只改显示倍率——页宽基准、边距、拖动坐标语义一律不变，导出与
+    打印走 core 渲染、不受影响；每次开窗新建本控件，缩放不持久化。
     """
+
+    PAGE_W_RATIO = 0.567  # 页宽/对话框宽（原版 595/1050，本体常量）
+    # 缩放层参数：100% = 上行原版口径；倍率范围与步进照行业通行
+    ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 0.25, 3.0, 1.25
+    zoom_changed = Signal(float)
 
     def __init__(self, core, layout):
         super().__init__()
@@ -731,21 +758,110 @@ class PageView(QWidget):
         self.idx = 0
         s = core.mm_to_pixel
         self.pw, self.ph = int(core.a4_width * s), int(core.a4_height * s)
+        self.ref_w = 1050.0             # 参照宽 = 对话框宽，对话框 resize 时同步
         self.scale = 1.0
-        self.ox = self.oy = 0.0
+        self.ox = 0.0
+        self.oy = 0.0                   # 恒 0：页上边距 0
         self._thumbs = {}
-        self._drag = None               # (card_idx, grab_dx, grab_dy) 视图像素
-        self.setMinimumSize(430, 500)
+        self._drag = None               # (card_idx, grab_dx, grab_dy) 内容像素
+        self.free_mode = False          # 自由排版开关：默认锁定（原版语义）
+        self.sel = None                 # 当前选中卡（本页序号）；None = 未选
+        self.all_sel = False            # 「全选图片」勾选态：全卡视为已选中
+        self.zoom = 1.0                 # 1.0 = 原版口径；开窗新建、不持久化
+        self._scroll_area = None        # 对话框建好滚动区后 attach_scroll 注入
+        self._pending_anchor = None     # 缩放后待落位的 (滚动x, 滚动y)
+        self.setMinimumSize(200, 120)
         self.setStyleSheet('border-radius: 5px;')
+        self._recalc()
 
     # ----- geometry -----
-    def _fit(self):
-        if self.width() <= 0 or self.height() <= 0:
+    def set_ref_width(self, w):
+        """对话框宽度变化时同步参照宽，页宽占比（0.567）随之恒定。"""
+        if w and abs(float(w) - self.ref_w) > 0.5:
+            self.ref_w = float(w)
+            self._recalc()
+
+    def _recalc(self):
+        # 页宽只由参照宽与缩放倍率定（× 0.567 × zoom），不随控件高度
+        # 变；zoom=1 即原版口径（整页适高只作缩放的「适页」档存在）。
+        page_w = self.ref_w * self.PAGE_W_RATIO * self.zoom
+        self.scale = page_w / self.pw
+        self.oy = 0.0
+        self.ox = (self.width() - page_w) / 2 if self.width() > 0 else 0.0
+        # 内容尺寸 = 页全尺寸（A4 比例）：宽/高超出视口的部分由滚动区
+        # 滚动（纵向原版即如此；横向仅在放大到页宽超视口时出现）。
+        self.setMinimumWidth(int(round(page_w)))
+        self.setMinimumHeight(int(round(self.ph * self.scale)))
+        self.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        page_w = self.ref_w * self.PAGE_W_RATIO * self.zoom
+        self.ox = (self.width() - page_w) / 2 if self.width() > 0 else 0.0
+
+    # ----- zoom（行业式补齐层：100% = 原版口径，见类 docstring） -----
+    def attach_scroll(self, scroll):
+        self._scroll_area = scroll
+
+    def set_zoom(self, z, anchor=None):
+        """设缩放倍率（25%–300%）。anchor 为控件（内容）坐标：缩放
+        前后，该点所指的页内容在视口中的位置保持不变（页面不跳位）；
+        不给 anchor 时以视口中心为锚。滚动偏移待布局落定后落位。"""
+        z = min(max(float(z), self.ZOOM_MIN), self.ZOOM_MAX)
+        if abs(z - self.zoom) < 1e-9:
             return
-        self.scale = min((self.width() - 16) / self.pw,
-                         (self.height() - 16) / self.ph)
-        self.ox = (self.width() - self.pw * self.scale) / 2
-        self.oy = (self.height() - self.ph * self.scale) / 2
+        if self._pending_anchor is not None:
+            self._apply_pending_anchor()
+        sa = self._scroll_area
+        if sa is not None and sa.viewport().width() > 0:
+            vp = sa.viewport()
+            hb, vb = sa.horizontalScrollBar(), sa.verticalScrollBar()
+            if anchor is None:
+                anchor = (hb.value() + vp.width() / 2.0,
+                          vb.value() + vp.height() / 2.0)
+            pgx = (anchor[0] - self.ox) / self.scale
+            pgy = (anchor[1] - self.oy) / self.scale
+            vx, vy = anchor[0] - hb.value(), anchor[1] - vb.value()
+            self.zoom = z
+            self._recalc()
+            # 目标几何按确定式算，与滚动区（resizable＋最小尺寸）最终
+            # 落定的内容尺寸一致，不依赖中间帧的控件宽高。
+            page_w = self.ref_w * self.PAGE_W_RATIO * z
+            content_w = max(float(vp.width()), page_w)
+            content_h = max(float(vp.height()), self.ph * self.scale)
+            ox_new = (content_w - page_w) / 2.0
+            tx = ox_new + pgx * self.scale - vx
+            ty = pgy * self.scale - vy          # oy 恒 0
+            self._pending_anchor = (
+                min(max(tx, 0.0), max(0.0, content_w - vp.width())),
+                min(max(ty, 0.0), max(0.0, content_h - vp.height())))
+            QTimer.singleShot(0, self._apply_pending_anchor)
+        else:
+            self.zoom = z
+            self._recalc()
+        self.zoom_changed.emit(self.zoom)
+
+    def _apply_pending_anchor(self):
+        if self._pending_anchor is None or self._scroll_area is None:
+            return
+        tx, ty = self._pending_anchor
+        self._pending_anchor = None
+        self._scroll_area.horizontalScrollBar().setValue(int(round(tx)))
+        self._scroll_area.verticalScrollBar().setValue(int(round(ty)))
+
+    def zoom_step(self, steps):
+        self.set_zoom(self.zoom * (self.ZOOM_STEP ** steps))
+
+    def zoom_reset(self):
+        self.set_zoom(1.0)
+
+    def zoom_fit(self):
+        """适页：整页恰好塞进视口（按高适配），水平居中、无需滚动。"""
+        sa = self._scroll_area
+        if sa is None or sa.viewport().height() <= 0:
+            return
+        base = self.ref_w * self.PAGE_W_RATIO / self.pw   # 100% 时 scale
+        self.set_zoom(sa.viewport().height() / (self.ph * base))
 
     def _card_rect(self, img, x, y):
         return (self.ox + x * self.scale, self.oy + y * self.scale,
@@ -759,7 +875,6 @@ class PageView(QWidget):
 
     # ----- painting -----
     def paintEvent(self, event):
-        self._fit()
         qp = QPainter(self)
         qp.setRenderHint(QPainter.SmoothPixmapTransform)
         # 页外底色用近白（与窗体底色同族）：原版画布区是亮底、页面适窗
@@ -784,16 +899,62 @@ class PageView(QWidget):
             qp.restore()
             qp.setPen(QPen(QColor('#999999'), 1))
             qp.drawPath(path)
+        if self.free_mode:
+            # 选中态：既有冷蓝色描边（克制）。全选时全卡描边，否则只描
+            # 当前选中卡——与原版 +0x89 选中位驱动逐卡 Refresh 同义。
+            if self.all_sel:
+                marked = range(len(self.layout[self.idx]))
+            elif self.sel is not None:
+                marked = (self.sel,)
+            else:
+                marked = ()
+            for i in marked:
+                img, x, y = self.layout[self.idx][i]
+                rx, ry, rw, rh = self._card_rect(img, x, y)
+                spath = QPainterPath()
+                spath.addRoundedRect(QRectF(rx, ry, rw, rh),
+                                     rw * 0.035, rw * 0.035)
+                qp.setPen(QPen(QColor(BLUE), 2))
+                qp.drawPath(spath)
+            if self._drag:
+                # 拖动参考线：过被拖卡中心的整页横/竖线（原版 func23），
+                # 纯显示、不回馈坐标；松手（_release 清 _drag）即隐藏。
+                img, x, y = self.layout[self.idx][self._drag[0]]
+                cx = self.ox + (x + img.width / 2.0) * self.scale
+                cy = self.oy + (y + img.height / 2.0) * self.scale
+                guide = QColor(BLUE)
+                guide.setAlpha(150)
+                qp.setPen(QPen(guide, 1))
+                qp.drawLine(int(px), int(cy), int(px + pw), int(cy))
+                qp.drawLine(int(cx), int(py), int(cx), int(py + ph))
         qp.end()
 
-    # ----- dragging (helpers kept separate so tests can drive them) -----
+    # ----- free layout & dragging (helpers kept separate for tests) -----
+    def set_free_mode(self, on):
+        """自由排版开关（原版 func27 语义）：开＝在模板现位置上原地解锁；
+        关＝原地锁定，且连带清当前选中、收「全选图片」态（原版退出时
+        SetChecked(false) 把多选塌回，净效果即全清）。不重排、不落盘。"""
+        self.free_mode = bool(on)
+        if not self.free_mode:
+            self._drag = None
+            self.sel = None
+            self.all_sel = False
+        self.update()
+
     def _press(self, vx, vy):
+        # 锁定态：点按无反应（原版关态 Tapped/Dragged 双检许可位直接返回）
+        if not self.free_mode:
+            return False
         cards = self.layout[self.idx]
         for i in range(len(cards) - 1, -1, -1):
             img, x, y = cards[i]
             rx, ry, rw, rh = self._card_rect(img, x, y)
             if rx <= vx <= rx + rw and ry <= vy <= ry + rh:
+                # 先点选、再拖动：按下即选中该卡并抓起它；点另一张即改选
+                # 另一张。全选态下任意卡本就已选中，同路径直接拖。
+                self.sel = i
                 self._drag = (i, vx - rx, vy - ry)
+                self.update()
                 return True
         return False
 
@@ -802,15 +963,16 @@ class PageView(QWidget):
             return
         i, gdx, gdy = self._drag
         img, _x, _y = self.layout[self.idx][i]
+        # 任意像素自由放：无吸附、无页界钳制（原版 Dragged 原样累加增量，
+        # 卡可拖出页外、坐标照存）——旧版自加的页内 clamp 已按原版撤除。
         nx = (vx - gdx - self.ox) / self.scale
         ny = (vy - gdy - self.oy) / self.scale
-        nx = min(max(nx, 0.0), float(self.pw - img.width))
-        ny = min(max(ny, 0.0), float(self.ph - img.height))
         self.layout[self.idx][i] = [img, nx, ny]
         self.update()
 
     def _release(self):
         self._drag = None
+        self.update()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -822,13 +984,34 @@ class PageView(QWidget):
     def mouseReleaseEvent(self, event):
         self._release()
 
+    def wheelEvent(self, event):
+        # 行业式：普通滚轮平移（不接受事件、传播给滚动区，保持原状）；
+        # Ctrl+滚轮以光标点为锚缩放。
+        if event.modifiers() & Qt.ControlModifier:
+            steps = event.angleDelta().y() / 120.0
+            if steps:
+                self.set_zoom(self.zoom * (self.ZOOM_STEP ** steps),
+                              anchor=(float(event.x()), float(event.y())))
+            event.accept()
+            return
+        super().wheelEvent(event)
+
 
 class PreviewDialog(QDialog):
-    """可交互排版预览：顶排照 IDCardMerge v2.2 原版——单排 5 个长钮等宽
+    """可交互排版预览：顶排照 IDCardMerge v2.2 原版——单排 6 个长钮等宽
     拉长撑满窗宽（导出裁剪 / 导出为 JPG / 导出单页 PDF / 导出合并 PDF /
-    系统直接打印），页内拖卡；信息 Excel/TXT 不在此窗（已挪主窗生成预览
+    系统直接打印 / 🛠 开启自由排版），自由排版语义照原版复刻（默认锁定、
+    开启后先点选再拖、无页界钳制、拖动参考线、文案双态恒橙，详见
+    PageView docstring 与 PREVIEW-GEOMETRY.md §七）；标题行右端有
+    「全选图片」勾选（原版置于「铺满 A4 全页」钮行右端，我方无该钮，
+    置此等价右侧位，§八）。信息 Excel/TXT 不在此窗（已挪主窗生成预览
     钮旁）。导出一律走系统标准保存框，存完报告位置并给打开文件夹入口。
-    排版按主窗底部模板设置（三模板已在主窗切换，此处不另设选择）。"""
+    排版按主窗底部模板设置（三模板已在主窗切换，此处不另设选择）。
+    几何照原版真数（PREVIEW-GEOMETRY.md）：窗 1050×650 居中、页宽 =
+    窗宽 × 0.567、上边距 0、页高溢出纵向滚动——此前近全屏＋左栏版已撤，
+    多页导航只用底部上一页/下一页钮。底部行右侧另有缩放簇（−／百分比／
+    ＋／适页），系 2026-11-11 用户拍板的行业式补齐，非原版口径、与对版
+    清单分开记（见 PORT-STATUS）。"""
 
     def __init__(self, win, layout):
         super().__init__(win)
@@ -848,10 +1031,20 @@ class PreviewDialog(QDialog):
             _it = iter(_flat)
             self._src_map = [[next(_it) for _ in page] for page in self.layout]
         self.setWindowTitle('可交互排版预览（支持拖放）')
-        self.resize(1180, 760)
+        # 尺寸照原版 v2.2 本体真数：1050×650 居中开窗（PREVIEW-GEOMETRY.md
+        # §一，Resize 常量实锤；亦合「预览页比主窗小一号」）。窗可缩放，
+        # PageView 的页宽占比由对话框 resize 时同步参照宽恒定保持。
+        self.resize(1050, 650)
+        scr = QGuiApplication.primaryScreen()
+        if scr is not None and QGuiApplication.platformName() != 'offscreen':
+            geo = scr.availableGeometry()
+            self.move(geo.x() + (geo.width() - self.width()) // 2,
+                      geo.y() + (geo.height() - self.height()) // 2)
         self.setStyleSheet(f'background: {PAGE_BG};')
         lay = QVBoxLayout(self)
-        # 原版式单排长钮：5 钮等宽拉长撑满窗宽——裁剪素色（剪刀语义）、
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(6)
+        # 原版式单排长钮：6 钮等宽拉长撑满窗宽——裁剪素色（剪刀语义）、
         # JPG/单页 PDF 蓝、合并 PDF 绿、系统直接打印同裁剪素色（浅底深字、
         # 不作主钮——原版 v2.2 如此，2026-11-11 午后小修更正）。
         top = QHBoxLayout()
@@ -876,13 +1069,56 @@ class PreviewDialog(QDialog):
             top.addWidget(b, 1)
             self.top_buttons[text] = b
         self.print_btn = self.top_buttons['系统直接打印']
+        # 第六钮「开启自由排版」：原版恒 warning 橙（Importance=4，§六），
+        # 与既有五钮同高同排版规则、贴右；开启后文案变「🛑 锁定当前
+        # 排版」，颜色不变（原版切换不改 Importance）。
+        self.free_btn = QPushButton('🛠 开启自由排版')
+        self.free_btn.setStyleSheet(btn_qss(ORANGE, '#E07F14'))
+        self.free_btn.clicked.connect(self.toggle_free)
+        top.addWidget(self.free_btn, 1)
+        self.top_buttons['开启自由排版'] = self.free_btn
+        # 钮带高度照真数核对（PREVIEW-GEOMETRY.md §二：原版钮带 ≈33、
+        # 含间隙工具区 ≈42）：全局大钮口径会把本窗六钮撑到 52，仅本窗
+        # 覆写回紧凑高（实测 ≈37），文案/数目/配色一律不动。
+        for b in self.top_buttons.values():
+            b.setStyleSheet(b.styleSheet() +
+                            'QPushButton { min-height: 25px;'
+                            ' padding: 6px 18px; }')
+        # 六钮严格同高：第六钮的 emoji 字形度量可能比纯文字钮高 1px
+        # （环境字体而定），以五钮的 sizeHint 最大值为准把六钮钉同高，
+        # 数值随平台字体自适应、不写死。
+        _h = max(b.sizeHint().height()
+                 for k, b in self.top_buttons.items() if k != '开启自由排版')
+        for b in self.top_buttons.values():
+            b.setFixedHeight(_h)
         lay.addLayout(top)
+        title_row = QHBoxLayout()
         self.title = QLabel('')
         self.title.setAlignment(Qt.AlignCenter)
         self.title.setStyleSheet('font-size: 15px; font-weight: bold; color: #333;')
-        lay.addWidget(self.title)
+        title_row.addWidget(self.title, 1)
+        # 「全选图片」勾选（原版 §八）：原版位于「铺满 A4 全页」钮行最
+        # 右端；我方无该钮，置于标题行右端这一等价的预览控制区右侧位。
+        self.all_sel_chk = QCheckBox('全选图片')
+        self.all_sel_chk.setStyleSheet('color: #333; font-size: 13px;')
+        self.all_sel_chk.stateChanged.connect(self._on_all_sel)
+        title_row.addWidget(self.all_sel_chk)
+        lay.addLayout(title_row)
         self.view = PageView(self.core, self.layout)
-        lay.addWidget(self.view, 1)
+        self.view.set_ref_width(self.width())
+        # 页高按 A4 比例溢出画布 → 纵向滚动（原版式，照片实证页下边被
+        # 截断）：QScrollArea 常规实现，滚轮与竖直拖拽条均可用；左栏
+        # 缩略图已撤，多页导航只用底部上一页/下一页钮。
+        self.scroll = QScrollArea()
+        self.scroll.setWidget(self.view)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        # 横向条按需：≤100%/适页时内容不溢出、不出现；放大到页宽超
+        # 视口时出现以便横向查看（缩放层所需，原版口径下恒不触发）。
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll.setStyleSheet('background: #EDF0F3;')
+        self.view.attach_scroll(self.scroll)
+        lay.addWidget(self.scroll, 1)
         nav = QHBoxLayout()
         prev_b = QPushButton('上一页')
         next_b = QPushButton('下一页')
@@ -895,19 +1131,70 @@ class PreviewDialog(QDialog):
         self.page_label.setStyleSheet('color: #5B6470; font-size: 12.5px;')
         nav.addWidget(prev_b)
         nav.addWidget(self.page_label, 1)
+        # 缩放簇（行业式补齐，用户 2026-11-11 拍板，非原版口径）：素色
+        # 与上下页钮同族、紧凑定宽，与中间文案分置两端——文案仍居中、
+        # 一行原文不变，不被挤压。百分比钮点击回 100%。
+        zoom_box = QHBoxLayout()
+        zoom_box.setSpacing(4)
+        self.zoom_out_b = QPushButton('−')
+        self.zoom_pct_b = QPushButton('100%')
+        self.zoom_in_b = QPushButton('+')
+        self.zoom_fit_b = QPushButton('适页')
+        for b, w in ((self.zoom_out_b, 34), (self.zoom_pct_b, 58),
+                     (self.zoom_in_b, 34), (self.zoom_fit_b, 56)):
+            b.setStyleSheet(PairRow._btn_style() +
+                            'QPushButton { padding: 8px 4px; }')
+            b.setFixedWidth(w)
+            zoom_box.addWidget(b)
+        self.zoom_out_b.clicked.connect(lambda: self.view.zoom_step(-1))
+        self.zoom_in_b.clicked.connect(lambda: self.view.zoom_step(1))
+        self.zoom_pct_b.clicked.connect(self.view.zoom_reset)
+        self.zoom_fit_b.clicked.connect(self.view.zoom_fit)
+        self.view.zoom_changed.connect(self._on_zoom_changed)
+        nav.addLayout(zoom_box)
         nav.addWidget(next_b)
         lay.addLayout(nav)
         self.show_page(0)
 
+    def toggle_free(self):
+        """自由排版开关（原版 func27）：文案双态、恒橙；退出时连带把
+        「全选图片」勾选收掉（原版 SetChecked(false) 联动）。"""
+        on = not self.view.free_mode
+        self.view.set_free_mode(on)
+        self.free_btn.setText('🛑 锁定当前排版' if on else '🛠 开启自由排版')
+        if not on and self.all_sel_chk.isChecked():
+            self.all_sel_chk.blockSignals(True)
+            self.all_sel_chk.setChecked(False)
+            self.all_sel_chk.blockSignals(False)
+
+    def _on_all_sel(self, state):
+        # 勾选＝全卡已选中（可直接拖任意一张）；取消＝塌回当前单张
+        # （view.sel 本就只记当前卡，语义自动合拢）。
+        self.view.all_sel = (state == Qt.Checked)
+        self.view.update()
+
     def show_page(self, i):
         self.idx = max(0, min(i, len(self.layout) - 1))
         self.view.idx = self.idx
+        # 选中是页内 affordance：换页清当前选中，避免在新页错描另一张
+        # （全选态跨页仍按页生效，与原版逐卡置位同义）。
+        self.view.sel = None
+        self.view._drag = None
         self.view.update()
         self.title.setText(f'— 第 {self.idx + 1} 页 A4 画布 —')
         # 底部文案照对照表 §5 原文一行：页码 + 拖动提示合并
         self.page_label.setText(
             f'第 {self.idx + 1}/{len(self.layout)} 页 · '
             '拖动卡片可调整位置，保存/打印按新位置')
+
+    def _on_zoom_changed(self, z):
+        self.zoom_pct_b.setText(f'{int(round(z * 100))}%')
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # 页宽占比锚定对话框宽：缩放窗体时同步参照宽（0.567 恒定）
+        if getattr(self, 'view', None) is not None:
+            self.view.set_ref_width(self.width())
 
     # ----- export plumbing -----
     def _stem(self, gi, side):
