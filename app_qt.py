@@ -25,7 +25,7 @@ ORANGE = '#F28C1E'
 PAGE_BG = '#F5F6F8'
 BAR_BG = '#EEF0F3'
 SLOT_BG = '#FAFBFC'
-ENH_MAP = {'原图': 'none', '彩色': 'color', '黑白': 'bw',
+ENH_MAP = {'原图': 'none', '彩色': 'color', '清晰': 'clarity', '黑白': 'bw',
            '文档黑白': 'docbw', '文档彩色': 'doccolor'}
 WM_COLORS = ['黑色', '蓝色', '红色', '灰色']
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.heic', '.heif', '.tif', '.tiff')
@@ -591,6 +591,7 @@ class MainWindow(QMainWindow):
     def _save_settings(self):
         self._sync_core_settings()
         data = {'last_dir': self.last_dir, 'enhance': self.enh_combo.currentText(),
+                'enhance_id_default': self.enh_combo.currentText() == '清晰',
                 'wm_enabled': self.wm_check.isChecked(), 'wm_text': self.wm_text.text(),
                 'wm_size': self.wm_size.currentText(), 'wm_color': self.wm_color.currentText(),
                 'wm_opacity': self.wm_opacity.currentText(), 'wm_rows': self.wm_rows.currentText(),
@@ -618,6 +619,10 @@ class MainWindow(QMainWindow):
             return
         if s.get('enhance') in ENH_MAP:
             self.enh_combo.setCurrentText(s['enhance'])
+        elif s.get('enhance_id_default'):
+            # 清晰档粘性标记（出厂默认 False，见 idcard_settings.json）：
+            # enhance 键缺失时凭它恢复上次的清晰档选择
+            self.enh_combo.setCurrentText('清晰')
         self.wm_check.setChecked(bool(s.get('wm_enabled', False)))
         self.wm_text.setText(s.get('wm_text', ''))
         for combo, key in ((self.wm_size, 'wm_size'), (self.wm_color, 'wm_color'),

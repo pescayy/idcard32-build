@@ -216,6 +216,69 @@ def _enhance_idcard_color(pil_img):
             out[..., c] = np.clip(arr[..., c] * gain, 0, 255)
     return Image.fromarray(out.astype(np.uint8), 'RGB')
 
+def _enhance_idcard_clarity(pil_img):
+    """身份证清晰档（2026-11-11 议定，见 CLARITY-SPEC.md）：去雾＋
+    锐化（对比改善由去雾的光照归一化兼任，理由见下），全是纯像素
+    数学——绝不重画/生成笔画（微信 AI 把标签字增强改形就是生成式
+    重画的实证，本档从根上不用那类方法）。两道工序都只动亮度、
+    按通道同比例缩放（色相不变），且带
+    两道保护：高饱和像素（红章、烫金）权重自动收力、不被加深或吹
+    白；近白纸面有白色肩部保护。劲宁小勿大：光照场增益顶 1.15、
+    锐化量 0.35 且带噪点守卫（平坦区的高频多为噪点/纹理，不锐
+    化；真字边才吃锐化）。配方经午后十六验收三轮实测收敛：首版
+    （增益 1.5／锐化 0.55）把噪声图噪点描硬；次版收劲后 OCR 仍
+    丢浅蓝标签字——二分定位到分位对比拉伸是主犯（三组参数下都
+    丢字，它把纸面噪点与浅色笔画一起拉扯），故本档不做全局分
+    位拉伸，对比改善只来自光照场归一化本身；去雾（增益 1.15＋
+    软限幅）＋守卫锐化的组合在真实虚图上标签字完整、OCR 字数
+    不减、锐度小升，即现行配方。"""
+    arr = np.asarray(pil_img.convert('RGB')).astype(np.float32)
+    y = arr[..., 0] * 0.299 + arr[..., 1] * 0.587 + arr[..., 2] * 0.114
+    h, w = y.shape
+
+    def _sat_weight(rgb):
+        mx = rgb.max(axis=2)
+        mn = rgb.min(axis=2)
+        s = np.where(mx > 0, (mx - mn) / np.maximum(mx, 1.0), 0.0)
+        t = np.clip((s - 0.20) / 0.25, 0.0, 1.0)
+        return 1.0 - t * t * (3.0 - 2.0 * t)
+
+    # 1) 去雾：亮度除以低频光照场（÷16 降采样求场，粗到看不见笔画，
+    #    同 lic_enhance 的 48px 阶段思路）；同 lic_enhance 的墨守卫：
+    #    远低于本地场的像素（笔画本体）少吃增益，不被提成灰。
+    small = cv2.resize(y, (max(1, w // 16), max(1, h // 16)),
+                       interpolation=cv2.INTER_AREA)
+    bg = cv2.resize(small, (w, h), interpolation=cv2.INTER_CUBIC)
+    bg = cv2.GaussianBlur(bg, (0, 0), 8)
+    bgv = np.maximum(bg, 24.0)
+    gain = np.clip(232.0 / bgv, 0.97, 1.15)
+    r = y / bgv
+    gf = np.where(r >= 0.85, 1.0,
+                  np.where(r <= 0.55, 0.25,
+                           0.25 + 0.75 * (r - 0.55) / 0.30))
+    # 高饱和像素（红章、皮肤、烫金）同样收力：增益不整幅硬乘。
+    gain = 1.0 + (gain - 1.0) * gf * _sat_weight(arr)
+    gained = arr * gain[..., None]
+    # 软限幅：>235 的部分只走 35% 斜率，避免单通道硬削顶把浅色
+    # 笔画冲向纸白（午后十六二分实测：硬削顶参与丢浅蓝标签字）。
+    out = np.where(gained > 235.0,
+                   235.0 + (gained - 235.0) * 0.35, gained)
+    out = np.clip(out, 0, 255)
+
+    # 2) 锐化：只在亮度上做 unsharp（不生色边），高饱和区收力，
+    #    防红章边缘出光晕；噪点守卫：高频幅度小的像素多为噪点/
+    #    纸纹，权重趋零，只有真边缘（字边）吃满锐化。
+    y3 = out[..., 0] * 0.299 + out[..., 1] * 0.587 + out[..., 2] * 0.114
+    blur = cv2.GaussianBlur(y3, (0, 0), 1.1)
+    sharp = y3 + 0.35 * (y3 - blur)
+    ratio = np.where(y3 >= 1.0, sharp / np.maximum(y3, 1.0), 1.0)
+    edge = np.abs(y3 - blur)
+    e_wgt = np.clip((edge - 1.5) / 8.0, 0.0, 1.0)
+    wgt = (_sat_weight(out) * e_wgt)[..., None]
+    corrected = np.clip(out * ratio[..., None], 0, 255)
+    out = out + wgt * (corrected - out)
+    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), 'RGB')
+
 def _doc_three_band(v):
     """文档模式三段处理：<=215 压黑，>=245 提纯白，中间线性拉伸（鱼还原的 215/245/255 阈值）"""
     return np.clip((v - 215.0) / 30.0, 0.0, 1.0) * 255.0
@@ -683,6 +746,8 @@ class Core:
                 return _enhance_document_color(img)
             if mode == 'color':
                 return _enhance_idcard_color(img)
+            if mode == 'clarity':
+                return _enhance_idcard_clarity(img)
         except Exception:
             return img
         return img
