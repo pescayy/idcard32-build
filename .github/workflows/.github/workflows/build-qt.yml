@@ -1,0 +1,54 @@
+name: build-idcardmuse-qt
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'app_qt.py'
+      - 'core.py'
+      - 'mark_dialog.py'
+      - 'license_dialog.py'
+      - 'ocr_qt.py'
+      - 'lic_pipeline.py'
+      - 'bigdoc.py'
+      - 'lic_enhance.py'
+      - 'lic_dehaze.py'
+      - 'settings_dialog.py'
+      - 'requirements-qt.txt'
+      - '.github/workflows/build-qt.yml'
+jobs:
+  build-qt:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout model parts
+        uses: actions/checkout@v4
+        with:
+          ref: assets
+          path: modelparts
+      - name: Assemble AI model
+        run: python -c "import base64,glob,hashlib,os; parts=sorted(glob.glob('modelparts/models/b64/model.b64.*')); data=b''.join(open(p,'rb').read() for p in parts); raw=base64.b64decode(data); os.makedirs('models',exist_ok=True); open('models/carddetection_scrfd34gkps.onnx','wb').write(raw); print(len(parts),'parts ->',len(raw),'bytes'); assert hashlib.md5(raw).hexdigest()=='bb47635d61f21d63d3993162c28303ff', 'model md5 mismatch'"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8.10'
+          architecture: 'x86'
+      - name: Show python bitness
+        run: python -c "import struct,sys; print(sys.version); print(struct.calcsize('P')*8)"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-qt.txt
+      - name: Build with PyInstaller (onedir)
+        run: pyinstaller --noconfirm --onedir --windowed --name IDCardMuse --collect-all onnxruntime --collect-all rapidocr_onnxruntime --add-data "models/carddetection_scrfd34gkps.onnx;models" app_qt.py
+      - name: Verify onedir layout
+        run: |
+          Get-ChildItem dist/IDCardMuse | Select-Object Name,Length | Format-Table -AutoSize
+          $m = Get-Item dist/IDCardMuse/models/carddetection_scrfd34gkps.onnx
+          Write-Host "model bytes next to exe: $($m.Length)"
+          $total = (Get-ChildItem dist/IDCardMuse -Recurse -File | Measure-Object Length -Sum).Sum
+          Write-Host "onedir total bytes: $total"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IDCardMuse-win7-qt
+          path: dist/IDCardMuse
