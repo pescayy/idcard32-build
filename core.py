@@ -312,6 +312,8 @@ class Core:
 
     def _template_key(self):
         v = self.template
+        if '单列' in v or '清单' in v:
+            return 'single'
         return 'compact' if '紧凑' in v else 'standard'
 
     def collect_pair_images(self):
@@ -343,7 +345,8 @@ class Core:
             return img.convert('RGB')
 
         pages = []
-        if self._template_key() == 'compact':
+        key = self._template_key()
+        if key == 'compact':
             cards = [prep(im) for g in groups for im in g]
             margin = int(10 * s)
             gap_y = int(4 * s)
@@ -358,6 +361,19 @@ class Core:
                     x = margin + c * (cw + gap_x)
                     y = margin + r * (ch + gap_y)
                     placements.append((card, x, y))
+                pages.append(placements)
+        elif key == 'single':
+            # 单列居中（清单）：全部卡片一列居中、自上而下，页边距/行距
+            # 与紧凑模式同档；原版 v2.2 三排版模式之一（对照表 §5）。
+            cards = [prep(im) for g in groups for im in g]
+            margin = int(10 * s)
+            gap_y = int(4 * s)
+            rows = max(1, int((ph - 2 * margin + gap_y) // (ch + gap_y)))
+            x = (pw - cw) // 2
+            for start in range(0, len(cards), rows):
+                placements = []
+                for j, card in enumerate(cards[start:start + rows]):
+                    placements.append((card, x, margin + j * (ch + gap_y)))
                 pages.append(placements)
         else:
             spacing = int(20 * s)
