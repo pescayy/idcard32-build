@@ -1,1 +1,9 @@
-UHlTaWRlMj09NS4xNS4yLjEKb25ueHJ1bnRpbWU9PTEuMTQuMQpyYXBpZG9jci1vbm54cnVudGltZT09MS40LjQKb3BlbnB5eGw9PTMuMS41Cm51bXB5PT0xLjI0LjQKUGlsbG93PT0xMC40LjAKb3BlbmN2LXB5dGhvbj09NC42LjAuNjYKaW1nMnBkZj09MC40LjQKcHlpbnN0YWxsZXI9PTUuMTMuMgo=
+PySide2==5.15.2.1
+onnxruntime==1.14.1
+rapidocr-onnxruntime==1.4.4
+openpyxl==3.1.5
+numpy==1.24.4
+Pillow==10.4.0
+opencv-python==4.6.0.66
+img2pdf==0.4.4
+pyinstaller==5.13.2
