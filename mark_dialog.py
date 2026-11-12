@@ -151,6 +151,12 @@ class MarkDialog(QDialog):
         data = self.core.pairs[idx][side]
         self.img = data['image']
         self.result_points = None
+        # True only while canvas.points hold fresh AI detection output
+        # (card-semantic warp order). Stored points and the preset box
+        # keep the default False -> process_card's geometric sort, i.e.
+        # exactly the pre-fix behavior for those sources. Dragging a
+        # handle preserves list order, so the flag survives drags.
+        self._points_ordered = False
         self.setWindowTitle('手动微调边缘（拖拽四角）')
         # size the window to the photo's aspect, like the original
         iw, ih = self.img.width, self.img.height
@@ -192,12 +198,14 @@ class MarkDialog(QDialog):
         w, h = self.img.width, self.img.height
         self.canvas.points = [(0.12 * w, 0.12 * h), (0.88 * w, 0.12 * h),
                               (0.88 * w, 0.88 * h), (0.12 * w, 0.88 * h)]
+        self._points_ordered = False
         self.canvas.update()
 
     def auto_detect(self, silent=False):
         corners = self.core.ai_detect_any(self.img)
         if corners:
             self.canvas.points = [tuple(p) for p in corners]
+            self._points_ordered = True
             self.canvas.update()
             self._sync_state()
             return True
@@ -210,7 +218,8 @@ class MarkDialog(QDialog):
         if len(self.canvas.points) != 4:
             return
         self.core.current_marking_side = self.side
-        processed = self.core.process_card(self.img, list(self.canvas.points))
+        processed = self.core.process_card(self.img, list(self.canvas.points),
+                                           points_ordered=self._points_ordered)
         if processed is None:
             QMessageBox.warning(self, '提示', '4 个角围的范围太小或交叉了，挪开一点再确认')
             return

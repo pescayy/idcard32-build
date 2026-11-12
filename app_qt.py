@@ -518,7 +518,7 @@ class MainWindow(QMainWindow):
         self._sync_core_settings()
         self.core.current_marking_side = side
         corners = self.core.ai_detect_any(img)
-        processed = self.core.process_card(img, corners) if corners else None
+        processed = self.core.process_card(img, corners, points_ordered=True) if corners else None
         data = self.core.pairs[idx][side]
         data['image'] = img
         data['path'] = path
