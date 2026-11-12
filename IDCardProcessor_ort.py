@@ -129,6 +129,28 @@ def _order_quad_points(pts):
     return [tl, tr, br, bl]
 
 
+def _quad_plausible_for_frame(pts, frame_w, frame_h):
+    """2026-11-12: gate for rescue-chain tile results. A 'card' found inside
+    a tile that covers only a small part of the whole frame is almost
+    always a false positive inside the real card (a text block / portrait
+    region), not the card itself. Require it to span a plausible share of
+    the frame before it may be returned as the card quad."""
+    try:
+        xs = [float(p[0]) for p in pts]
+        ys = [float(p[1]) for p in pts]
+        area = 0.0
+        for i in range(4):
+            x1, y1 = float(pts[i][0]), float(pts[i][1])
+            x2, y2 = float(pts[(i + 1) % 4][0]), float(pts[(i + 1) % 4][1])
+            area += x1 * y2 - x2 * y1
+        area = abs(area) / 2.0
+        return (area >= 0.35 * frame_w * frame_h
+                and (max(xs) - min(xs)) >= 0.45 * frame_w
+                and (max(ys) - min(ys)) >= 0.45 * frame_h)
+    except Exception:
+        return False
+
+
 def _order_points_np(pts):
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
@@ -1238,21 +1260,66 @@ class IDCardProcessor:
             filetypes=[('图像文件', '*.jpg *.jpeg *.png *.bmp *.tiff'), ('所有文件', '*.*')])
         if not files:
             return
+        self.import_files_as_pairs(list(files))
+
+    def on_files_dropped(self, event, idx=None, side=None):
+        """Handle files dropped on a slot, the pairs panel, or anywhere on
+        the main window. splitlist keeps EVERY dropped file (the old slot
+        handler silently kept only the first one). A single file on a
+        slot keeps the single-slot behavior; anything else fills pairs
+        in order, two per pair, without popping marking windows."""
+        try:
+            paths = list(self.root.tk.splitlist(event.data))
+        except Exception:
+            paths = []
+        exts = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp')
+        files = [p for p in paths if p.lower().endswith(exts)]
+        if not files:
+            return
+        if idx is not None and len(files) == 1:
+            self.import_into_slot(idx, side, files[0])
+        elif idx is not None:
+            self.import_files_as_pairs(files, start_idx=idx, start_side=side)
+        else:
+            self.import_files_as_pairs(files)
+
+    def import_files_as_pairs(self, files, start_idx=None, start_side='front'):
+        """Fill pairs with image files in order (front then back per
+        pair), auto-processing each; failures stay as 待标角 and are
+        counted in the status line. With start_idx, filling starts at
+        that pair/side and continues into following pairs."""
+        files = [f for f in files if f]
+        if not files:
+            return
         self._remember_dir(files[0])
         ok, manual = 0, 0
         bad = []
-        # 启动时自带的那个空组先撤掉，免得导入完平白多出一个空组
-        if len(self.pairs) == 1 and \
-                self.pairs[0]['front']['image'] is None and \
-                self.pairs[0]['back']['image'] is None:
-            self.pairs = []
-            self.current_open = None
-        for start in range(0, len(files), 2):
-            idx = self.add_pair()
-            for off, side in enumerate(('front', 'back')):
-                if start + off >= len(files):
-                    break
-                path = files[start + off]
+        if start_idx is None:
+            # 启动时自带的那个空组先撤掉，免得导入完平白多出一个空组
+            if len(self.pairs) == 1 and \
+                    self.pairs[0]['front']['image'] is None and \
+                    self.pairs[0]['back']['image'] is None:
+                self.pairs = []
+                self.current_open = None
+            chunks = [files[i:i + 2] for i in range(0, len(files), 2)]
+            pair_seq = [(None, ('front', 'back')) for _ in chunks]
+        else:
+            first_order = ('front', 'back') if start_side == 'front' else ('back', 'front')
+            chunks = [files[:len(first_order)]]
+            rest = files[len(first_order):]
+            while rest:
+                chunks.append(rest[:2])
+                rest = rest[2:]
+            pair_seq = [(start_idx, first_order)] + \
+                [(start_idx + 1 + j, ('front', 'back')) for j in range(len(chunks) - 1)]
+        import gc as _gc
+        for (pidx, order), chunk in zip(pair_seq, chunks):
+            if pidx is None or pidx >= len(self.pairs):
+                idx = self.add_pair()
+            else:
+                idx = pidx
+                self.open_pair(idx)
+            for side, path in zip(order, chunk):
                 try:
                     image = Image.open(path)
                     image.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
@@ -1276,7 +1343,6 @@ class IDCardProcessor:
                 else:
                     manual += 1
             self._stash_workspace()
-            import gc as _gc
             _gc.collect()
         self.refresh_pairs_panel()
         _msg = f'批量导入完成：自动处理 {ok} 张，待手动标角 {manual} 张'
@@ -1316,6 +1382,16 @@ class IDCardProcessor:
         self.pairs_list_frame.bind('<Configure>', lambda e: self.pairs_canvas.configure(scrollregion=self.pairs_canvas.bbox('all')))
         self.pairs_canvas.bind('<Configure>', lambda e: self.pairs_canvas.itemconfigure(self._pairs_win, width=e.width))
         self.pairs_count_var = tk.StringVar(value='共 0 组')
+        if DRAG_DROP_SUPPORTED:
+            # 2026-11-12: accept drops anywhere on the main window, not
+            # only on the small slot labels (which showed a no-drop
+            # cursor over most of the window).
+            try:
+                for _dw in (self.pairs_canvas, self.pairs_list_frame, self.root):
+                    _dw.drop_target_register(DND_FILES)
+                    _dw.dnd_bind('<<Drop>>', lambda e: self.on_files_dropped(e))
+            except Exception:
+                pass
         self.pairs.append({'front': self._new_slot(), 'back': self._new_slot()})
         self.current_open = 0
         self.refresh_pairs_panel()
@@ -1381,7 +1457,7 @@ class IDCardProcessor:
                 if DRAG_DROP_SUPPORTED:
                     try:
                         w.drop_target_register(DND_FILES)
-                        w.dnd_bind('<<Drop>>', lambda e, i=idx, s=side: self.import_into_slot(i, s, e.data.strip().strip('{}').split('} {')[0]))
+                        w.dnd_bind('<<Drop>>', lambda e, i=idx, s=side: self.on_files_dropped(e, i, s))
                     except Exception:
                         pass
             tk.Button(row, text='正反互换', command=lambda i=idx: self.swap_pair_sides(i),
@@ -1918,6 +1994,14 @@ class IDCardProcessor:
         """显示图片供用户标记 - 带缩放功能"""
         if self.mark_window is not None:
             self.mark_window.destroy()
+        # 2026-11-12 fix: a marking window closed mid-adjust used to leave
+        # adjust_mode/adjust_points stale; the next window then drew the
+        # OLD card's quad and never showed the user's own points. Reset
+        # all marking/adjust state on every window open.
+        self.adjust_mode = False
+        self.adjust_points = []
+        self.dragging_point_index = None
+        self._drag_idx = None
             
         # 创建标记窗口
         self.mark_window = ToplevelWithIcon(self.root)
@@ -2070,7 +2154,15 @@ class IDCardProcessor:
         self.current_scale = 1.0
         # 2026-11-10: open already fitted/zoomed to the window
         # (subtraction: no manual 'fit' step after opening)
-        self.mark_window.after(60, self._fit_mark_window)
+        # 2026-11-12: fit the whole photo into the window immediately and
+        # synchronously -- opening at 100% made close-up photos huge with
+        # corners off-screen; keep a delayed second fit as a safety.
+        try:
+            self.mark_window.update_idletasks()
+            self._fit_mark_window()
+        except Exception:
+            pass
+        self.mark_window.after(150, self._fit_mark_window)
         
         # 如果有传入的点，直接完成标记
         if existing_points is not None and len(existing_points) == 4:
@@ -2183,6 +2275,18 @@ class IDCardProcessor:
                 return None
             arr = np.array(corners, dtype=np.float32)
             h, w = img_cv.shape[:2]
+            # 2026-11-12 fix: on tight-framed photos (card edge right on the
+            # photo edge -- the common customer case) the model puts a
+            # keypoint a few px OUTSIDE the frame, and the validator then
+            # threw away the whole detection. Clamp points that are only
+            # slightly out (<=2% of the frame) back inside; a quad with a
+            # point far outside is still rejected outright.
+            _tolx, _toly = 0.02 * w, 0.02 * h
+            if (arr[:, 0] < -_tolx).any() or (arr[:, 0] > (w - 1) + _tolx).any() or \
+               (arr[:, 1] < -_toly).any() or (arr[:, 1] > (h - 1) + _toly).any():
+                return None
+            arr[:, 0] = np.clip(arr[:, 0], 0, w - 1)
+            arr[:, 1] = np.clip(arr[:, 1], 0, h - 1)
             if not self._validate_quadrilateral(arr.copy(), h, w):
                 return None
             # 2026-11-10: inset edges by 1.0% of card width before warping.
@@ -2271,6 +2375,8 @@ class IDCardProcessor:
                 if not c:
                     continue
                 pts = [[x + tx, y + ty] for x, y in c]
+                if not _quad_plausible_for_frame(pts, W, H):
+                    continue
                 touches = any(x < tw * 0.015 or x > tw * 0.985 or y < th * 0.015 or y > th * 0.985 for x, y in c)
                 if not touches:
                     return pts
@@ -2953,7 +3059,17 @@ class IDCardProcessor:
             
             # 缩放图片
             if self.current_scale != 1.0:
-                scaled_image = self.original_image.resize((scaled_width, scaled_height), Image.Resampling.LANCZOS)
+                # 2026-11-12: cache the LANCZOS-resized image per
+                # (source image, scale); a drag used to re-resize the
+                # full photo on every mouse-motion event, which is what
+                # made marking feel stuck on slow machines.
+                _ckey = round(float(self.current_scale), 4)
+                _cache = getattr(self, "_scaled_cache", None)
+                if _cache and _cache[0] is self.original_image and _cache[1] == _ckey:
+                    scaled_image = _cache[2]
+                else:
+                    scaled_image = self.original_image.resize((scaled_width, scaled_height), Image.Resampling.LANCZOS)
+                    self._scaled_cache = (self.original_image, _ckey, scaled_image)
             else:
                 scaled_image = self.original_image.copy()
             
