@@ -2,25 +2,32 @@
 """营业执照模式（Qt 线）：导入 → lic_pipeline 处理 → 预览 → 导出。
 
 算法全在 bigdoc.py / lic_enhance.py / lic_pipeline.py，本文件只做 UI 与接线：
-- 副本 A4 横版 3508×2480、正本 A3 横版 4961×3508，均 300dpi；
-- JPG 嵌 300dpi；PDF 经 core._pages_to_pdf_bytes 以 300dpi 定页，
-  页面物理尺寸即 A4 297×210mm / A3 420×297mm；
+- 单一规格（2026-11-12 青店实测裁决）：A4 横版 2339×1654 @200dpi，
+  即青在 PS 里把执照拉正后的实际出图尺寸；A3 处理路已删（店里 A3
+  正本直接上扫描仪、不走拍照识别，照片路只剩 A4 量级）；
+- JPG 嵌 200dpi；PDF 在本文件内以 200dpi 定页（不能走
+  core._pages_to_pdf_bytes：那是身份证 A4 页、按 core 的 300dpi
+  盖章，会把 2339×1654 印成非 A4 尺寸），页面即 A4 297×210mm；
 - 自动流程对不上纸边（fallback / no_quad）→ 手动标角窗（复用标角画布）
   框纸面四角后拉正调光；竖拍照片可用「旋转90°」转正后重处理。
 """
-import os, sys
+import os, sys, tempfile, shutil
 import numpy as np
 import cv2
 from PySide2.QtCore import Qt
 from PySide2.QtGui import QPixmap
 from PySide2.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
-                               QComboBox, QLabel, QFileDialog, QMessageBox)
+                               QLabel, QFileDialog, QMessageBox)
 from PIL import Image
+try:
+    import img2pdf
+except Exception:
+    img2pdf = None
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from app_qt import pil_to_qimage, BLUE, PAGE_BG, report_saved
 from mark_dialog import MarkCanvas
-from lic_pipeline import process_license, order_quad, OUT_A4, OUT_A3, DEFAULT_MODEL
+from lic_pipeline import process_license, order_quad, OUT_A4, DEFAULT_MODEL
 from bigdoc import dark_border_fraction
 from lic_enhance import enhance_license
 
@@ -105,13 +112,6 @@ class LicenseDialog(QDialog):
         self.import_b.setStyleSheet(_btn_style())
         self.import_b.clicked.connect(self.import_image)
         top.addWidget(self.import_b)
-        top.addWidget(QLabel('规格'))
-        self.spec_combo = QComboBox()
-        self.spec_combo.addItems(['副本（A4 横版）', '正本（A3 横版）'])
-        self.spec_combo.setStyleSheet(
-            'QComboBox { border-radius: 4px; padding: 3px 6px; background: white; }')
-        self.spec_combo.currentIndexChanged.connect(self._on_spec_changed)
-        top.addWidget(self.spec_combo)
         self.mark_b = QPushButton('手动标角')
         self.mark_b.setStyleSheet(_btn_style())
         self.mark_b.clicked.connect(self.manual_mark)
@@ -146,7 +146,7 @@ class LicenseDialog(QDialog):
 
     # ---------- helpers ----------
     def _out_size(self):
-        return OUT_A4 if self.spec_combo.currentIndex() == 0 else OUT_A3
+        return OUT_A4
 
     def _detector(self):
         det = getattr(self.win.core, 'detector_ai', None)
@@ -218,15 +218,13 @@ class LicenseDialog(QDialog):
             notes.append('电子档/平扫图：整图即纸面，已跳过外探与调光')
         if res['fallback'] == 'frame_quad':
             notes.append('外探没对上纸边，已按花边框拉正，建议手动标角核对')
+        if res.get('dewarp_skipped_high_bow'):
+            notes.append('这张照片卷曲较重，没能拉平，本次只做了透视拉正')
         note = self._dark_note(res['info'].get('dark_border'))
         if note:
             notes.append(note)
         self.info.setText('；'.join(notes) if notes else '处理完成，可导出')
         self._sync_buttons()
-
-    def _on_spec_changed(self, _idx):
-        if self.src_bgr is not None:
-            self._process()
 
     def rotate_source(self):
         if self.src_bgr is None:
@@ -287,7 +285,7 @@ class LicenseDialog(QDialog):
             return
         if not path.lower().endswith(('.jpg', '.jpeg')):
             path += '.jpg'
-        self._pil().save(path, quality=95, dpi=(300, 300))
+        self._pil().save(path, quality=95, dpi=(200, 200))
         self._after_save(path)
 
     def export_pdf(self):
@@ -302,7 +300,25 @@ class LicenseDialog(QDialog):
             return
         if not path.lower().endswith('.pdf'):
             path += '.pdf'
-        data = self.win.core._pages_to_pdf_bytes([self._pil()])
+        data = self._license_pdf_bytes()
+        if data is None:
+            QMessageBox.warning(self, '提示', 'PDF 生成失败，请改用导出 JPG')
+            return
         with open(path, 'wb') as f:
             f.write(data)
         self._after_save(path)
+
+    def _license_pdf_bytes(self):
+        """执照 PDF：2339×1654 以 200dpi 定页 = A4 横版 297×210mm。
+        不走 core._pages_to_pdf_bytes（那是身份证页、按 300dpi 盖章，
+        会把执照页印成约 198×140mm）。临时目录用完即清（同 core 的
+        客户证件页纪律：不把整页渲染留在 %TEMP%）。"""
+        if img2pdf is None:
+            return None
+        tmpdir = tempfile.mkdtemp()
+        try:
+            fp = os.path.join(tmpdir, 'license.jpg')
+            self._pil().save(fp, quality=95, dpi=(200, 200))
+            return img2pdf.convert(fp)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)

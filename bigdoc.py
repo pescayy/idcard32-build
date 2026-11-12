@@ -280,6 +280,264 @@ def converge_corners(bgr, quad, max_shift_frac=0.02):
     return q, {"corner_shifts_px": moved, "paper_level": paper_level}
 
 
+# ---------- local corner refinement (2026-11-12) ----------
+# The paper quad's corners are intersections of two full-length edge
+# lines whose angles descend from the detector's frame chord. Gold-set
+# scoring (license-goldset-v2, 22 photo samples) showed the corner
+# error concentrates exactly there: the detector chord is off by
+# 30-90 px at the top corners, expand_to_paper_edge shifts the two
+# lines outward by scalar offsets, and their intersection slides along
+# the edge -- worst case 152 px (Image-14-53-06 TL), 128 px on the
+# scalloped corner of shadow_purple that the three-way comparison
+# flagged as a corner-refinement (edge-hugging fit) failure, not a
+# paper-finding failure. Bottom corners, where the chord happens to
+# sit well, stay at 10-45 px through the same stages.
+# refine_corners_local re-fits each corner from the paper boundary in
+# the corner's own neighbourhood. The boundary points come from
+# edge_station_bounds (the envelope's station march: per-station paper
+# extent along each frame edge, with shadow-plateau adaptation and
+# sustained-paper tests -- the most battle-tested boundary reader in
+# this module). For each corner, the boundary points on the two
+# incident edges' corner-adjacent station stretches (10%-38% of the
+# edge from the corner, staying off the corner turn itself) are
+# robust-line-fitted (PCA + one MAD rejection pass) and the corner is
+# the two local lines' intersection -- the same construction the gold
+# labeler used ("intersection of the two band outer edges"). A corner
+# moves only when both incident fits are clean (enough stations, low
+# residual, sane angle) AND the intersection is stable when each
+# segment is re-fitted from its near/far halves alone; otherwise it
+# keeps its incoming position --
+# an unreadable corner is left alone, never guessed. The whole quad
+# is returned untouched if the refined quad fails sanity / convexity /
+# area checks. (First version note: a hand-rolled per-station
+# brightness-step finder was tried and rejected on the evidence --
+# too weak on low-contrast edges to fire where needed, and where the
+# background offered a cleaner straight feature than the paper edge
+# it fired wrongly, Image-14-55-27 TR 121 -> 174 px.)
+
+def _fit_line_pca(pts):
+    """Total-least-squares line through pts; returns (point, unit dir,
+    rms residual) or None."""
+    P = np.asarray(pts, float)
+    if len(P) < 3:
+        return None
+    c = P.mean(axis=0)
+    X = P - c
+    try:
+        _u, _s, vt = np.linalg.svd(X, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    d = vt[0]
+    nrm = np.array([-d[1], d[0]])
+    res = np.abs(X @ nrm)
+    return c, d, float(np.sqrt((res ** 2).mean())), res
+
+
+def _fit_line_robust(pts):
+    """PCA line fit with one MAD-based outlier rejection pass."""
+    got = _fit_line_pca(pts)
+    if got is None:
+        return None
+    c, d, _rms, res = got
+    med = float(np.median(res))
+    mad = float(np.median(np.abs(res - med))) * 1.4826
+    thr = max(3.0, med + 3.0 * max(mad, 0.5))
+    keep = res <= thr
+    if int(keep.sum()) >= 4 and int(keep.sum()) < len(pts):
+        got2 = _fit_line_pca(np.asarray(pts, float)[keep])
+        if got2 is not None:
+            return got2[0], got2[1], got2[2], int(keep.sum())
+    return c, d, got[2], len(pts)
+
+
+def refine_corners_local(bgr, quad, frame_quad=None):
+    """Re-fit each corner of a paper quad from the paper boundary in
+    the corner's neighbourhood (see the section header). Returns
+    (quad, info); the input quad is returned unchanged when nothing
+    qualifies -- this stage only ever moves a corner onto measured
+    local evidence."""
+    q = _validate_quad(quad, "refine_corners_local")
+    if frame_quad is None:
+        return q, {"applied": False, "reason": "no_frame_quad"}
+    bounds = edge_station_bounds(bgr, np.asarray(frame_quad, float))
+    if bounds is None:
+        return q, {"applied": False, "reason": "no_paper_reference"}
+    ink_all, ext_all, oob_all, _lvl = bounds
+    fgeo = _edge_geometry(np.asarray(frame_quad, float))
+    geo = _edge_geometry(q)
+    samples = len(ext_all[0])
+    ts_all = np.linspace(0.04, 0.96, samples)
+    out = q.copy()
+    detail = []
+    cos_min = float(np.cos(np.radians(12.0)))
+
+    def _seg_line(pts, u):
+        if len(pts) < 4:
+            return None
+        fit = _fit_line_robust(pts)
+        if fit is None:
+            return None
+        c0, d0, rms, _nu = fit
+        if rms > 6.0 or abs(float(np.dot(d0, u))) < cos_min:
+            return None
+        return _line(c0, c0 + d0), rms
+
+    # Segment pre-pass: for each edge, fit the boundary points in the
+    # station stretch nearest each end (10%-38% of the edge from the
+    # corner, staying off the corner turn itself).
+    seg_info = {}
+    for j in range(4):
+        a, b, n, _mid = fgeo[j]
+        seg = b - a
+        qa, qb, _qn, _qm = geo[j]
+        u = qb - qa
+        u = u / max(1e-9, float(np.hypot(*u)))
+        for at_b_end in (False, True):
+            if at_b_end:
+                sel = (ts_all >= 0.62) & (ts_all <= 0.90)
+            else:
+                sel = (ts_all >= 0.10) & (ts_all <= 0.38)
+            pts = []
+            for k in np.nonzero(sel)[0]:
+                if oob_all[j][k]:
+                    continue        # extent set by the image border
+                e = float(ext_all[j][k])
+                if e <= 0.0:
+                    continue
+                pts.append(a + seg * float(ts_all[k]) + n * e)
+            entry = {"pts": pts, "line": None, "u": u}
+            if len(pts) >= 5:
+                got = _seg_line(pts, u)
+                if got is not None:
+                    entry["line"], entry["rms"] = got
+            seg_info[(j, at_b_end)] = entry
+    # Edge consistency: a paper edge is ONE straight line (the cutting
+    # rule is four straight sides). If the fits from the edge's two
+    # ends disagree -- angle over 3 degrees, or the two lines sitting
+    # more than 12 px apart at the edge's midpoint -- then at least
+    # one end measured something else (a twisted tail segment near a
+    # lifted corner reads as a clean but different line), and neither
+    # end may move its corner.
+    for j in range(4):
+        e0 = seg_info[(j, False)]
+        e1 = seg_info[(j, True)]
+        if e0["line"] is None or e1["line"] is None:
+            continue
+        d0 = np.array([-e0["line"][1], e0["line"][0]])
+        d1 = np.array([-e1["line"][1], e1["line"][0]])
+        cosang = abs(float(np.dot(d0, d1)))
+        # Separation is judged at the edge's midpoint: two fits of one
+        # straight edge under perspective/noise differ by a degree or
+        # two and separate slowly (a far-centroid comparison would
+        # veto them all), while a segment that measured a different,
+        # parallel line (a twisted tail) is offset everywhere,
+        # midpoint included.
+        mid = fgeo[j][3]
+        L0, L1 = e0["line"], e1["line"]
+        p0 = mid - (L0[0] * mid[0] + L0[1] * mid[1] + L0[2]) \
+            * np.array([L0[0], L0[1]])
+        p1 = mid - (L1[0] * mid[0] + L1[1] * mid[1] + L1[2]) \
+            * np.array([L1[0], L1[1]])
+        sep = max(abs(float(L1[0] * p0[0] + L1[1] * p0[1] + L1[2])),
+                  abs(float(L0[0] * p1[0] + L0[1] * p1[1] + L0[2])))
+        if cosang < float(np.cos(np.radians(3.0))) or sep > 12.0:
+            e0["line"] = e1["line"] = None
+            e0["veto"] = e1["veto"] = "edge_inconsistent"
+            detail.append({"edge": j, "reason": "edge_inconsistent",
+                           "cosang": round(cosang, 4),
+                           "sep": round(sep, 1)})
+    for i in range(4):
+        C = q[i]
+        prev_pt = q[(i - 1) % 4]
+        next_pt = q[(i + 1) % 4]
+        variants = []
+        ok = True
+        # Each segment is also fitted from its near/far halves
+        # separately, because the corner is only trustworthy when the
+        # intersection is STABLE under that window perturbation: a
+        # boundary that flares, curls or changes surface inside the
+        # window shifts the half-fits apart, while a straight
+        # boundary stretch gives the same line from every sub-window.
+        for j, at_b_end in (((i - 1) % 4, True), (i, False)):
+            entry = seg_info[(j, at_b_end)]
+            pts = entry["pts"]
+            if entry["line"] is None:
+                ok = False
+                detail.append({"corner": i, "edge": j,
+                               "reason": entry.get("veto",
+                                                   "few_stations"
+                                                   if len(pts) < 5
+                                                   else "fit_rejected"),
+                               "n": len(pts)})
+                break
+            seg_vars = [entry["line"]]
+            detail.append({"corner": i, "edge": j,
+                           "rms": round(entry["rms"], 2),
+                           "n": len(pts)})
+            half = len(pts) // 2
+            for sub in (pts[:max(half, len(pts) - half)],
+                        pts[min(half, len(pts) - half):]):
+                got_h = _seg_line(sub, entry["u"])
+                if got_h is not None:
+                    seg_vars.append(got_h[0])
+            variants.append(seg_vars)
+        if not ok or len(variants) != 2:
+            continue
+        pt = _intersect(variants[0][0], variants[1][0])
+        if pt is None:
+            continue
+        # stability: every variant pairing's intersection must stay
+        # near the full-fit corner; a corner whose position depends
+        # on which sub-window measured it is not evidence, it is a
+        # guess -- keep the incoming corner instead.
+        cands_pt = []
+        for la in variants[0]:
+            for lb in variants[1]:
+                p_ab = _intersect(la, lb)
+                if p_ab is not None:
+                    cands_pt.append(p_ab)
+        if len(cands_pt) >= 4:
+            spread = max(float(np.hypot(*(p_ab - pt)))
+                         for p_ab in cands_pt)
+            if spread > 20.0:
+                detail.append({"corner": i, "reason": "unstable",
+                               "spread": round(spread, 1)})
+                continue
+        move = float(np.hypot(*(pt - C)))
+        cap = 0.18 * min(float(np.hypot(*(C - prev_pt))),
+                         float(np.hypot(*(next_pt - C))))
+        if move > cap:
+            detail.append({"corner": i, "reason": "move_capped",
+                           "move": round(move, 1), "cap": round(cap, 1)})
+            continue
+        out[i] = pt
+        detail.append({"corner": i, "moved_px": round(move, 1)})
+    if np.allclose(out, q):
+        return q, {"applied": False, "detail": detail}
+    # whole-quad sanity: finite, sane area vs input, convex, same winding
+    try:
+        _validate_quad(out, "refine_corners_local(out)")
+    except ValueError:
+        return q, {"applied": False, "detail": detail,
+                   "reason": "output_insane"}
+
+    def _area(p):
+        return 0.5 * abs(float(np.dot(p[:, 0], np.roll(p[:, 1], -1)) -
+                               np.dot(p[:, 1], np.roll(p[:, 0], -1))))
+    if not (0.70 * _area(q) <= _area(out) <= 1.40 * _area(q)):
+        return q, {"applied": False, "detail": detail,
+                   "reason": "area_out_of_band"}
+    signs = []
+    for i in range(4):
+        e1 = out[(i + 1) % 4] - out[i]
+        e2 = out[(i + 2) % 4] - out[(i + 1) % 4]
+        signs.append(float(e1[0] * e2[1] - e1[1] * e2[0]))
+    if not (all(s > 0 for s in signs) or all(s < 0 for s in signs)):
+        return q, {"applied": False, "detail": detail,
+                   "reason": "non_convex"}
+    return out, {"applied": True, "detail": detail}
+
+
 # ---------- out-of-frame clamp + evidence tightening (2026-11-11) ----------
 # Qing's rule: rather lose a sliver of paper than show anything outside it.
 # warpPerspective fills out-of-source samples with black, so a paper quad

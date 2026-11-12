@@ -70,13 +70,20 @@ import cv2
 
 from bigdoc import expand_to_paper_edge, converge_corners, \
     dark_border_fraction, clamp_quad_to_frame, tighten_edges, \
-    envelope_quad, is_flat_scan, A4_RATIO
+    envelope_quad, is_flat_scan, A4_RATIO, refine_corners_local
 from lic_enhance import enhance_license
 from lic_dehaze import dehaze_license
 from lic_undistort import undistort_license, GATE_MAX_DEV
 
-OUT_A4 = (3508, 2480)  # copy (副本): 297x210mm @300dpi, landscape
-OUT_A3 = (4961, 3508)  # original (正本): 420x297mm @300dpi, landscape
+# Single output spec (2026-11-12 canvas ruling, measured at Qing's
+# shop from her PS "image size" dialog): A4 landscape @200dpi. The
+# old A4@300 canvas (3508x2480) and the A3 path (4961x3508) are gone:
+# her licence output IS 2339x1654, shop A3 originals go to the flatbed
+# scanner rather than the photo route, and the smaller canvas also
+# caps the warp/TPS buffer sizes on her Win7-32/4GB machine. Detection
+# still runs on the source photo at native resolution; this constant
+# governs only the processing/output canvas.
+OUT_A4 = (2339, 1654)  # A4 landscape: 297x210mm @200dpi
 
 _BASE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL = os.path.join(_BASE, "models", "carddetection_scrfd34gkps.onnx")
@@ -331,6 +338,23 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
     warp_quad = paper2
 
     flat = bool(info.get("flat_scan"))
+    if fallback is None and not flat:
+        # Local corner refinement (2026-11-12): the converged quad's
+        # corners are intersections of two full-length lines descended
+        # from the detector's frame chord, and gold-set scoring showed
+        # the intersection sliding along curled edges (worst 152 px).
+        # Re-fit each corner from the paper boundary in its own
+        # neighbourhood before the framing candidates are built on
+        # this quad; corners without clean local evidence keep their
+        # incoming position. Flat scans (whole image is paper, corners
+        # exact) and the frame fallback (no reconciled paper) skip it.
+        try:
+            paper2, rinfo = refine_corners_local(bgr, paper2, frame_used)
+        except Exception as exc:
+            rinfo = {"applied": False,
+                     "error": f"{type(exc).__name__}: {exc}"}
+        info["corner_refine"] = rinfo
+        warp_quad = paper2
     warped = None
     if fallback is None and not flat:
         # Three framing candidates, picked by measured evidence on
@@ -362,7 +386,14 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
         info["frame_clamp"] = fc_info
         te_q, te_info = tighten_edges(bgr, fc_q, frame_used)
         info["tighten"] = te_info
-        env_q, env_info = envelope_quad(bgr, frame_used, out_size)
+        # The envelope's default target margins (250/370 output px)
+        # are physical sizes -- 21mm / 31mm on the old 300dpi canvas.
+        # Scale them with the canvas so the framed licence keeps the
+        # same physical margins at 200dpi (~167 / ~247 px).
+        m_lr = 250.0 * out_w / 3508.0
+        m_tb = 370.0 * out_h / 2480.0
+        env_q, env_info = envelope_quad(bgr, frame_used, out_size,
+                                        m_lr=m_lr, m_tb=m_tb)
         info["envelope"] = env_info
 
         cands = [("expand", paper2, paper2, 0.0),
@@ -402,6 +433,7 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
             # and slack only ever move the line within the original
             # image's real pixels).
             env_q, env_info = envelope_quad(bgr, frame_used, out_size,
+                                            m_lr=m_lr, m_tb=m_tb,
                                             extra_tiers=((12.0, 10.0),))
             info["envelope"] = env_info
             if env_q is not None:
