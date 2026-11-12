@@ -530,6 +530,10 @@ class IDCardProcessor:
                   activeforeground='white', relief=tk.FLAT,
                   font=("Arial", 11, "bold"), padx=18, pady=6,
                   cursor='hand2').pack(side=tk.LEFT)
+        tk.Button(top_bar, text="看图选片", command=self.open_thumbnail_picker,
+                  bg='#F5F5F7', fg='#333333', activebackground='#E8E8EA',
+                  relief=tk.FLAT, font=("Arial", 11),
+                  padx=14, pady=6, cursor='hand2').pack(side=tk.LEFT, padx=(8, 0))
         tk.Button(top_bar, text="清空数据", command=self._clear_pairs,
                   bg='#F5F5F7', fg='#333333', activebackground='#E8E8EA',
                   relief=tk.FLAT, font=("Arial", 10),
@@ -1233,6 +1237,121 @@ class IDCardProcessor:
         except Exception as e:
             messagebox.showerror('错误', f'加载图片失败: {str(e)}')
 
+    def open_thumbnail_picker(self):
+        """看图选片：文件夹大缩略图阅览窗（PS 式）。点照片选中（可多选），
+        一键按文件名顺序导入成组——不用对着文件名猜，也不用逐张拖。"""
+        import os as _os
+        exts = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp')
+        win = ToplevelWithIcon(self.root)
+        win.title('看图选片 - 点照片选中，可多选')
+        win.geometry('920x680')
+        state = {'dir': self._get_last_dir() or _os.path.expanduser('~'),
+                 'files': [], 'names': [], 'sel': set(), 'photos': [], 'frames': []}
+        top = tk.Frame(win, bg='#F5F6F8')
+        top.pack(side=tk.TOP, fill=tk.X)
+        dir_lbl = tk.Label(top, text='', bg='#F5F6F8', fg='#333333', font=('Arial', 10))
+        dir_lbl.pack(side=tk.LEFT, padx=8, pady=6)
+
+        def choose_dir():
+            d = filedialog.askdirectory(title='选择照片文件夹', initialdir=state['dir'])
+            if d:
+                state['dir'] = d
+                load_dir()
+
+        tk.Button(top, text='换文件夹', command=choose_dir,
+                  bg='#F5F5F7', fg='#333333', activebackground='#E8E8EA',
+                  relief=tk.FLAT, padx=12, pady=5, cursor='hand2').pack(side=tk.RIGHT, padx=8, pady=4)
+        wrap = tk.Frame(win, bg='white')
+        wrap.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(wrap, bg='white', highlightthickness=0)
+        sb = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        inner = tk.Frame(canvas, bg='white')
+        _win_id = canvas.create_window((0, 0), window=inner, anchor='nw')
+        inner.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>', lambda e: canvas.itemconfigure(_win_id, width=e.width))
+        canvas.bind('<MouseWheel>', lambda e: canvas.yview_scroll(int(-e.delta / 120), 'units'))
+        bar = tk.Frame(win, bg='#EEF0F3')
+        bar.pack(side=tk.BOTTOM, fill=tk.X)
+        cnt = tk.Label(bar, text='', bg='#EEF0F3', font=('Arial', 10))
+        cnt.pack(side=tk.LEFT, padx=8, pady=6)
+
+        def refresh_cnt():
+            cnt.config(text=f"已选 {len(state['sel'])} 张（按文件名顺序导入，两张一组）")
+
+        def paint_sel():
+            for i, fr in enumerate(state['frames']):
+                fr.config(bg='#2F7CF6' if i in state['sel'] else '#DDDDDD')
+
+        def toggle(i):
+            if i in state['sel']:
+                state['sel'].discard(i)
+            else:
+                state['sel'].add(i)
+            paint_sel()
+            refresh_cnt()
+
+        def do_import():
+            files = [state['files'][i] for i in sorted(state['sel'])]
+            if not files:
+                messagebox.showinfo('提示', '先点几张照片把它们选中', parent=win)
+                return
+            win.destroy()
+            self.import_files_as_pairs(files)
+
+        tk.Button(bar, text='导入选中', command=do_import,
+                  bg='#2F7CF6', fg='white', activebackground='#2F7CF6',
+                  activeforeground='white', relief=tk.FLAT,
+                  font=('Arial', 10, 'bold'), padx=16, pady=5,
+                  cursor='hand2').pack(side=tk.RIGHT, padx=8, pady=4)
+        tk.Button(bar, text='清空选择',
+                  command=lambda: (state['sel'].clear(), paint_sel(), refresh_cnt()),
+                  bg='#F5F5F7', fg='#333333', activebackground='#E8E8EA',
+                  relief=tk.FLAT, padx=12, pady=5, cursor='hand2').pack(side=tk.RIGHT, pady=4)
+
+        def load_dir():
+            for w_ in inner.winfo_children():
+                w_.destroy()
+            state['sel'].clear()
+            state['photos'] = []
+            state['frames'] = []
+            dir_lbl.config(text=state['dir'])
+            try:
+                names = sorted(n for n in _os.listdir(state['dir'])
+                               if n.lower().endswith(exts))
+            except Exception:
+                names = []
+            state['names'] = names[:300]
+            state['files'] = [_os.path.join(state['dir'], n) for n in state['names']]
+            cols = 5
+            for i, path in enumerate(state['files']):
+                cell = tk.Frame(inner, bg='#DDDDDD')
+                cell.grid(row=i // cols, column=i % cols, padx=4, pady=4)
+                state['frames'].append(cell)
+                holder = tk.Frame(cell, bg='white')
+                holder.pack(padx=2, pady=2)
+                try:
+                    _im = Image.open(path)
+                    _im.thumbnail((150, 105), Image.Resampling.LANCZOS)
+                    _ph = ImageTk.PhotoImage(_im, master=self.root)
+                    state['photos'].append(_ph)
+                    lab = tk.Label(holder, image=_ph, bg='white')
+                except Exception:
+                    lab = tk.Label(holder, text='读不了', bg='white', width=20, height=6)
+                lab.pack()
+                _nm = state['names'][i]
+                _short = _nm if len(_nm) <= 22 else _nm[:19] + '…'
+                t = tk.Label(holder, text=_short, bg='white', fg='#555555', font=('Arial', 8))
+                t.pack()
+                for _w in (cell, holder, lab, t):
+                    _w.bind('<Button-1>', lambda e, i=i: toggle(i))
+            refresh_cnt()
+            canvas.yview_moveto(0)
+
+        load_dir()
+
     def batch_import(self):
         """批量导入：按选择顺序两张一组（先正面后反面），逐张自动识别处理"""
         files = filedialog.askopenfilenames(
@@ -1623,14 +1742,14 @@ class IDCardProcessor:
         s = self.mm_to_pixel
         pw, ph = int(self.a4_width * s), int(self.a4_height * s)
         cw, ch = int(self.id_width * s), int(self.id_height * s)
-        scale = min(860 / pw, 800 / ph)
-        dw, dh = int(pw * scale), int(ph * scale)
-        dcw, dch = max(10, int(cw * scale)), max(10, int(ch * scale))
-        ox, oy = (900 - dw) // 2, (840 - dh) // 2 + 16
+        # 2026-11-12: open at ORIGINAL size (scale 1.0) on a scrollable
+        # canvas. The old fit-whole-page view shrank the sheet to ~23%,
+        # where a millimetre is under 3 px and drag distances cannot be
+        # judged. A fit-to-window toggle stays for the overview.
+        state = {'idx': 0, 'photos': [], 'drag': None, 'scale': 1.0}
         win = ToplevelWithIcon(self.root)
         win.title('可交互排版预览（支持拖放）')
         win.geometry('900x960')
-        state = {'idx': 0, 'photos': [], 'drag': None}
 
         # 顶部工具条（对齐 IDCardMerge 交互预览：按钮在上、颜色分工，个个是真功能）
         toolbar = tk.Frame(win, bg='white')
@@ -1649,18 +1768,49 @@ class IDCardProcessor:
         _tbtn('导出单页 PDF', self._export_pages_pdf_single, bg='#2E7CF6')
         _tbtn('导出合并 PDF', self._export_pages_pdf, bg='#43C93B')
         _tbtn('系统直接打印', self._print_pages)
+        _tbtn('原始大小', lambda: set_scale(1.0))
+        _tbtn('整页显示', lambda: set_scale(fit_scale()))
 
         header = tk.Label(win, text='', bg='#808080', fg='#F0F0F0', font=('Arial', 10))
         header.pack(side=tk.TOP, fill=tk.X)
-        canvas = tk.Canvas(win, bg='#808080', highlightthickness=0)
-        canvas.pack(fill=tk.BOTH, expand=True)
+        wrap = tk.Frame(win, bg='#808080')
+        wrap.pack(fill=tk.BOTH, expand=True)
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+        canvas = tk.Canvas(wrap, bg='#808080', highlightthickness=0)
+        ysb = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=canvas.yview)
+        xsb = ttk.Scrollbar(wrap, orient=tk.HORIZONTAL, command=canvas.xview)
+        canvas.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        canvas.grid(row=0, column=0, sticky='nsew')
+        ysb.grid(row=0, column=1, sticky='ns')
+        xsb.grid(row=1, column=0, sticky='ew')
+
+        def metrics():
+            sc = state['scale']
+            return (int(pw * sc), int(ph * sc), max(10, int(cw * sc)), max(10, int(ch * sc)), 24, 24)
+
+        def fit_scale():
+            try:
+                win.update_idletasks()
+                vw = max(200, canvas.winfo_width() - 8)
+                vh = max(200, canvas.winfo_height() - 8)
+            except Exception:
+                vw, vh = 860, 800
+            return min(vw / pw, vh / ph)
+
+        def set_scale(sc):
+            state['scale'] = sc
+            render()
 
         def render():
+            dw, dh, dcw, dch, ox, oy = metrics()
+            sc = state['scale']
             canvas.delete('all')
             state['photos'] = []
+            canvas.configure(scrollregion=(0, 0, ox + dw + 24, oy + dh + 24))
             canvas.create_rectangle(ox, oy, ox + dw, oy + dh, fill='white', outline='black')
             for i, (img, x, y) in enumerate(layout[state['idx']]):
-                dx, dy = ox + int(x * scale), oy + int(y * scale)
+                dx, dy = ox + int(x * sc), oy + int(y * sc)
                 tag = f'card{i}'
                 canvas.create_rectangle(dx, dy, dx + dcw, dy + dch, outline='#999999', tags=(tag,))
                 thumb = img.resize((dcw, dch), Image.Resampling.LANCZOS)
@@ -1668,7 +1818,7 @@ class IDCardProcessor:
                 state['photos'].append(photo)
                 canvas.create_image(dx, dy, image=photo, anchor=tk.NW, tags=(tag,))
             header.config(text=f"--- 第 {state['idx'] + 1} 页 A4 画布 ---")
-            info.config(text=f"第 {state['idx'] + 1} / {len(layout)} 页 · 拖动卡片可调整位置，保存/打印按新位置")
+            info.config(text=f"第 {state['idx'] + 1} / {len(layout)} 页 · 显示 {int(sc * 100)}% · 拖动卡片可调整位置，保存/打印按新位置")
 
         def on_press(event):
             items = canvas.find_withtag('current')
@@ -1676,14 +1826,16 @@ class IDCardProcessor:
                 return
             for t in canvas.gettags(items[0]):
                 if t.startswith('card'):
-                    state['drag'] = (int(t[4:]), event.x, event.y)
+                    state['drag'] = (int(t[4:]), canvas.canvasx(event.x), canvas.canvasy(event.y))
                     return
 
         def on_motion(event):
             if not state['drag']:
                 return
+            dw, dh, dcw, dch, ox, oy = metrics()
             i, lx, ly = state['drag']
-            dx, dy = event.x - lx, event.y - ly
+            dx = canvas.canvasx(event.x) - lx
+            dy = canvas.canvasy(event.y) - ly
             tag = f'card{i}'
             box = canvas.bbox(tag)
             if box:
@@ -1706,12 +1858,15 @@ class IDCardProcessor:
             state['drag'] = None
             box = canvas.bbox(f'card{i}')
             if box:
+                _dw, _dh, _dcw, _dch, ox, oy = metrics()
                 img, _x, _y = layout[state['idx']][i]
-                layout[state['idx']][i] = (img, (box[0] - ox) / scale, (box[1] - oy) / scale)
+                layout[state['idx']][i] = (img, (box[0] - ox) / state['scale'], (box[1] - oy) / state['scale'])
 
         canvas.bind('<ButtonPress-1>', on_press)
         canvas.bind('<B1-Motion>', on_motion)
         canvas.bind('<ButtonRelease-1>', on_release)
+        canvas.bind('<MouseWheel>', lambda e: canvas.yview_scroll(int(-e.delta / 120), 'units'))
+        canvas.bind('<Shift-MouseWheel>', lambda e: canvas.xview_scroll(int(-e.delta / 120), 'units'))
         bar = tk.Frame(win, bg='#F0F0F0')
         bar.pack(side=tk.BOTTOM, fill=tk.X)
         info = tk.Label(bar, text='', bg='#F0F0F0', fg='#555555', font=('Arial', 9))
