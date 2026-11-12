@@ -10,6 +10,10 @@ try:
 except Exception:
     img2pdf = None
 
+# refineCorners 开关（对齐原版 IDCardMerge v2.2：Detect 出角后紧接着在
+# 原图上精修四角）。置 False 则原样使用模型角点。
+REFINE_CORNERS = True
+
 def _order_quad_points(pts):
     """把任意顺序点击的 4 个角点排成 [左上, 右上, 右下, 左下]。"""
     pts = [tuple(p) for p in pts]
@@ -18,28 +22,6 @@ def _order_quad_points(pts):
     tr = max(pts, key=lambda p: p[0] - p[1])
     bl = min(pts, key=lambda p: p[0] - p[1])
     return [tl, tr, br, bl]
-
-def _quad_plausible_for_frame(pts, frame_w, frame_h):
-    """2026-11-12: gate for rescue-chain tile results. A 'card' found inside
-    a tile that covers only a small part of the whole frame is almost
-    always a false positive inside the real card (a text block / portrait
-    region), not the card itself. Require it to span a plausible share of
-    the frame before it may be returned as the card quad."""
-    try:
-        xs = [float(p[0]) for p in pts]
-        ys = [float(p[1]) for p in pts]
-        area = 0.0
-        for i in range(4):
-            x1, y1 = float(pts[i][0]), float(pts[i][1])
-            x2, y2 = float(pts[(i + 1) % 4][0]), float(pts[(i + 1) % 4][1])
-            area += x1 * y2 - x2 * y1
-        area = abs(area) / 2.0
-        return (area >= 0.35 * frame_w * frame_h
-                and (max(xs) - min(xs)) >= 0.45 * frame_w
-                and (max(ys) - min(ys)) >= 0.45 * frame_h)
-    except Exception:
-        return False
-
 
 def _order_points_np(pts):
     rect = np.zeros((4, 2), dtype="float32")
@@ -50,42 +32,6 @@ def _order_points_np(pts):
     rect[1] = pts[np.argmin(diff)]
     rect[3] = pts[np.argmax(diff)]
     return rect
-
-def _inset_quad(pts, frac=0.003):
-    """Inset each edge of the quad along its inward normal by frac*card width,
-    recomputing corners as intersections. Counters the model's outward corner
-    bias (measured: 47% of edges include >2px background). On any degeneracy,
-    returns the input unchanged."""
-    try:
-        p = [np.array(q, dtype=np.float64) for q in pts]
-        w1 = np.hypot(*(p[1] - p[0])); w2 = np.hypot(*(p[2] - p[3]))
-        d = frac * max(w1, w2)
-        if d <= 0:
-            return pts
-        cen = sum(p) / 4.0
-        lines = []
-        for i in range(4):
-            a, b = p[i], p[(i + 1) % 4]
-            e = b - a
-            L = np.hypot(*e)
-            if L < 1:
-                return pts
-            n = np.array([-e[1], e[0]]) / L
-            if np.dot(n, cen - a) < 0:
-                n = -n
-            lines.append((a + n * d, e))
-        out = []
-        for i in range(4):
-            p1, e1 = lines[i - 1]
-            p2, e2 = lines[i]
-            det_ = e1[0] * e2[1] - e1[1] * e2[0]
-            if abs(det_) < 1e-9:
-                return pts
-            t = ((p2[0] - p1[0]) * e2[1] - (p2[1] - p1[1]) * e2[0]) / det_
-            out.append(p1 + e1 * t)
-        return [(float(q[0]), float(q[1])) for q in out]
-    except Exception:
-        return pts
 
 class CardDetectorAI:
     """SCRFD 证件关键点检测（算法摘自云星球 V7.3.1，经三方对测验证）。
@@ -118,7 +64,9 @@ class CardDetectorAI:
                 img = cv2.copyMakeBorder(img, 0, 0, padw, self.inpWidth - neww - padw,
                                          cv2.BORDER_CONSTANT, value=0)
             else:
-                newh, neww = int(self.inpHeight * hw_scale) + 1, self.inpWidth
+                # Aligned with the original IDCardMerge letterbox: plain
+                # truncation (cvttsd2si), no +1.
+                newh, neww = int(self.inpHeight * hw_scale), self.inpWidth
                 img = cv2.resize(srcimg, (neww, newh), interpolation=cv2.INTER_AREA)
                 padh = int((self.inpHeight - newh) * 0.5)
                 img = cv2.copyMakeBorder(img, padh, self.inpHeight - newh - padh, 0, 0,
@@ -171,7 +119,8 @@ class CardDetectorAI:
             anchor_centers = (anchor_centers * stride).reshape((-1, 2))
             if self._num_anchors > 1:
                 anchor_centers = np.stack([anchor_centers] * self._num_anchors, axis=1).reshape((-1, 2))
-            pos_inds = np.where(scores >= self.confThreshold)[0]
+            # Original keeps a candidate only when score > 0.5 (strict).
+            pos_inds = np.where(scores > self.confThreshold)[0]
             bboxes = self.distance2bbox(anchor_centers, bbox_preds)
             scores_list.append(scores[pos_inds]); bboxes_list.append(bboxes[pos_inds])
             kpss = self.distance2kps(anchor_centers, kps_preds).reshape((-1, 4, 2))
@@ -195,10 +144,19 @@ class CardDetectorAI:
             if scores[i] > best_score:
                 best_score, best = scores[i], i
         pts = kpss[best]
-        pts_list = [(float(pts[i, 0]), float(pts[i, 1])) for i in range(4)]
-        # 2026-11-10 fix: model keypoints carry card orientation (trained order =
-        # card TL->TR->BR->BL); geometric re-sort flips upside-down shots.
-        # Use raw order; fall back to geometric sort only on self-crossing quads.
+        raw = [(float(pts[i, 0]), float(pts[i, 1])) for i in range(4)]
+        # Corner order, aligned with the original IDCardMerge v2.2: its
+        # Detect returns the 4 keypoints rotated by one, [kp1, kp2, kp3,
+        # kp0]. The model's RAW keypoint order is [BL, TL, TR, BR] --
+        # measured 2026-11-12 on real front/back photos (raw kp0 always
+        # lands on the card's bottom-left corner), so the rotation yields
+        # exactly the canonical [TL, TR, BR, BL] this pipeline consumes.
+        # (An older comment here claimed the raw order was already
+        # TL-first; it is not -- downstream geometric re-sorts were
+        # masking the one-position rotation.)
+        pts_list = [raw[1], raw[2], raw[3], raw[0]]
+        # Degenerate-case guard only: if the rotated quad self-crosses,
+        # fall back to a geometric sort rather than emit a bow-tie.
         _arr = np.array(pts_list, dtype=np.float64)
         def _cr(o, p, q):
             return (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0])
@@ -363,6 +321,156 @@ def _apply_watermark(page_img, text, font_px, opacity_pct, rows, color_rgb=(110,
     overlay = overlay.rotate(30, resample=Image.Resampling.BICUBIC, center=(W // 2, H // 2))
     return Image.alpha_composite(base, overlay).convert('RGB')
 
+# ---------------------------------------------------------------------------
+# refineCorners 复刻（据 IDCardMerge v2.2 refineCorners 反汇编定案重写，
+# 见 idcard-audit/original-detect-spec.md §9，全部 PROVEN；与
+# idcard-qt/refine.py 同源，此处内嵌以便单文件分发）。
+# 原版算法：对每条边取 n+1 个基点，n = clamp(int(L/20), 15, 60)（边长
+# L < 10 不采样、直接用原边线）；每基点沿法线在 [-15,+15] 步长 1.0 横扫，
+# 响应 = R/G/B 三通道各自完整 Sobel 梯度幅值 sqrt(Gx^2+Gy^2) 的最大值，
+# 取首个达峰的偏移，峰值 > 30.0 才把浮点峰位收为边点；边点 >= 10 时跑
+# RANSAC（1000 轮，每条边用新鲜的时间种子随机源）：候选线软评分
+# sum(exp(-d^2/32))（仅 |d| < 4.0 的点计入），冠军仅在严格更优时替换
+# （初始分 -1.0），冠军分 >= 0.15*m 才采纳、否则用原边线。四边成线后
+# 相邻线求交得新角，|det| <= 1e-9 跳过，新角离原角 <= 25.0 才保留。
+# 老机器保险丝：整体墙钟预算 _REFINE_TIME_BUDGET_S（本机尺度 0.6s），
+# 超时即以"已完成的边用拟合线、未完成的边用原边线"收尾，绝不无界运行。
+_REFINE_SCAN_LO, _REFINE_SCAN_HI, _REFINE_SCAN_STEP = -15.0, 15.0, 1.0
+_REFINE_GRAD_MIN = 30.0
+_REFINE_MIN_EDGE_LEN = 10.0
+_REFINE_SAMPLE_DIV = 20.0
+_REFINE_SAMPLE_MIN, _REFINE_SAMPLE_MAX = 15, 60
+_REFINE_RANSAC_ITER = 1000
+_REFINE_RANSAC_MIN_POINTS = 10
+_REFINE_INLIER_DIST = 4.0
+_REFINE_EXP_DENOM = 32.0
+_REFINE_ACCEPT_RATIO = 0.15
+_REFINE_MAX_CORNER_SHIFT = 25.0
+_REFINE_DET_EPS = 1e-9
+_REFINE_TIME_BUDGET_S = 0.6
+
+
+def _refine_line_from_points(p, q):
+    """过两点的归一化直线 (a, b, c)，a*x + b*y + c = 0。"""
+    a = float(p[1] - q[1])
+    b = float(q[0] - p[0])
+    n = np.hypot(a, b)
+    if n == 0:
+        return None
+    a, b = a / n, b / n
+    c = -(a * p[0] + b * p[1])
+    return np.array([a, b, c], dtype=np.float64)
+
+
+def _refine_corners_np(img_rgb, corners, rng=None, stats=None):
+    """img_rgb: HxWx3 uint8（RGB 序）；corners: (4,2) float，原图坐标。
+    返回精修后的 (4,2) float64；任何一步不达标都退回原角（与原版一致）。
+    stats 非 None 时回填 {'budget_hit': bool, 'time_s': float}。"""
+    corners = np.asarray(corners, dtype=np.float64)
+    if corners.shape != (4, 2):
+        return corners.copy()
+    t_start = time.monotonic()
+    deadline = t_start + _REFINE_TIME_BUDGET_S
+    h, w = img_rgb.shape[:2]
+    chans = [img_rgb[:, :, c].astype(np.int32) for c in range(3)]
+    offs = np.arange(_REFINE_SCAN_LO,
+                     _REFINE_SCAN_HI + 0.5 * _REFINE_SCAN_STEP,
+                     _REFINE_SCAN_STEP)
+
+    def sobel_resp(xs, ys):
+        """三通道完整 Sobel 幅值的最大值（原版响应函数）。"""
+        best = None
+        for ch in chans:
+            gx = ((ch[ys - 1, xs + 1] + 2 * ch[ys, xs + 1] + ch[ys + 1, xs + 1])
+                  - (ch[ys - 1, xs - 1] + 2 * ch[ys, xs - 1] + ch[ys + 1, xs - 1]))
+            gy = ((ch[ys + 1, xs - 1] + 2 * ch[ys + 1, xs] + ch[ys + 1, xs + 1])
+                  - (ch[ys - 1, xs - 1] + 2 * ch[ys - 1, xs] + ch[ys - 1, xs + 1]))
+            mag = np.sqrt(gx.astype(np.float64) ** 2
+                          + gy.astype(np.float64) ** 2)
+            best = mag if best is None else np.maximum(best, mag)
+        return best
+
+    lines = []
+    budget_hit = False
+    for i in range(4):
+        a_pt = corners[i]
+        b_pt = corners[(i + 1) % 4]
+        fallback = _refine_line_from_points(a_pt, b_pt)
+        d = b_pt - a_pt
+        length = float(np.hypot(d[0], d[1]))
+        if length < _REFINE_MIN_EDGE_LEN or fallback is None or budget_hit:
+            lines.append(fallback)
+            continue
+        if time.monotonic() > deadline:
+            budget_hit = True
+            lines.append(fallback)
+            continue
+        # 基点数 n+1，n = clamp(int(L/20), 15, 60)（原版 PROVEN）
+        n = int(max(_REFINE_SAMPLE_MIN,
+                    min(_REFINE_SAMPLE_MAX, length / _REFINE_SAMPLE_DIV)))
+        u = d / length
+        nrm = np.array([-u[1], u[0]])       # 法线 (-dy, dx)/L，正负无所谓
+        t = np.arange(n + 1, dtype=np.float64) / n
+        base = a_pt[None, :] + t[:, None] * d[None, :]              # (n+1, 2)
+        pts = base[:, None, :] + offs[None, :, None] * nrm[None, None, :]
+        xs = pts[:, :, 0].astype(np.int64)  # 向零截断（Go int() 语义）
+        ys = pts[:, :, 1].astype(np.int64)
+        valid = (xs >= 1) & (xs <= w - 2) & (ys >= 1) & (ys <= h - 2)
+        resp = np.zeros(xs.shape, dtype=np.float64)
+        if valid.any():
+            resp[valid] = sobel_resp(xs[valid], ys[valid])
+        best_idx = resp.argmax(axis=1)      # 首个达峰（与原版严格大于更新一致）
+        best_val = resp[np.arange(resp.shape[0]), best_idx]
+        keep = best_val > _REFINE_GRAD_MIN
+        edge_pts = pts[keep, best_idx[keep]]
+
+        line = fallback
+        m = len(edge_pts)
+        if m >= _REFINE_RANSAC_MIN_POINTS:
+            # 原版每条边新建时间种子 RNG；调用方给 rng 时用它（测试可复现）
+            edge_rng = rng if rng is not None else np.random.default_rng()
+            best_line, best_score = None, -1.0
+            for it in range(_REFINE_RANSAC_ITER):
+                if it % 16 == 0 and time.monotonic() > deadline:
+                    budget_hit = True
+                    break
+                i1 = int(edge_rng.integers(0, m))
+                i2 = int(edge_rng.integers(0, m))
+                if i1 == i2:
+                    continue
+                cand = _refine_line_from_points(edge_pts[i1], edge_pts[i2])
+                if cand is None:
+                    continue
+                dist = np.abs(edge_pts @ cand[:2] + cand[2])
+                inl = dist < _REFINE_INLIER_DIST
+                score = (float(np.exp(-(dist[inl] ** 2)
+                                      / _REFINE_EXP_DENOM).sum())
+                         if inl.any() else 0.0)
+                if score > best_score:
+                    best_score, best_line = score, cand
+            if best_line is not None and best_score >= _REFINE_ACCEPT_RATIO * m:
+                line = best_line
+        lines.append(line)
+
+    out = corners.copy()
+    for i in range(4):
+        l_prev, l_cur = lines[i - 1], lines[i]
+        if l_prev is None or l_cur is None:
+            continue
+        det = l_prev[0] * l_cur[1] - l_cur[0] * l_prev[1]
+        if abs(det) <= _REFINE_DET_EPS:
+            continue
+        x = (l_prev[1] * l_cur[2] - l_cur[1] * l_prev[2]) / det
+        y = (l_cur[0] * l_prev[2] - l_prev[0] * l_cur[2]) / det
+        new_pt = np.array([x, y])
+        if np.hypot(new_pt[0] - corners[i][0],
+                    new_pt[1] - corners[i][1]) <= _REFINE_MAX_CORNER_SHIFT:
+            out[i] = new_pt
+    if stats is not None:
+        stats['budget_hit'] = budget_hit
+        stats['time_s'] = time.monotonic() - t_start
+    return out
+
 class Core:
     """Plain-state holder + portable processing methods from IDCardProcessor."""
 
@@ -507,13 +615,19 @@ class Core:
         return self.render_pages(layout)
 
     def _pages_to_pdf_bytes(self, pages):
+        # The temp dir holds full-size renders of CUSTOMER ID pages; it
+        # must not be left behind in %TEMP% (audit 3.4). Bytes are fully
+        # materialized by img2pdf.convert before we clean up.
         tmpdir = tempfile.mkdtemp()
-        paths = []
-        for i, p in enumerate(pages):
-            fp = os.path.join(tmpdir, f'page{i + 1}.jpg')
-            p.save(fp, quality=95, dpi=(self.dpi, self.dpi))
-            paths.append(fp)
-        return img2pdf.convert(*paths)
+        try:
+            paths = []
+            for i, p in enumerate(pages):
+                fp = os.path.join(tmpdir, f'page{i + 1}.jpg')
+                p.save(fp, quality=95, dpi=(self.dpi, self.dpi))
+                paths.append(fp)
+            return img2pdf.convert(*paths)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def detect_card_corners(self, image):
         """纯检测：返回按左上→右上→右下→左下排序的角点列表（原图坐标），失败返回 None。
@@ -576,7 +690,8 @@ class Core:
 
     def ai_detect_corners(self, image):
         """AI 检测：懒加载 SCRFD 模型（exe 同目录或打包内 models 文件夹），
-        模型缺失或检测失败返回 None，由传统检测兜底。"""
+        模型缺失或检测失败返回 None（对齐原版：失败即失败，交给手动标角，
+        没有传统检测自动兜底）。"""
         try:
             detector = getattr(self, "_ai_detector", None)
             if detector is None:
@@ -597,125 +712,44 @@ class Core:
                 detector = self._ai_detector
             if not detector:
                 return None
-            img_cv = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+            img_rgb = np.array(image.convert("RGB"))
+            img_cv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
             self._ai_ran = True
             corners = detector.detect(img_cv)
             if not corners:
                 return None
-            arr = np.array(corners, dtype=np.float32)
-            h, w = img_cv.shape[:2]
-            # 2026-11-12 fix: on tight-framed photos (card edge right on the
-            # photo edge -- the common customer case) the model puts a
-            # keypoint a few px OUTSIDE the frame, and the validator then
-            # threw away the whole detection. Clamp points that are only
-            # slightly out (<=2% of the frame) back inside; a quad with a
-            # point far outside is still rejected outright.
-            _tolx, _toly = 0.02 * w, 0.02 * h
-            if (arr[:, 0] < -_tolx).any() or (arr[:, 0] > (w - 1) + _tolx).any() or \
-               (arr[:, 1] < -_toly).any() or (arr[:, 1] > (h - 1) + _toly).any():
-                return None
-            arr[:, 0] = np.clip(arr[:, 0], 0, w - 1)
-            arr[:, 1] = np.clip(arr[:, 1], 0, h - 1)
-            if not self._validate_quadrilateral(arr.copy(), h, w):
-                return None
-            # 2026-11-10: inset edges by 1.0% of card width before warping.
-            # Calibrated on synthetic ground truth: model corners overshoot
-            # ~0.9% of card width; 1.0% drives out-of-card pixels to ~0 while
-            # eating only ~10 output px of the card's blank margin per edge.
-            arr = np.array(_inset_quad([[float(x), float(y)] for x, y in arr], 0.010),
-                           dtype=np.float32)
-            return [[float(x), float(y)] for x, y in arr]
+            # Aligned with the original IDCardMerge v2.2: the decoded
+            # keypoints are used exactly as they come out -- NO
+            # out-of-frame rejection, NO 2% clamping, NO quadrilateral
+            # validator gate, NO 1.0% inset (all four were our own
+            # additions; the original performs none of them). On tight
+            # shots a point may sit a few px outside the frame; the warp
+            # consumes it as-is, exactly like the original.
+            result = [[float(x), float(y)] for x, y in corners]
+            if REFINE_CORNERS:
+                # refineCorners（原版 Detect 的紧接步骤）：只在原图上
+                # 微调已检出的四角，不做任何门槛判断；精修自身出错时
+                # 记录一行日志并原样使用未精修角，绝不让识别因此失败。
+                try:
+                    refined = _refine_corners_np(
+                        img_rgb, np.asarray(result, dtype=np.float64))
+                    refined = np.asarray(refined, dtype=np.float64)
+                    if refined.shape == (4, 2) and np.isfinite(refined).all():
+                        result = [[float(x), float(y)] for x, y in refined]
+                except Exception as _refine_err:
+                    print(f"[core] refine_corners failed, "
+                          f"using raw corners: {_refine_err!r}")
+            return result
         except Exception:
             return None
-
-    def _ai_band_crop(self, image):
-        """找截图里照片所在的横带（上下大片黑边/纯色时）：返回 (裁剪图, y偏移)，不适用返回 (None, 0)"""
-        try:
-            g = np.asarray(image.convert("L"), dtype=np.float32)
-            rs = g.std(axis=1)
-            mask = rs > 10
-            best, cur = (0, 0), None
-            for i, v in enumerate(mask):
-                if v and cur is None:
-                    cur = i
-                if (not v or i == len(mask) - 1) and cur is not None:
-                    end = i if not v else i + 1
-                    if end - cur > best[1] - best[0]:
-                        best = (cur, end)
-                    cur = None
-            h = image.height
-            if not (h * 0.12 < best[1] - best[0] < h * 0.85):
-                return None, 0
-            y0 = max(0, best[0] - 6)
-            y1 = min(h, best[1] + 6)
-            return image.crop((0, y0, image.width, y1)), y0
-        except Exception:
-            return None, 0
 
     def ai_detect_any(self, image):
-        """深度识别：全图没认出时的补救链——横带裁剪→旋转90/270→中心裁剪→分块放大。
-        每步仍走 ai_detect_corners（含四边形合理性校验）；全失败返回 None，交给手动标角。
-        AI 模型缺失时第一步后直接返回，保持传统检测兜底的原有门闩不变。"""
-        corners = self.ai_detect_corners(image)
-        if corners or not getattr(self, "_ai_ran", False):
-            return corners
-        W, H = image.size
-        import time as _time
-        _t0 = _time.time()
-        try:
-            band, y0 = self._ai_band_crop(image)
-            if band is not None:
-                c = self.ai_detect_corners(band)
-                if c:
-                    return [[x, y + y0] for x, y in c]
-        except Exception:
-            pass
-        if _time.time() - _t0 > 20:
-            return None
-        for ang in (90, 270):
-            try:
-                rot = image.rotate(ang, expand=True)
-                c = self.ai_detect_corners(rot)
-                if c:
-                    if ang == 90:
-                        return [[W - 1 - qy, qx] for qx, qy in c]
-                    return [[qy, H - 1 - qx] for qx, qy in c]
-            except Exception:
-                pass
-        if _time.time() - _t0 > 20:
-            return None
-        try:
-            cw, ch = int(W * 0.79), int(H * 0.79)
-            x0, y0 = (W - cw) // 2, (H - ch) // 2
-            c = self.ai_detect_corners(image.crop((x0, y0, x0 + cw, y0 + ch)))
-            if c:
-                return [[x + x0, y + y0] for x, y in c]
-        except Exception:
-            pass
-        if _time.time() - _t0 > 20:
-            return None
-        try:
-            tw, th = int(W * 0.62), int(H * 0.62)
-            fallback = None
-            for (tx, ty) in [(0, 0), (W - tw, 0), (0, H - th), (W - tw, H - th), ((W - tw) // 2, (H - th) // 2)]:
-                if _time.time() - _t0 > 25:
-                    break
-                c = self.ai_detect_corners(image.crop((tx, ty, tx + tw, ty + th)))
-                if not c:
-                    continue
-                pts = [[x + tx, y + ty] for x, y in c]
-                if not _quad_plausible_for_frame(pts, W, H):
-                    continue
-                touches = any(x < tw * 0.015 or x > tw * 0.985 or y < th * 0.015 or y > th * 0.985 for x, y in c)
-                if not touches:
-                    return pts
-                if fallback is None:
-                    fallback = pts
-            if fallback:
-                return fallback
-        except Exception:
-            pass
-        return None
+        """识别入口（对齐原版 IDCardMerge v2.2）：只做一次全图 AI 识别。
+        原版没有任何第二机会——没有横带裁剪、没有旋转重试、没有中心
+        裁剪、没有分块放大、没有传统轮廓兜底；我们自创的那套补救链已
+        整体拆除（分块阶段曾把卡内横带误报成整卡，即"半张卡"事故）。
+        认不出就如实返回 None，交给手动标角。"""
+        return self.ai_detect_corners(image)
 
     def _validate_quadrilateral(self, corners, img_height, img_width):
         """验证四边形是否合理"""
@@ -874,7 +908,8 @@ class Core:
         return self.add_rounded_corners(processed)
 
     def auto_process(self, image):
-        """Detect corners (AI first, traditional fallback) and process."""
+        """Detect corners (AI only -- aligned with the original: no
+        classical fallback stage) and process; None when not detected."""
         corners = self.ai_detect_any(image)
         if not corners:
             return None
