@@ -1368,6 +1368,7 @@ class IDCardProcessor:
         for side in ('front', 'back'):
             setattr(self, side + '_image', pair[side]['image'])
             setattr(self, side + '_points', list(pair[side]['points']))
+            setattr(self, side + '_points_detected', False)
             setattr(self, side + '_processed', pair[side]['processed'])
         self.current_open = idx
         try:
@@ -1425,6 +1426,7 @@ class IDCardProcessor:
             for side in ('front', 'back'):
                 setattr(self, side + '_image', None)
                 setattr(self, side + '_points', [])
+                setattr(self, side + '_points_detected', False)
                 setattr(self, side + '_processed', None)
             try:
                 self.draw_a4_layout()
@@ -1449,6 +1451,7 @@ class IDCardProcessor:
         if getattr(self, 'current_open', None) == idx:
             setattr(self, side + '_image', None)
             setattr(self, side + '_points', [])
+            setattr(self, side + '_points_detected', False)
             setattr(self, side + '_processed', None)
             try:
                 self.draw_a4_layout()
@@ -1543,6 +1546,7 @@ class IDCardProcessor:
         on_done(True)；没认出来 on_done(False)，交给标角窗口。"""
         setattr(self, side + '_image', image)
         setattr(self, side + '_points', [])
+        setattr(self, side + '_points_detected', False)
         try:
             self.update_status('正在识别，请稍候…')
         except Exception:
@@ -1560,6 +1564,7 @@ class IDCardProcessor:
             try:
                 if corners:
                     setattr(self, side + '_points', corners)
+                    setattr(self, side + '_points_detected', True)
                     self.finish_marking(side)
                     ok = getattr(self, side + '_processed', None) is not None
             except Exception:
@@ -1951,6 +1956,7 @@ class IDCardProcessor:
             self.pairs[idx][side]['path'] = path
             setattr(self, side + '_image', image)
             setattr(self, side + '_points', [])
+            setattr(self, side + '_points_detected', False)
 
             def _done(corners):
                 # Audit 2.1/3.1: the chain advances NO MATTER WHAT --
@@ -1962,6 +1968,7 @@ class IDCardProcessor:
                 try:
                     if corners:
                         setattr(self, side + '_points', corners)
+                        setattr(self, side + '_points_detected', True)
                         self.finish_marking(side)
                         ok = getattr(self, side + '_processed', None) is not None
                 except Exception:
@@ -2050,6 +2057,7 @@ class IDCardProcessor:
         for side in ('front', 'back'):
             setattr(self, side + '_image', None)
             setattr(self, side + '_points', [])
+            setattr(self, side + '_points_detected', False)
             setattr(self, side + '_processed', None)
         self._append_pair()
         try:
@@ -3207,6 +3215,7 @@ class IDCardProcessor:
         """Auto-detect failed: pre-place a draggable quad (12% image inset)
         so the user drags four green handles onto the card corners instead
         of clicking four points from scratch."""
+        setattr(self, side + '_points_detected', False)
         try:
             if side == "front":
                 image = self.front_image
@@ -3267,6 +3276,7 @@ class IDCardProcessor:
                         self.back_points = corners
                     else:
                         self.card_points = corners
+                    setattr(self, side + '_points_detected', True)
                     self.finish_marking(side)
                 except Exception:
                     pass
@@ -4092,6 +4102,7 @@ class IDCardProcessor:
         # 确保坐标在图像范围内
         img_width, img_height = self.original_image.size
         if 0 <= img_x < img_width and 0 <= img_y < img_height:
+            setattr(self, side + '_points_detected', False)
             points.append((int(img_x), int(img_y)))
             if len(points) == 4:
                 points[:] = _order_quad_points(points)
@@ -4201,8 +4212,16 @@ class IDCardProcessor:
             messagebox.showwarning("警告", "请先标记4个点")
             return
 
-        # 自由标角：点击顺序不限，统一排成 左上→右上→右下→左下
-        points[:] = _order_quad_points(points)
+        # 角点顺序：识别（AI）给的点已按证件本身排好（左上→右上→右下
+        # →左下，跟着证件走、不跟照片方向走），必须原样送拉正——竖拍
+        # 照片若再按图像坐标重排，拉正出来就是侧躺的（2026-11-12 青
+        # 现场实测＋复现坐实；原版 IDCardMerge 也是 Detect 的点直送
+        # 拉正、从不重排）。只有手工标角的点（点击顺序任意）才走
+        # 下面的几何排序。_points_detected 由识别回调置 True、由手工
+        # 点点/清槽/载入存档等路径置 False（getattr 默认 False）。
+        if not getattr(self, side + '_points_detected', False):
+            # 自由标角：点击顺序不限，统一排成 左上→右上→右下→左下
+            points[:] = _order_quad_points(points)
 
         # 角点合法性把关：四点重合或围出的面积太小，拉正必然失败，先给人话提示
         try:

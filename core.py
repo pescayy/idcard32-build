@@ -887,12 +887,28 @@ class Core:
         return rounded_image
 
 
-    def process_card(self, image, points):
+    def process_card(self, image, points, points_ordered=False):
         """UI-free equivalent of finish_marking's pipeline:
-        order -> area guard -> warp -> enhance -> rounded corners."""
+        order -> area guard -> warp -> enhance -> rounded corners.
+
+        points_ordered=True: the points already stand in warp order
+        [card TL, TR, BR, BL] -- AI detection output. The model's
+        keypoints are anchored to the card itself, not to the photo
+        (verified 2026-11-12: detect() on a photo rotated 90 deg CW/CCW
+        returns the rotated original corners elementwise, max diff
+        ~5 px, vs >1200 px for any cyclic shift), so they must NOT be
+        re-sorted geometrically: on a portrait photo the geometric sort
+        maps the image's top edge onto the output's top edge and the
+        card comes out sideways. The original IDCardMerge never
+        re-sorts Detect output either -- the points go straight into
+        the warp. Free-clicked manual points (arbitrary order) keep
+        the geometric sort (the default)."""
         if image is None or not points or len(points) != 4:
             return None
-        points = _order_quad_points([tuple(p) for p in points])
+        if points_ordered:
+            points = [tuple(p) for p in points]
+        else:
+            points = _order_quad_points([tuple(p) for p in points])
         pts = [(float(p[0]), float(p[1])) for p in points]
         area = 0.0
         for i in range(4):
@@ -913,4 +929,4 @@ class Core:
         corners = self.ai_detect_any(image)
         if not corners:
             return None
-        return self.process_card(image, corners)
+        return self.process_card(image, corners, points_ordered=True)
