@@ -2436,7 +2436,12 @@ class IDCardProcessor:
         state = {'idx': 0, 'photos': [], 'drag': None, 'scale': 1.0}
         win = ToplevelWithIcon(self.root)
         win.title('可交互排版预览（支持拖放）')
-        win.geometry('900x960')
+        # Clamp to the screen and center it (Qing's small Acer is
+        # 768-class tall: a fixed 900x960 window opens taller than
+        # the screen and the bottom bar becomes unreachable).
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        ww, wh = min(900, sw - 40), min(960, sh - 80)
+        win.geometry(f'{ww}x{wh}+{max(0, (sw - ww) // 2)}+{max(0, (sh - wh) // 2)}')
 
         # 顶部工具条（对齐 IDCardMerge 交互预览：按钮在上、颜色分工，个个是真功能）
         toolbar = tk.Frame(win, bg='white')
