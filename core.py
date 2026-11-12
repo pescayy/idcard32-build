@@ -45,7 +45,16 @@ class CardDetectorAI:
         self._cv_net = None
         try:
             import onnxruntime as _ort
-            self._sess = _ort.InferenceSession(onnxmodel, providers=['CPUExecutionProvider'])
+            # Reserve one core for the UI: with ORT's default
+            # all-cores setting, detection saturated Qing's 4-core
+            # i5-7400 and even the mouse cursor stuttered during the
+            # recognition wait (2026-11-12). Detection behavior is
+            # unchanged; only the thread budget is capped.
+            _opts = _ort.SessionOptions()
+            _opts.intra_op_num_threads = max(1, (os.cpu_count() or 2) - 1)
+            _opts.inter_op_num_threads = 1
+            self._sess = _ort.InferenceSession(onnxmodel, sess_options=_opts,
+                                              providers=['CPUExecutionProvider'])
             self._iname = self._sess.get_inputs()[0].name
         except Exception:
             self._sess = None

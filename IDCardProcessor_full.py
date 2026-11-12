@@ -161,7 +161,16 @@ class CardDetectorAI:
         self._cv_net = None
         try:
             import onnxruntime as _ort
-            self._sess = _ort.InferenceSession(onnxmodel, providers=['CPUExecutionProvider'])
+            # Reserve one core for the UI: with ORT's default
+            # all-cores setting, detection saturated Qing's 4-core
+            # i5-7400 and even the mouse cursor stuttered during the
+            # recognition wait (2026-11-12). Detection behavior is
+            # unchanged; only the thread budget is capped.
+            _opts = _ort.SessionOptions()
+            _opts.intra_op_num_threads = max(1, (os.cpu_count() or 2) - 1)
+            _opts.inter_op_num_threads = 1
+            self._sess = _ort.InferenceSession(onnxmodel, sess_options=_opts,
+                                              providers=['CPUExecutionProvider'])
             self._iname = self._sess.get_inputs()[0].name
         except Exception:
             self._sess = None
@@ -2487,7 +2496,21 @@ class IDCardProcessor:
 
         def metrics():
             sc = state['scale']
-            return (int(pw * sc), int(ph * sc), max(10, int(cw * sc)), max(10, int(ch * sc)), 24, 24)
+            dw, dh = int(pw * sc), int(ph * sc)
+            # Center the page in the viewport (the original centers its
+            # page; the old fixed 24px anchor left a gray void whenever
+            # the window was larger than the scaled page -- Qing flagged
+            # it live 2026-11-12). Falls back to 24 whenever the page
+            # fills or exceeds the viewport, and before the canvas has
+            # a real size. on_motion/on_release read the same metrics(),
+            # so drag clamping/release math stay consistent.
+            try:
+                vw, vh = canvas.winfo_width(), canvas.winfo_height()
+            except Exception:
+                vw, vh = 0, 0
+            ox = max(24, (vw - dw) // 2)
+            oy = max(24, (vh - dh) // 2)
+            return (dw, dh, max(10, int(cw * sc)), max(10, int(ch * sc)), ox, oy)
 
         def fit_scale():
             try:
@@ -2507,7 +2530,11 @@ class IDCardProcessor:
             sc = state['scale']
             canvas.delete('all')
             state['photos'] = []
-            canvas.configure(scrollregion=(0, 0, ox + dw + 24, oy + dh + 24))
+            try:
+                vw, vh = canvas.winfo_width(), canvas.winfo_height()
+            except Exception:
+                vw, vh = 0, 0
+            canvas.configure(scrollregion=(0, 0, max(vw, ox + dw + 24), max(vh, oy + dh + 24)))
             canvas.create_rectangle(ox, oy, ox + dw, oy + dh, fill='white', outline='black')
             for i, (img, x, y) in enumerate(layout[state['idx']]):
                 dx, dy = ox + int(x * sc), oy + int(y * sc)
@@ -2567,6 +2594,19 @@ class IDCardProcessor:
         canvas.bind('<ButtonRelease-1>', on_release)
         canvas.bind('<MouseWheel>', lambda e: canvas.yview_scroll(int(-e.delta / 120), 'units'))
         canvas.bind('<Shift-MouseWheel>', lambda e: canvas.xview_scroll(int(-e.delta / 120), 'units'))
+        # Re-center on resize/maximize. render() never resizes the
+        # canvas itself (setting scrollregion is not a size change),
+        # so this cannot loop; the guard covers layout storms anyway.
+        _cfg_guard = {'busy': False}
+        def _on_canvas_configure(event):
+            if _cfg_guard['busy']:
+                return
+            _cfg_guard['busy'] = True
+            try:
+                render()
+            finally:
+                _cfg_guard['busy'] = False
+        canvas.bind('<Configure>', _on_canvas_configure)
         bar = tk.Frame(win, bg='#F0F0F0')
         bar.pack(side=tk.BOTTOM, fill=tk.X)
         info = tk.Label(bar, text='', bg='#F0F0F0', fg='#555555', font=('Arial', 9))
@@ -2731,12 +2771,244 @@ class IDCardProcessor:
         elif saved:
             messagebox.showinfo('完成', f'已保存 {saved} 个单页 PDF 到所选文件夹')
 
+    def _print_images_windows(self, page_images, job_name):
+        """Windows printing with an explicit printer choice.
+
+        The old code used os.startfile(path, 'print'), which silently
+        targets the system DEFAULT printer -- in Qing's shop the
+        default is the tracing-paper printer used for seal plates, so
+        ID copies came out on the wrong machine and there was no way
+        to choose (2026-11-12). This flow always asks first; the
+        system default is never used as a silent target and is never
+        changed. Route A: the standard Windows print dialog
+        (pywin32/MFC PrintDlg -- printer list, copies, properties)
+        plus GDI printing of the composed 300dpi page images.
+        Route B (only if A fails before anything is spooled): a small
+        Tk picker fed by winspool EnumPrintersW via ctypes, same GDI
+        path. Cancelling prints nothing; any failure shows an error
+        dialog. There is deliberately NO fallback to the default
+        printer.
+        """
+        try:
+            import win32ui  # noqa: F401  (pywin32, bundled by the build)
+        except Exception:
+            messagebox.showerror(
+                '打印不可用',
+                '打印组件（pywin32）没有随程序打包，无法选择打印机。\n本次没有打印任何内容。')
+            return False
+        try:
+            return self._print_via_printdlg(page_images, job_name)
+        except Exception:
+            pass  # nothing was spooled yet; fall through to the picker
+        try:
+            return self._print_via_picker(page_images, job_name)
+        except Exception as e:
+            messagebox.showerror(
+                '打印失败',
+                f'没能把打印任务发出去：{e}\n本次没有打印到任何打印机。')
+            return False
+
+    def _spool_images_gdi(self, dc, page_images, job_name, copies):
+        """GDI-print PIL page images (300dpi A4) through a win32ui DC.
+
+        GetDeviceCaps indices 110-113 are the fixed Win32 ABI values
+        PHYSICALWIDTH / PHYSICALHEIGHT / PHYSICALOFFSETX /
+        PHYSICALOFFSETY; the image is stretched onto the physical
+        page (the composed pages already carry their own margins).
+        """
+        from PIL import ImageWin
+        hdc = dc.GetHandleOutput()
+        phys_w = dc.GetDeviceCaps(110)
+        phys_h = dc.GetDeviceCaps(111)
+        off_x = dc.GetDeviceCaps(112)
+        off_y = dc.GetDeviceCaps(113)
+        try:
+            for _ in range(max(1, int(copies))):
+                dc.StartDoc(job_name)
+                try:
+                    for img in page_images:
+                        dc.StartPage()
+                        dib = ImageWin.Dib(img.convert('RGB'))
+                        dib.draw(hdc, (-off_x, -off_y,
+                                       -off_x + phys_w, -off_y + phys_h))
+                        dc.EndPage()
+                finally:
+                    dc.EndDoc()
+        finally:
+            dc.DeleteDC()
+
+    def _print_via_printdlg(self, page_images, job_name):
+        """Route A: the standard Windows printer dialog (PrintDlg)."""
+        import win32con
+        import win32ui
+        pd = win32ui.CreatePrintDialog(
+            win32con.PD_RETURNDC | win32con.PD_NOSELECTION |
+            win32con.PD_NOPAGENUMS)
+        if pd.DoModal() != win32con.IDOK:
+            self.update_status('已取消打印')
+            return False
+        # Still pre-spool: any failure above the StartDoc line may
+        # raise out to the picker fallback; once spooling starts, a
+        # failure is reported here instead of re-asking (which could
+        # double-print).
+        try:
+            dc = pd.GetPrinterDC()
+        except Exception:
+            dc = pd.GetDC()
+        try:
+            copies = int(pd.GetCopies())
+        except Exception:
+            copies = 1
+        copies = min(max(copies, 1), 20)
+        try:
+            self._spool_images_gdi(dc, page_images, job_name, copies)
+        except Exception as e:
+            try:
+                dc.DeleteDC()
+            except Exception:
+                pass
+            messagebox.showerror('打印失败',
+                                 f'打印过程中出错：{e}\n请检查所选打印机后重试。')
+            return False
+        messagebox.showinfo('打印', '打印任务已发送到打印机')
+        return True
+
+    def _enum_printers_ctypes(self):
+        """Installed printer names via winspool EnumPrintersW (stdlib
+        ctypes only, so enumeration works even without pywin32)."""
+        import ctypes
+        from ctypes import wintypes
+
+        class PRINTER_INFO_2(ctypes.Structure):
+            _fields_ = [('pServerName', ctypes.c_void_p),
+                        ('pPrinterName', ctypes.c_void_p),
+                        ('pShareName', ctypes.c_void_p),
+                        ('pPortName', ctypes.c_void_p),
+                        ('pDriverName', ctypes.c_void_p),
+                        ('pComment', ctypes.c_void_p),
+                        ('pLocation', ctypes.c_void_p),
+                        ('pDevMode', ctypes.c_void_p),
+                        ('pSepFile', ctypes.c_void_p),
+                        ('pPrintProcessor', ctypes.c_void_p),
+                        ('pDatatype', ctypes.c_void_p),
+                        ('pParameters', ctypes.c_void_p),
+                        ('pSecurityDescriptor', ctypes.c_void_p),
+                        ('Attributes', wintypes.DWORD),
+                        ('Priority', wintypes.DWORD),
+                        ('DefaultPriority', wintypes.DWORD),
+                        ('StartTime', wintypes.DWORD),
+                        ('UntilTime', wintypes.DWORD),
+                        ('Status', wintypes.DWORD),
+                        ('cJobs', wintypes.DWORD),
+                        ('AveragePPM', wintypes.DWORD)]
+
+        winspool = ctypes.WinDLL('winspool.drv')
+        flags = 0x2 | 0x4  # PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS
+        needed = wintypes.DWORD(0)
+        returned = wintypes.DWORD(0)
+        winspool.EnumPrintersW(flags, None, 2, None, 0,
+                               ctypes.byref(needed), ctypes.byref(returned))
+        if needed.value == 0:
+            return []
+        buf = ctypes.create_string_buffer(needed.value)
+        if not winspool.EnumPrintersW(flags, None, 2, buf, needed.value,
+                                       ctypes.byref(needed),
+                                       ctypes.byref(returned)):
+            return []
+        names = []
+        base = ctypes.addressof(buf)
+        stride = ctypes.sizeof(PRINTER_INFO_2)
+        for i in range(returned.value):
+            info = PRINTER_INFO_2.from_address(base + i * stride)
+            if info.pPrinterName:
+                names.append(ctypes.wstring_at(info.pPrinterName))
+        return names
+
+    def _default_printer_ctypes(self):
+        """Current default printer name (only used to PRESELECT the
+        picker's row; the user still confirms before anything is
+        sent, and the default is never changed)."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            winspool = ctypes.WinDLL('winspool.drv')
+            size = wintypes.DWORD(0)
+            winspool.GetDefaultPrinterW(None, ctypes.byref(size))
+            if size.value == 0:
+                return None
+            buf = ctypes.create_unicode_buffer(size.value)
+            if winspool.GetDefaultPrinterW(buf, ctypes.byref(size)):
+                return buf.value
+        except Exception:
+            pass
+        return None
+
+    def _print_via_picker(self, page_images, job_name):
+        """Route B: own printer picker + GDI printing via win32ui."""
+        import win32ui
+        names = self._enum_printers_ctypes()
+        if not names:
+            raise RuntimeError('没有枚举到任何已安装的打印机')
+        result = {'printer': None, 'copies': 1}
+        dlg = ToplevelWithIcon(self.root)
+        dlg.title('选择打印机')
+        dlg.geometry('420x360')
+        dlg.transient(self.root)
+        dlg.grab_set()
+        tk.Label(dlg, text='请选择打印机（不会使用默认打印机直接打印）：',
+                 font=('Arial', 10)).pack(anchor='w', padx=14, pady=(12, 6))
+        lb = tk.Listbox(dlg, font=('Arial', 10), exportselection=False)
+        lb.pack(fill=tk.BOTH, expand=True, padx=14)
+        for n in names:
+            lb.insert(tk.END, n)
+        default_name = self._default_printer_ctypes()
+        sel = names.index(default_name) if default_name in names else 0
+        lb.selection_set(sel)
+        lb.see(sel)
+        row = tk.Frame(dlg)
+        row.pack(fill=tk.X, padx=14, pady=8)
+        tk.Label(row, text='份数：', font=('Arial', 10)).pack(side=tk.LEFT)
+        copies_var = tk.IntVar(value=1)
+        tk.Spinbox(row, from_=1, to=9, width=4, textvariable=copies_var,
+                   font=('Arial', 10)).pack(side=tk.LEFT)
+
+        def _ok():
+            cur = lb.curselection()
+            if cur:
+                result['printer'] = names[cur[0]]
+                try:
+                    result['copies'] = min(max(int(copies_var.get()), 1), 9)
+                except Exception:
+                    result['copies'] = 1
+            dlg.destroy()
+
+        brow = tk.Frame(dlg)
+        brow.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=12)
+        tk.Button(brow, text='打印', bg='#2E7CF6', fg='white',
+                  activebackground='#2E7CF6', activeforeground='white',
+                  relief=tk.FLAT, padx=16, pady=4,
+                  command=_ok).pack(side=tk.RIGHT)
+        tk.Button(brow, text='取消', relief=tk.FLAT, padx=16, pady=4,
+                  command=dlg.destroy).pack(side=tk.RIGHT, padx=8)
+        dlg.wait_window()
+        if not result['printer']:
+            self.update_status('已取消打印')
+            return False
+        dc = win32ui.CreateDC('WINSPOOL', result['printer'], None)
+        self._spool_images_gdi(dc, page_images, job_name, result['copies'])
+        messagebox.showinfo('打印', '打印任务已发送到打印机')
+        return True
+
     def _print_pages(self):
         if getattr(self, 'layout_pages', None):
             self.render_pages()
         pages = getattr(self, 'batch_pages', None) or self.compose_a4_pages()
         if not pages:
             messagebox.showwarning('提示', '还没有可打印的拼版，请先处理证件')
+            return
+        if platform.system() == 'Windows':
+            # Ask-first printer flow (never the silent default).
+            self._print_images_windows(pages, '证件拼版')
             return
         try:
             with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
@@ -2746,10 +3018,7 @@ class IDCardProcessor:
             messagebox.showerror('打印失败', f'生成打印文件失败：{e}')
             return
         try:
-            if platform.system() == 'Windows':
-                os.startfile(temp_file, 'print')
-            else:
-                subprocess.run(['lp', temp_file], check=True)
+            subprocess.run(['lp', temp_file], check=True)
         except Exception as e:
             messagebox.showerror('打印失败',
                                  f'没能把打印任务发出去：{e}\n（拼版文件已存到 {temp_file}，可手动打开打印）')
@@ -4428,6 +4697,21 @@ class IDCardProcessor:
     
     def reopen_for_adjustment(self, side):
         """重新打开标记窗口进行调整"""
+        # *_image_path is only ever assigned inside
+        # show_image_for_marking; after a pure auto-process (no
+        # marking window opened for this side yet) the attribute does
+        # not exist, and reading it raised AttributeError -- which Tk
+        # swallows in the frozen exe, so clicking a processed
+        # thumbnail looked completely dead (Qing, 2026-11-12).
+        # Fall back to the open pair slot's stored path.
+        def _path(side_):
+            p = getattr(self, side_ + '_image_path', None)
+            if p:
+                return p
+            idx = getattr(self, 'current_open', None)
+            if idx is not None and 0 <= idx < len(self.pairs):
+                return self.pairs[idx][side_].get('path')
+            return None
         # 根据side获取原始图片和点
         if side == "front":
             if not hasattr(self, 'front_image') or self.front_image is None:
@@ -4435,7 +4719,7 @@ class IDCardProcessor:
                 return
             image = self.front_image
             points = self.front_points
-            file_path = self.front_image_path
+            file_path = _path("front")
             side_name = "身份证人像面"
         elif side == "back":
             if not hasattr(self, 'back_image') or self.back_image is None:
@@ -4443,7 +4727,7 @@ class IDCardProcessor:
                 return
             image = self.back_image
             points = self.back_points
-            file_path = self.back_image_path
+            file_path = _path("back")
             side_name = "身份证国徽面"
         else:  # card
             if not hasattr(self, 'card_image') or self.card_image is None:
@@ -4451,7 +4735,7 @@ class IDCardProcessor:
                 return
             image = self.card_image
             points = self.card_points
-            file_path = self.card_image_path
+            file_path = _path("card")
             side_name = "银行卡"
         
         # 重新显示标记窗口，并传入已有的点
@@ -5175,21 +5459,23 @@ class IDCardProcessor:
         if not hasattr(self, 'a4_layout_image'):
             messagebox.showwarning("警告", "请先生成A4排版")
             return
-        
+
+        system = platform.system()
+        if system == 'Windows':
+            # Ask-first printer flow (never the silent default).
+            if self._print_images_windows([self.a4_layout_image], 'A4排版'):
+                self.update_status("打印任务已发送")
+            return
+
         try:
             # 创建临时文件
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                 temp_file = tmp.name
                 # 保存为PNG格式
                 self.a4_layout_image.save(temp_file, dpi=(self.dpi, self.dpi))
-            
+
             # 根据操作系统调用打印命令
-            system = platform.system()
-            if system == 'Windows':
-                # Windows系统
-                os.startfile(temp_file, "print")
-                messagebox.showinfo("打印", "打印任务已发送到打印机")
-            elif system == 'Darwin':
+            if system == 'Darwin':
                 # macOS系统
                 subprocess.run(["lpr", temp_file])
                 messagebox.showinfo("打印", "打印任务已发送到打印机")
