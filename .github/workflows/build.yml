@@ -84,7 +84,7 @@ jobs:
           pip install -r requirements.txt
           pip install onnxruntime==1.14.1 rapidocr-onnxruntime==1.4.4 openpyxl==3.1.5
       - name: Build exe with PyInstaller
-        run: pyinstaller --noconfirm --onefile --windowed --name IDCardProcessor32QN --collect-all tkinterdnd2 --collect-all onnxruntime --add-data "models/carddetection_scrfd34gkps.onnx;models" IDCardProcessor_full.py
+                run: pyinstaller --noconfirm --onefile --windowed --name IDCardProcessor32QN --collect-all tkinterdnd2 --collect-all onnxruntime --collect-all rapidocr_onnxruntime --add-data "models/carddetection_scrfd34gkps.onnx;models" IDCardProcessor_full.py
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
