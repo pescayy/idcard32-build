@@ -2429,14 +2429,19 @@ class IDCardProcessor:
         s = self.mm_to_pixel
         pw, ph = int(self.a4_width * s), int(self.a4_height * s)
         cw, ch = int(self.id_width * s), int(self.id_height * s)
-        # 2026-11-12: open at ORIGINAL size (scale 1.0) on a scrollable
-        # canvas. The old fit-whole-page view shrank the sheet to ~23%,
-        # where a millimetre is under 3 px and drag distances cannot be
-        # judged. A fit-to-window toggle stays for the overview.
+        # Open fit-to-page by default (Qing's live feedback 2026-11-12:
+        # original size opened far too big). '原始大小' (1.0) stays on the
+        # toolbar; state['scale'] is set from fit_scale() before the
+        # first render() below.
         state = {'idx': 0, 'photos': [], 'drag': None, 'scale': 1.0}
         win = ToplevelWithIcon(self.root)
         win.title('可交互排版预览（支持拖放）')
-        win.geometry('900x960')
+        # Clamp to the screen and center it (Qing's small Acer is
+        # 768-class tall: a fixed 900x960 window opens taller than
+        # the screen and the bottom bar becomes unreachable).
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        ww, wh = min(900, sw - 40), min(960, sh - 80)
+        win.geometry(f'{ww}x{wh}+{max(0, (sw - ww) // 2)}+{max(0, (sh - wh) // 2)}')
 
         # 顶部工具条（对齐 IDCardMerge 交互预览：按钮在上、颜色分工，个个是真功能）
         toolbar = tk.Frame(win, bg='white')
@@ -2560,6 +2565,7 @@ class IDCardProcessor:
         info.pack(side=tk.LEFT, padx=8, pady=4)
         ttk.Button(bar, text='下一页', command=lambda: (state.update(idx=(state['idx'] + 1) % len(layout)), render())).pack(side=tk.RIGHT, padx=4, pady=3)
         ttk.Button(bar, text='上一页', command=lambda: (state.update(idx=(state['idx'] - 1) % len(layout)), render())).pack(side=tk.RIGHT, padx=4, pady=3)
+        state['scale'] = fit_scale()
         render()
 
     def _export_crops(self):
