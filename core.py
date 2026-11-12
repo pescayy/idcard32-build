@@ -19,6 +19,28 @@ def _order_quad_points(pts):
     bl = min(pts, key=lambda p: p[0] - p[1])
     return [tl, tr, br, bl]
 
+def _quad_plausible_for_frame(pts, frame_w, frame_h):
+    """2026-11-12: gate for rescue-chain tile results. A 'card' found inside
+    a tile that covers only a small part of the whole frame is almost
+    always a false positive inside the real card (a text block / portrait
+    region), not the card itself. Require it to span a plausible share of
+    the frame before it may be returned as the card quad."""
+    try:
+        xs = [float(p[0]) for p in pts]
+        ys = [float(p[1]) for p in pts]
+        area = 0.0
+        for i in range(4):
+            x1, y1 = float(pts[i][0]), float(pts[i][1])
+            x2, y2 = float(pts[(i + 1) % 4][0]), float(pts[(i + 1) % 4][1])
+            area += x1 * y2 - x2 * y1
+        area = abs(area) / 2.0
+        return (area >= 0.35 * frame_w * frame_h
+                and (max(xs) - min(xs)) >= 0.45 * frame_w
+                and (max(ys) - min(ys)) >= 0.45 * frame_h)
+    except Exception:
+        return False
+
+
 def _order_points_np(pts):
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
@@ -582,6 +604,18 @@ class Core:
                 return None
             arr = np.array(corners, dtype=np.float32)
             h, w = img_cv.shape[:2]
+            # 2026-11-12 fix: on tight-framed photos (card edge right on the
+            # photo edge -- the common customer case) the model puts a
+            # keypoint a few px OUTSIDE the frame, and the validator then
+            # threw away the whole detection. Clamp points that are only
+            # slightly out (<=2% of the frame) back inside; a quad with a
+            # point far outside is still rejected outright.
+            _tolx, _toly = 0.02 * w, 0.02 * h
+            if (arr[:, 0] < -_tolx).any() or (arr[:, 0] > (w - 1) + _tolx).any() or \
+               (arr[:, 1] < -_toly).any() or (arr[:, 1] > (h - 1) + _toly).any():
+                return None
+            arr[:, 0] = np.clip(arr[:, 0], 0, w - 1)
+            arr[:, 1] = np.clip(arr[:, 1], 0, h - 1)
             if not self._validate_quadrilateral(arr.copy(), h, w):
                 return None
             # 2026-11-10: inset edges by 1.0% of card width before warping.
@@ -670,6 +704,8 @@ class Core:
                 if not c:
                     continue
                 pts = [[x + tx, y + ty] for x, y in c]
+                if not _quad_plausible_for_frame(pts, W, H):
+                    continue
                 touches = any(x < tw * 0.015 or x > tw * 0.985 or y < th * 0.015 or y > th * 0.985 for x, y in c)
                 if not touches:
                     return pts
