@@ -1152,28 +1152,92 @@ class IDCardProcessor:
             self.refresh_pairs_panel()
             self.update_status('已互换正反面')
 
-    def _auto_process_slot(self, idx, side, image):
-        """放入即自动识别（对齐 IDCardMerge 交互）：识别成功直接处理完返回 True；
-        没认出来返回 False，交给标角窗口手动处理。与批量导入同一条识别线。"""
+    # ---- 2026-11-12: detection runs on ONE background thread and the
+    # result comes back through root.after. The old flow ran
+    # ai_detect_any on the UI thread; its rescue chain can take
+    # 20-60s on a slow PC, freezing the whole window -- Qing's
+    # "software is laggy, buttons don't respond".
+    def _detect_async(self, image, done):
+        """Queue a background detection; done(corners) runs on the UI thread.
+        The worker thread never touches Tk: it puts the result into a
+        thread-safe queue that the UI thread polls. (Calling root.after
+        from the worker thread can block forever -- verified the hard
+        way on 2026-11-12: the batch sat at job 1/4 with the UI alive
+        and the worker parked.)"""
+        import queue
+        if not hasattr(self, '_detect_jobs'):
+            self._detect_jobs = []
+            self._detect_busy = False
+            self._detect_results = queue.Queue()
+            self._poll_detect_results()
+        self._detect_jobs.append((image, done))
+        self._pump_detect_jobs()
+
+    def _poll_detect_results(self):
+        try:
+            while True:
+                _done, _corners = self._detect_results.get_nowait()
+                self._detect_done(_done, _corners)
+        except Exception:
+            pass
+        try:
+            self.root.after(120, self._poll_detect_results)
+        except Exception:
+            pass
+
+    def _pump_detect_jobs(self):
+        if getattr(self, '_detect_busy', False):
+            return
+        jobs = getattr(self, '_detect_jobs', None)
+        if not jobs:
+            return
+        image, done = jobs.pop(0)
+        self._detect_busy = True
+
+        def work():
+            corners = None
+            try:
+                corners = self.ai_detect_any(image)
+                if not corners and not getattr(self, '_ai_ran', False):
+                    corners = self.detect_card_corners(image)
+            except Exception:
+                corners = None
+            try:
+                self._detect_results.put((done, corners))
+            except Exception:
+                pass
+
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
+    def _detect_done(self, done, corners):
+        self._detect_busy = False
+        try:
+            done(corners)
+        except Exception:
+            pass
+        self._pump_detect_jobs()
+
+    def _auto_process_slot(self, idx, side, image, on_done):
+        """放入即自动识别（对齐 IDCardMerge 交互）：识别在后台线程跑、
+        界面不冻结；识别成功直接处理完，完成后在主线程调
+        on_done(True)；没认出来 on_done(False)，交给标角窗口。"""
         setattr(self, side + '_image', image)
         setattr(self, side + '_points', [])
         try:
             self.update_status('正在识别，请稍候…')
-            self.root.update_idletasks()
         except Exception:
             pass
-        corners = None
-        try:
-            corners = self.ai_detect_any(image)
-            if not corners and not getattr(self, '_ai_ran', False):
-                corners = self.detect_card_corners(image)
-        except Exception:
-            corners = None
-        if corners:
-            setattr(self, side + '_points', corners)
-            self.finish_marking(side)
-            return True
-        return False
+
+        def _done(corners):
+            if corners:
+                setattr(self, side + '_points', corners)
+                self.finish_marking(side)
+                on_done(True)
+            else:
+                on_done(False)
+
+        self._detect_async(image, _done)
 
     def _settings_file(self):
         try:
@@ -1215,6 +1279,9 @@ class IDCardProcessor:
             pass
 
     def import_into_slot(self, idx, side, file_path=None):
+        if getattr(self, '_import_busy', False):
+            self.update_status('正在识别上一张，请稍候…')
+            return
         self.open_pair(idx)
         if not file_path:
             file_path = filedialog.askopenfilename(
@@ -1226,16 +1293,23 @@ class IDCardProcessor:
         try:
             image = Image.open(file_path)
             image.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
-            self.pairs[idx][side]['path'] = file_path
-            if self._auto_process_slot(idx, side, image):
+        except Exception as e:
+            messagebox.showerror('错误', f'加载图片失败: {str(e)}')
+            return
+        self.pairs[idx][side]['path'] = file_path
+        self._import_busy = True
+
+        def _fin(ok):
+            self._import_busy = False
+            if ok:
                 self.refresh_pairs_panel()
                 self.update_status(f"第{idx + 1}组{'正面' if side == 'front' else '反面'}已自动识别处理完成")
             else:
                 self._skip_auto_finish = True
                 self.show_image_for_marking(side, image, file_path)
                 self.update_status('自动识别没成功，请在窗口里手动标4个角点')
-        except Exception as e:
-            messagebox.showerror('错误', f'加载图片失败: {str(e)}')
+
+        self._auto_process_slot(idx, side, image, _fin)
 
     def open_thumbnail_picker(self):
         """看图选片：文件夹大缩略图阅览窗（PS 式）。点照片选中（可多选），
@@ -1384,15 +1458,18 @@ class IDCardProcessor:
 
     def import_files_as_pairs(self, files, start_idx=None, start_side='front'):
         """Fill pairs with image files in order (front then back per
-        pair), auto-processing each; failures stay as 待标角 and are
-        counted in the status line. With start_idx, filling starts at
-        that pair/side and continues into following pairs."""
+        pair), auto-processing each IN THE BACKGROUND so the window
+        stays responsive while recognition runs; failures stay as
+        待标角 and are counted in the status line. With start_idx,
+        filling starts at that pair/side and continues into
+        following pairs."""
         files = [f for f in files if f]
         if not files:
             return
+        if getattr(self, '_import_busy', False):
+            self.update_status('正在识别上一批，请稍候再导入')
+            return
         self._remember_dir(files[0])
-        ok, manual = 0, 0
-        bad = []
         if start_idx is None:
             # 启动时自带的那个空组先撤掉，免得导入完平白多出一个空组
             if len(self.pairs) == 1 and \
@@ -1411,43 +1488,65 @@ class IDCardProcessor:
                 rest = rest[2:]
             pair_seq = [(start_idx, first_order)] + \
                 [(start_idx + 1 + j, ('front', 'back')) for j in range(len(chunks) - 1)]
+        steps = []
+        for ci, ((pidx, order), chunk) in enumerate(zip(pair_seq, chunks)):
+            for side, path in zip(order, chunk):
+                steps.append((ci, pidx, side, path))
+        state = {'i': 0, 'ok': 0, 'manual': 0, 'bad': [], 'idx_of': {}}
         import gc as _gc
-        for (pidx, order), chunk in zip(pair_seq, chunks):
-            if pidx is None or pidx >= len(self.pairs):
+        self._import_busy = True
+
+        def finish_all():
+            self._import_busy = False
+            self.refresh_pairs_panel()
+            _msg = f"批量导入完成：自动处理 {state['ok']} 张，待手动标角 {state['manual']} 张"
+            if state['bad']:
+                _msg += f"，另有 {len(state['bad'])} 张读不了：{'、'.join(state['bad'][:3])}"
+            self.update_status(_msg)
+
+        def step():
+            if state['i'] >= len(steps):
+                finish_all()
+                return
+            ci, pidx, side, path = steps[state['i']]
+            self.update_status(f"正在识别（{state['i'] + 1}/{len(steps)}），请稍候…")
+            if ci in state['idx_of']:
+                idx = state['idx_of'][ci]
+                self.open_pair(idx)
+            elif pidx is None or pidx >= len(self.pairs):
                 idx = self.add_pair()
+                state['idx_of'][ci] = idx
             else:
                 idx = pidx
+                state['idx_of'][ci] = idx
                 self.open_pair(idx)
-            for side, path in zip(order, chunk):
-                try:
-                    image = Image.open(path)
-                    image.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
-                except Exception:
-                    bad.append(path.replace('\\', '/').split('/')[-1])
-                    continue
-                self.pairs[idx][side]['path'] = path
-                setattr(self, side + '_image', image)
-                setattr(self, side + '_points', [])
-                corners = None
-                try:
-                    corners = self.ai_detect_any(image)
-                    if not corners and not getattr(self, '_ai_ran', False):
-                        corners = self.detect_card_corners(image)
-                except Exception:
-                    corners = None
+            try:
+                image = Image.open(path)
+                image.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
+            except Exception:
+                state['bad'].append(path.replace('\\', '/').split('/')[-1])
+                state['i'] += 1
+                step()
+                return
+            self.pairs[idx][side]['path'] = path
+            setattr(self, side + '_image', image)
+            setattr(self, side + '_points', [])
+
+            def _done(corners):
                 if corners:
                     setattr(self, side + '_points', corners)
                     self.finish_marking(side)
-                    ok += 1
+                    state['ok'] += 1
                 else:
-                    manual += 1
-            self._stash_workspace()
-            _gc.collect()
-        self.refresh_pairs_panel()
-        _msg = f'批量导入完成：自动处理 {ok} 张，待手动标角 {manual} 张'
-        if bad:
-            _msg += f"，另有 {len(bad)} 张读不了：{'、'.join(bad[:3])}"
-        self.update_status(_msg)
+                    state['manual'] += 1
+                self._stash_workspace()
+                _gc.collect()
+                state['i'] += 1
+                step()
+
+            self._detect_async(image, _done)
+
+        step()
 
     def on_slot_click(self, idx, side):
         slot = self.pairs[idx][side]
@@ -1457,13 +1556,22 @@ class IDCardProcessor:
             self.open_pair(idx)
             self.reopen_for_adjustment(side)
         else:
+            if getattr(self, '_import_busy', False):
+                self.update_status('正在识别上一张，请稍候…')
+                return
             self.open_pair(idx)
-            if self._auto_process_slot(idx, side, slot['image']):
-                self.refresh_pairs_panel()
-                self.update_status(f"第{idx + 1}组{'正面' if side == 'front' else '反面'}已自动识别处理完成")
-            else:
-                self._skip_auto_finish = True
-                self.show_image_for_marking(side, slot['image'], slot['path'])
+            self._import_busy = True
+
+            def _fin(ok):
+                self._import_busy = False
+                if ok:
+                    self.refresh_pairs_panel()
+                    self.update_status(f"第{idx + 1}组{'正面' if side == 'front' else '反面'}已自动识别处理完成")
+                else:
+                    self._skip_auto_finish = True
+                    self.show_image_for_marking(side, slot['image'], slot['path'])
+
+            self._auto_process_slot(idx, side, slot['image'], _fin)
 
     def build_pairs_panel(self, parent):
         # 换脸：无边框白底，组列表占满主区域
@@ -2551,8 +2659,9 @@ class IDCardProcessor:
             pass
 
     def try_auto_finish(self, side):
-        """标记窗口打开后静默尝试自动识别：成功直接完成该面处理（不弹窗确认）；
-        失败不打扰用户，停留在手动标记流程。"""
+        """标记窗口打开后静默尝试自动识别（后台线程跑，界面不冻结）：
+        成功直接完成该面处理（不弹窗确认）；失败不打扰用户，
+        停留在手动标记流程。"""
         try:
             if getattr(self, '_skip_auto_finish', False):
                 self._skip_auto_finish = False
@@ -2568,19 +2677,29 @@ class IDCardProcessor:
                 image, points = self.card_image, self.card_points
             if image is None or len(points) == 4:
                 return
-            corners = self.ai_detect_any(image)
-            if not corners and not getattr(self, '_ai_ran', False):
-                corners = self.detect_card_corners(image)
-            if not corners:
-                self._seed_preset_box(side)
-                return
-            if side == "front":
-                self.front_points = corners
-            elif side == "back":
-                self.back_points = corners
-            else:
-                self.card_points = corners
-            self.finish_marking(side)
+            _win = self.mark_window
+
+            def _done(corners):
+                try:
+                    if self.mark_window is not _win or self.current_marking_side != side:
+                        return
+                    _pts = getattr(self, side + '_points', None)
+                    if _pts is not None and len(_pts) == 4:
+                        return
+                    if not corners:
+                        self._seed_preset_box(side)
+                        return
+                    if side == "front":
+                        self.front_points = corners
+                    elif side == "back":
+                        self.back_points = corners
+                    else:
+                        self.card_points = corners
+                    self.finish_marking(side)
+                except Exception:
+                    pass
+
+            self._detect_async(image, _done)
         except Exception:
             pass
 
