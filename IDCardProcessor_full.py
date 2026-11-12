@@ -10,8 +10,13 @@ import sys
 import time
 import traceback
 import platform
+import shutil
 import hashlib
 import img2pdf
+
+# refineCorners 开关（对齐原版 IDCardMerge v2.2：Detect 出角后紧接着在
+# 原图上精修四角）。置 False 则原样使用模型角点。
+REFINE_CORNERS = True
 
 # === 图标设置代码（由打包工具自动添加） ===
 import os
@@ -131,27 +136,6 @@ def _order_quad_points(pts):
     return [tl, tr, br, bl]
 
 
-def _quad_plausible_for_frame(pts, frame_w, frame_h):
-    """2026-11-12: gate for rescue-chain tile results. A 'card' found inside
-    a tile that covers only a small part of the whole frame is almost
-    always a false positive inside the real card (a text block / portrait
-    region), not the card itself. Require it to span a plausible share of
-    the frame before it may be returned as the card quad."""
-    try:
-        xs = [float(p[0]) for p in pts]
-        ys = [float(p[1]) for p in pts]
-        area = 0.0
-        for i in range(4):
-            x1, y1 = float(pts[i][0]), float(pts[i][1])
-            x2, y2 = float(pts[(i + 1) % 4][0]), float(pts[(i + 1) % 4][1])
-            area += x1 * y2 - x2 * y1
-        area = abs(area) / 2.0
-        return (area >= 0.35 * frame_w * frame_h
-                and (max(xs) - min(xs)) >= 0.45 * frame_w
-                and (max(ys) - min(ys)) >= 0.45 * frame_h)
-    except Exception:
-        return False
-
 
 def _order_points_np(pts):
     rect = np.zeros((4, 2), dtype="float32")
@@ -163,42 +147,6 @@ def _order_points_np(pts):
     rect[3] = pts[np.argmax(diff)]
     return rect
 
-
-def _inset_quad(pts, frac=0.003):
-    """Inset each edge of the quad along its inward normal by frac*card width,
-    recomputing corners as intersections. Counters the model's outward corner
-    bias (measured: 47% of edges include >2px background). On any degeneracy,
-    returns the input unchanged."""
-    try:
-        p = [np.array(q, dtype=np.float64) for q in pts]
-        w1 = np.hypot(*(p[1] - p[0])); w2 = np.hypot(*(p[2] - p[3]))
-        d = frac * max(w1, w2)
-        if d <= 0:
-            return pts
-        cen = sum(p) / 4.0
-        lines = []
-        for i in range(4):
-            a, b = p[i], p[(i + 1) % 4]
-            e = b - a
-            L = np.hypot(*e)
-            if L < 1:
-                return pts
-            n = np.array([-e[1], e[0]]) / L
-            if np.dot(n, cen - a) < 0:
-                n = -n
-            lines.append((a + n * d, e))
-        out = []
-        for i in range(4):
-            p1, e1 = lines[i - 1]
-            p2, e2 = lines[i]
-            det_ = e1[0] * e2[1] - e1[1] * e2[0]
-            if abs(det_) < 1e-9:
-                return pts
-            t = ((p2[0] - p1[0]) * e2[1] - (p2[1] - p1[1]) * e2[0]) / det_
-            out.append(p1 + e1 * t)
-        return [(float(q[0]), float(q[1])) for q in out]
-    except Exception:
-        return pts
 
 
 class CardDetectorAI:
@@ -232,7 +180,9 @@ class CardDetectorAI:
                 img = cv2.copyMakeBorder(img, 0, 0, padw, self.inpWidth - neww - padw,
                                          cv2.BORDER_CONSTANT, value=0)
             else:
-                newh, neww = int(self.inpHeight * hw_scale) + 1, self.inpWidth
+                # Aligned with the original IDCardMerge letterbox: plain
+                # truncation (cvttsd2si), no +1.
+                newh, neww = int(self.inpHeight * hw_scale), self.inpWidth
                 img = cv2.resize(srcimg, (neww, newh), interpolation=cv2.INTER_AREA)
                 padh = int((self.inpHeight - newh) * 0.5)
                 img = cv2.copyMakeBorder(img, padh, self.inpHeight - newh - padh, 0, 0,
@@ -285,7 +235,8 @@ class CardDetectorAI:
             anchor_centers = (anchor_centers * stride).reshape((-1, 2))
             if self._num_anchors > 1:
                 anchor_centers = np.stack([anchor_centers] * self._num_anchors, axis=1).reshape((-1, 2))
-            pos_inds = np.where(scores >= self.confThreshold)[0]
+            # Original keeps a candidate only when score > 0.5 (strict).
+            pos_inds = np.where(scores > self.confThreshold)[0]
             bboxes = self.distance2bbox(anchor_centers, bbox_preds)
             scores_list.append(scores[pos_inds]); bboxes_list.append(bboxes[pos_inds])
             kpss = self.distance2kps(anchor_centers, kps_preds).reshape((-1, 4, 2))
@@ -309,10 +260,19 @@ class CardDetectorAI:
             if scores[i] > best_score:
                 best_score, best = scores[i], i
         pts = kpss[best]
-        pts_list = [(float(pts[i, 0]), float(pts[i, 1])) for i in range(4)]
-        # 2026-11-10 fix: model keypoints carry card orientation (trained order =
-        # card TL->TR->BR->BL); geometric re-sort flips upside-down shots.
-        # Use raw order; fall back to geometric sort only on self-crossing quads.
+        raw = [(float(pts[i, 0]), float(pts[i, 1])) for i in range(4)]
+        # Corner order, aligned with the original IDCardMerge v2.2: its
+        # Detect returns the 4 keypoints rotated by one, [kp1, kp2, kp3,
+        # kp0]. The model's RAW keypoint order is [BL, TL, TR, BR] --
+        # measured 2026-11-12 on real front/back photos (raw kp0 always
+        # lands on the card's bottom-left corner), so the rotation yields
+        # exactly the canonical [TL, TR, BR, BL] this pipeline consumes.
+        # (An older comment here claimed the raw order was already
+        # TL-first; it is not -- downstream geometric re-sorts were
+        # masking the one-position rotation.)
+        pts_list = [raw[1], raw[2], raw[3], raw[0]]
+        # Degenerate-case guard only: if the rotated quad self-crosses,
+        # fall back to a geometric sort rather than emit a bow-tie.
         _arr = np.array(pts_list, dtype=np.float64)
         def _cr(o, p, q):
             return (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0])
@@ -556,6 +516,157 @@ def _log_ocr_error(exc):
             traceback.print_exc(file=f)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# refineCorners 复刻（据 IDCardMerge v2.2 refineCorners 反汇编定案重写，
+# 见 idcard-audit/original-detect-spec.md §9，全部 PROVEN；与
+# idcard-qt/refine.py 同源，此处内嵌以便单文件分发）。
+# 原版算法：对每条边取 n+1 个基点，n = clamp(int(L/20), 15, 60)（边长
+# L < 10 不采样、直接用原边线）；每基点沿法线在 [-15,+15] 步长 1.0 横扫，
+# 响应 = R/G/B 三通道各自完整 Sobel 梯度幅值 sqrt(Gx^2+Gy^2) 的最大值，
+# 取首个达峰的偏移，峰值 > 30.0 才把浮点峰位收为边点；边点 >= 10 时跑
+# RANSAC（1000 轮，每条边用新鲜的时间种子随机源）：候选线软评分
+# sum(exp(-d^2/32))（仅 |d| < 4.0 的点计入），冠军仅在严格更优时替换
+# （初始分 -1.0），冠军分 >= 0.15*m 才采纳、否则用原边线。四边成线后
+# 相邻线求交得新角，|det| <= 1e-9 跳过，新角离原角 <= 25.0 才保留。
+# 老机器保险丝：整体墙钟预算 _REFINE_TIME_BUDGET_S（本机尺度 0.6s），
+# 超时即以"已完成的边用拟合线、未完成的边用原边线"收尾，绝不无界运行。
+_REFINE_SCAN_LO, _REFINE_SCAN_HI, _REFINE_SCAN_STEP = -15.0, 15.0, 1.0
+_REFINE_GRAD_MIN = 30.0
+_REFINE_MIN_EDGE_LEN = 10.0
+_REFINE_SAMPLE_DIV = 20.0
+_REFINE_SAMPLE_MIN, _REFINE_SAMPLE_MAX = 15, 60
+_REFINE_RANSAC_ITER = 1000
+_REFINE_RANSAC_MIN_POINTS = 10
+_REFINE_INLIER_DIST = 4.0
+_REFINE_EXP_DENOM = 32.0
+_REFINE_ACCEPT_RATIO = 0.15
+_REFINE_MAX_CORNER_SHIFT = 25.0
+_REFINE_DET_EPS = 1e-9
+_REFINE_TIME_BUDGET_S = 0.6
+
+
+def _refine_line_from_points(p, q):
+    """过两点的归一化直线 (a, b, c)，a*x + b*y + c = 0。"""
+    a = float(p[1] - q[1])
+    b = float(q[0] - p[0])
+    n = np.hypot(a, b)
+    if n == 0:
+        return None
+    a, b = a / n, b / n
+    c = -(a * p[0] + b * p[1])
+    return np.array([a, b, c], dtype=np.float64)
+
+
+def _refine_corners_np(img_rgb, corners, rng=None, stats=None):
+    """img_rgb: HxWx3 uint8（RGB 序）；corners: (4,2) float，原图坐标。
+    返回精修后的 (4,2) float64；任何一步不达标都退回原角（与原版一致）。
+    stats 非 None 时回填 {'budget_hit': bool, 'time_s': float}。"""
+    corners = np.asarray(corners, dtype=np.float64)
+    if corners.shape != (4, 2):
+        return corners.copy()
+    t_start = time.monotonic()
+    deadline = t_start + _REFINE_TIME_BUDGET_S
+    h, w = img_rgb.shape[:2]
+    chans = [img_rgb[:, :, c].astype(np.int32) for c in range(3)]
+    offs = np.arange(_REFINE_SCAN_LO,
+                     _REFINE_SCAN_HI + 0.5 * _REFINE_SCAN_STEP,
+                     _REFINE_SCAN_STEP)
+
+    def sobel_resp(xs, ys):
+        """三通道完整 Sobel 幅值的最大值（原版响应函数）。"""
+        best = None
+        for ch in chans:
+            gx = ((ch[ys - 1, xs + 1] + 2 * ch[ys, xs + 1] + ch[ys + 1, xs + 1])
+                  - (ch[ys - 1, xs - 1] + 2 * ch[ys, xs - 1] + ch[ys + 1, xs - 1]))
+            gy = ((ch[ys + 1, xs - 1] + 2 * ch[ys + 1, xs] + ch[ys + 1, xs + 1])
+                  - (ch[ys - 1, xs - 1] + 2 * ch[ys - 1, xs] + ch[ys - 1, xs + 1]))
+            mag = np.sqrt(gx.astype(np.float64) ** 2
+                          + gy.astype(np.float64) ** 2)
+            best = mag if best is None else np.maximum(best, mag)
+        return best
+
+    lines = []
+    budget_hit = False
+    for i in range(4):
+        a_pt = corners[i]
+        b_pt = corners[(i + 1) % 4]
+        fallback = _refine_line_from_points(a_pt, b_pt)
+        d = b_pt - a_pt
+        length = float(np.hypot(d[0], d[1]))
+        if length < _REFINE_MIN_EDGE_LEN or fallback is None or budget_hit:
+            lines.append(fallback)
+            continue
+        if time.monotonic() > deadline:
+            budget_hit = True
+            lines.append(fallback)
+            continue
+        # 基点数 n+1，n = clamp(int(L/20), 15, 60)（原版 PROVEN）
+        n = int(max(_REFINE_SAMPLE_MIN,
+                    min(_REFINE_SAMPLE_MAX, length / _REFINE_SAMPLE_DIV)))
+        u = d / length
+        nrm = np.array([-u[1], u[0]])       # 法线 (-dy, dx)/L，正负无所谓
+        t = np.arange(n + 1, dtype=np.float64) / n
+        base = a_pt[None, :] + t[:, None] * d[None, :]              # (n+1, 2)
+        pts = base[:, None, :] + offs[None, :, None] * nrm[None, None, :]
+        xs = pts[:, :, 0].astype(np.int64)  # 向零截断（Go int() 语义）
+        ys = pts[:, :, 1].astype(np.int64)
+        valid = (xs >= 1) & (xs <= w - 2) & (ys >= 1) & (ys <= h - 2)
+        resp = np.zeros(xs.shape, dtype=np.float64)
+        if valid.any():
+            resp[valid] = sobel_resp(xs[valid], ys[valid])
+        best_idx = resp.argmax(axis=1)      # 首个达峰（与原版严格大于更新一致）
+        best_val = resp[np.arange(resp.shape[0]), best_idx]
+        keep = best_val > _REFINE_GRAD_MIN
+        edge_pts = pts[keep, best_idx[keep]]
+
+        line = fallback
+        m = len(edge_pts)
+        if m >= _REFINE_RANSAC_MIN_POINTS:
+            # 原版每条边新建时间种子 RNG；调用方给 rng 时用它（测试可复现）
+            edge_rng = rng if rng is not None else np.random.default_rng()
+            best_line, best_score = None, -1.0
+            for it in range(_REFINE_RANSAC_ITER):
+                if it % 16 == 0 and time.monotonic() > deadline:
+                    budget_hit = True
+                    break
+                i1 = int(edge_rng.integers(0, m))
+                i2 = int(edge_rng.integers(0, m))
+                if i1 == i2:
+                    continue
+                cand = _refine_line_from_points(edge_pts[i1], edge_pts[i2])
+                if cand is None:
+                    continue
+                dist = np.abs(edge_pts @ cand[:2] + cand[2])
+                inl = dist < _REFINE_INLIER_DIST
+                score = (float(np.exp(-(dist[inl] ** 2)
+                                      / _REFINE_EXP_DENOM).sum())
+                         if inl.any() else 0.0)
+                if score > best_score:
+                    best_score, best_line = score, cand
+            if best_line is not None and best_score >= _REFINE_ACCEPT_RATIO * m:
+                line = best_line
+        lines.append(line)
+
+    out = corners.copy()
+    for i in range(4):
+        l_prev, l_cur = lines[i - 1], lines[i]
+        if l_prev is None or l_cur is None:
+            continue
+        det = l_prev[0] * l_cur[1] - l_cur[0] * l_prev[1]
+        if abs(det) <= _REFINE_DET_EPS:
+            continue
+        x = (l_prev[1] * l_cur[2] - l_cur[1] * l_prev[2]) / det
+        y = (l_cur[0] * l_prev[2] - l_prev[0] * l_cur[2]) / det
+        new_pt = np.array([x, y])
+        if np.hypot(new_pt[0] - corners[i][0],
+                    new_pt[1] - corners[i][1]) <= _REFINE_MAX_CORNER_SHIFT:
+            out[i] = new_pt
+    if stats is not None:
+        stats['budget_hit'] = budget_hit
+        stats['time_s'] = time.monotonic() - t_start
+    return out
 
 
 class IDCardProcessor:
@@ -821,7 +932,10 @@ class IDCardProcessor:
             # 绑定拖拽事件
             self.a4_canvas.dnd_bind('<<DropEnter>>', self.on_drag_enter)
             self.a4_canvas.dnd_bind('<<DropLeave>>', self.on_drag_leave)
-            self.a4_canvas.dnd_bind('<<Drop>>', self.on_drop)
+            # Audit 1.1: drops on the A4 canvas go through the NEW
+            # multi-file handler like everywhere else; the legacy
+            # single-file on_drop must never be bound again.
+            self.a4_canvas.dnd_bind('<<Drop>>', self.on_files_dropped)
             
             print("拖拽功能已启用")
         except Exception as e:
@@ -1227,7 +1341,7 @@ class IDCardProcessor:
                 self.show_processed_result("back", self.back_processed)
     
     def _new_slot(self):
-        return {'image': None, 'points': [], 'processed': None, 'path': None, 'ocr': {}, '_ocr_key': None}
+        return {'image': None, 'points': [], 'processed': None, 'path': None, 'ocr': {}, '_ocr_for': None}
 
     def _stash_workspace(self):
         idx = getattr(self, 'current_open', None)
@@ -1242,8 +1356,11 @@ class IDCardProcessor:
         for side in ('front', 'back'):
             slot = pair[side]
             proc = slot.get('processed')
-            if proc is not None and slot.get('_ocr_key') != id(proc):
-                slot['_ocr_key'] = id(proc)
+            # Identity by OBJECT, not id(): a freed image's id() can be
+            # recycled by a different image, which used to suppress its
+            # OCR forever (audit 2.7).
+            if proc is not None and slot.get('_ocr_for') is not proc:
+                slot['_ocr_for'] = proc
                 self._schedule_ocr(idx, side, proc)
 
     def _load_pair_to_workspace(self, idx):
@@ -1272,6 +1389,16 @@ class IDCardProcessor:
         self.refresh_pairs_panel()
 
     def add_pair(self):
+        # UI entry point: while a detection is in flight, mutating the
+        # pair list would reroute its result onto another card (audit
+        # 2.3). Internal callers (the batch chain itself) use
+        # _append_pair, which skips this guard.
+        if getattr(self, '_import_busy', False):
+            self.update_status('正在识别上一张，请稍候…')
+            return self.current_open
+        return self._append_pair()
+
+    def _append_pair(self):
         self._stash_workspace()
         self.pairs.append({'front': self._new_slot(), 'back': self._new_slot()})
         idx = len(self.pairs) - 1
@@ -1280,18 +1407,42 @@ class IDCardProcessor:
         return idx
 
     def delete_pair(self, idx):
-        if 0 <= idx < len(self.pairs):
-            del self.pairs[idx]
-            if self.current_open is not None and self.current_open >= idx:
-                self.current_open = None
-            if self.pairs:
-                self._load_pair_to_workspace(min(idx, len(self.pairs) - 1))
-            else:
-                self.current_open = None
-            self.refresh_pairs_panel()
+        if getattr(self, '_import_busy', False):
+            self.update_status('正在识别上一张，请稍候…')
+            return
+        if not (0 <= idx < len(self.pairs)):
+            return
+        # Audit 2.2: stash FIRST (the old code overwrote unsaved
+        # workspace work), and only touch the workspace when the open
+        # pair itself is affected: deleting a LATER pair must not yank
+        # the workspace to another group; deleting an EARLIER pair only
+        # renumbers the open one.
+        self._stash_workspace()
+        cur = self.current_open
+        del self.pairs[idx]
+        if not self.pairs:
+            self.current_open = None
+            for side in ('front', 'back'):
+                setattr(self, side + '_image', None)
+                setattr(self, side + '_points', [])
+                setattr(self, side + '_processed', None)
+            try:
+                self.draw_a4_layout()
+            except Exception:
+                pass
+        elif cur is None:
+            pass
+        elif idx < cur:
+            self.current_open = cur - 1
+        elif idx == cur:
+            self._load_pair_to_workspace(min(idx, len(self.pairs) - 1))
+        self.refresh_pairs_panel()
 
     def clear_slot(self, idx, side):
         """只清一面（行尾「删组」是整组）：清掉该槽位的原图/角点/处理结果/读字，可单独重传这一面"""
+        if getattr(self, '_import_busy', False):
+            self.update_status('正在识别上一张，请稍候…')
+            return
         if not (0 <= idx < len(self.pairs)):
             return
         self.pairs[idx][side] = self._new_slot()
@@ -1308,6 +1459,9 @@ class IDCardProcessor:
 
     def swap_pair_sides(self, idx):
         """正反面互换（青点名要的功能）：整组数据对调，含原图/角点/处理结果"""
+        if getattr(self, '_import_busy', False):
+            self.update_status('正在识别上一张，请稍候…')
+            return
         if 0 <= idx < len(self.pairs):
             pair = self.pairs[idx]
             pair['front'], pair['back'] = pair['back'], pair['front']
@@ -1317,10 +1471,10 @@ class IDCardProcessor:
             self.update_status('已互换正反面')
 
     # ---- 2026-11-12: detection runs on ONE background thread and the
-    # result comes back through root.after. The old flow ran
-    # ai_detect_any on the UI thread; its rescue chain can take
-    # 20-60s on a slow PC, freezing the whole window -- Qing's
-    # "software is laggy, buttons don't respond".
+    # result comes back through a polled queue. The old flow ran
+    # detection on the UI thread; a single inference can take seconds
+    # on a slow PC, freezing the whole window -- Qing's "software is
+    # laggy, buttons don't respond".
     def _detect_async(self, image, done):
         """Queue a background detection; done(corners) runs on the UI thread.
         The worker thread never touches Tk: it puts the result into a
@@ -1361,9 +1515,10 @@ class IDCardProcessor:
         def work():
             corners = None
             try:
+                # Aligned detection only: the original has NO classical
+                # contour fallback stage; failure surfaces as None and
+                # routes to manual marking.
                 corners = self.ai_detect_any(image)
-                if not corners and not getattr(self, '_ai_ran', False):
-                    corners = self.detect_card_corners(image)
             except Exception:
                 corners = None
             try:
@@ -1394,12 +1549,25 @@ class IDCardProcessor:
             pass
 
         def _done(corners):
-            if corners:
-                setattr(self, side + '_points', corners)
-                self.finish_marking(side)
-                on_done(True)
-            else:
-                on_done(False)
+            # Audit 2.1/3.1: on_done MUST run exactly once even if
+            # finish_marking raises outside its own guard, or the batch
+            # chain stalls and _import_busy leaks (every later import
+            # refused until restart). And 'ok' must reflect the actual
+            # processing result -- finish_marking reports failure only
+            # via a dialog and returns None either way, so check that a
+            # processed image really landed.
+            ok = False
+            try:
+                if corners:
+                    setattr(self, side + '_points', corners)
+                    self.finish_marking(side)
+                    ok = getattr(self, side + '_processed', None) is not None
+            except Exception:
+                ok = False
+            try:
+                on_done(ok)
+            except Exception:
+                pass
 
         self._detect_async(image, _done)
 
@@ -1436,11 +1604,94 @@ class IDCardProcessor:
             if not d or not os.path.isdir(d):
                 return
             self._last_dir_cache = d
-            import json as _json
-            with open(self._settings_file(), 'w', encoding='utf-8') as f:
-                _json.dump({'last_dir': d}, f, ensure_ascii=False)
+            _data = self._read_settings()
+            _data['last_dir'] = d
+            self._write_settings(_data)
         except Exception:
             pass
+
+    def _read_settings(self):
+        try:
+            import json as _json
+            with open(self._settings_file(), 'r', encoding='utf-8') as f:
+                v = _json.load(f)
+            return v if isinstance(v, dict) else {}
+        except Exception:
+            return {}
+
+    def _write_settings(self, data):
+        try:
+            import json as _json
+            with open(self._settings_file(), 'w', encoding='utf-8') as f:
+                _json.dump(data, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _save_settings(self):
+        """Persist the UI settings (watermark / template / enhance)
+        merged with last_dir. Audit 3.5: these used to live only in Tk
+        variables recreated with defaults at every launch -- a safety
+        watermark she had configured silently turned itself OFF on
+        restart."""
+        _data = self._read_settings()
+        if getattr(self, '_last_dir_cache', None):
+            _data['last_dir'] = self._last_dir_cache
+        try:
+            if getattr(self, 'template_var', None) is not None:
+                _data['template'] = self.template_var.get()
+            if getattr(self, 'enhance_var', None) is not None:
+                _data['enhance'] = self.enhance_var.get()
+            if getattr(self, 'wm_enabled_var', None) is not None:
+                _data['wm'] = {
+                    'enabled': bool(self.wm_enabled_var.get()),
+                    'text': self.wm_text_var.get(),
+                    'size': int(self.wm_size_var.get()),
+                    'color': self.wm_color_var.get(),
+                    'opacity': int(self.wm_opacity_var.get()),
+                    'rows': int(self.wm_rows_var.get()),
+                }
+        except Exception:
+            pass
+        self._write_settings(_data)
+
+    def _restore_settings(self):
+        _data = self._read_settings()
+        try:
+            _tpl = _data.get('template')
+            if _tpl in ('标准（每组一页）', '紧凑拼版'):
+                self.template_var.set(_tpl)
+            _inv = {'none': '原图', 'color': '彩色', 'bw': '黑白',
+                    'docbw': '文档黑白', 'doccolor': '文档彩色'}
+            _enh = _data.get('enhance')
+            if _enh in _inv:
+                self._enhance_text_var.set(_inv[_enh])
+                self.enhance_var.set(_enh)
+                self._on_enhance_change()
+            _wm = _data.get('wm')
+            if isinstance(_wm, dict) and _wm:
+                self.wm_enabled_var.set(bool(_wm.get('enabled', False)))
+                if isinstance(_wm.get('text'), str):
+                    self.wm_text_var.set(_wm['text'])
+                if _wm.get('size') in range(4, 15):
+                    self.wm_size_var.set(_wm['size'])
+                if _wm.get('color') in ('黑色', '蓝色', '红色', '灰色'):
+                    self.wm_color_var.set(_wm['color'])
+                if _wm.get('opacity') in (5, 10, 15, 18, 20, 25, 30, 40, 50, 60):
+                    self.wm_opacity_var.set(_wm['opacity'])
+                if _wm.get('rows') in range(1, 7):
+                    self.wm_rows_var.set(_wm['rows'])
+        except Exception:
+            pass
+        # From now on, any change to these variables is saved at once.
+        for _name in ('wm_enabled_var', 'wm_text_var', 'wm_size_var',
+                      'wm_color_var', 'wm_opacity_var', 'wm_rows_var',
+                      'template_var', '_enhance_text_var'):
+            _var = getattr(self, _name, None)
+            if _var is not None:
+                try:
+                    _var.trace_add('write', lambda *a: self._save_settings())
+                except Exception:
+                    pass
 
     def import_into_slot(self, idx, side, file_path=None):
         if getattr(self, '_import_busy', False):
@@ -1661,12 +1912,17 @@ class IDCardProcessor:
         self._import_busy = True
 
         def finish_all():
+            # Busy flag released FIRST: whatever the reporting below
+            # does, the app must never stay wedged (audit 2.1).
             self._import_busy = False
-            self.refresh_pairs_panel()
-            _msg = f"批量导入完成：自动处理 {state['ok']} 张，待手动标角 {state['manual']} 张"
-            if state['bad']:
-                _msg += f"，另有 {len(state['bad'])} 张读不了：{'、'.join(state['bad'][:3])}"
-            self.update_status(_msg)
+            try:
+                self.refresh_pairs_panel()
+                _msg = f"批量导入完成：自动处理 {state['ok']} 张，待手动标角 {state['manual']} 张"
+                if state['bad']:
+                    _msg += f"，另有 {len(state['bad'])} 张读不了：{'、'.join(state['bad'][:3])}"
+                self.update_status(_msg)
+            except Exception:
+                pass
 
         def step():
             if state['i'] >= len(steps):
@@ -1678,7 +1934,7 @@ class IDCardProcessor:
                 idx = state['idx_of'][ci]
                 self.open_pair(idx)
             elif pidx is None or pidx >= len(self.pairs):
-                idx = self.add_pair()
+                idx = self._append_pair()
                 state['idx_of'][ci] = idx
             else:
                 idx = pidx
@@ -1697,13 +1953,27 @@ class IDCardProcessor:
             setattr(self, side + '_points', [])
 
             def _done(corners):
-                if corners:
-                    setattr(self, side + '_points', corners)
-                    self.finish_marking(side)
+                # Audit 2.1/3.1: the chain advances NO MATTER WHAT --
+                # an exception here used to strand the whole batch on
+                # "正在识别（i/N）" with _import_busy stuck on. A card
+                # whose finish_marking failed counts as 待手动标角,
+                # not as a success.
+                ok = False
+                try:
+                    if corners:
+                        setattr(self, side + '_points', corners)
+                        self.finish_marking(side)
+                        ok = getattr(self, side + '_processed', None) is not None
+                except Exception:
+                    ok = False
+                if ok:
                     state['ok'] += 1
                 else:
                     state['manual'] += 1
-                self._stash_workspace()
+                try:
+                    self._stash_workspace()
+                except Exception:
+                    pass
                 _gc.collect()
                 state['i'] += 1
                 step()
@@ -1717,6 +1987,9 @@ class IDCardProcessor:
         if slot['image'] is None:
             self.import_into_slot(idx, side)
         elif slot['processed'] is not None:
+            if getattr(self, '_import_busy', False):
+                self.update_status('正在识别上一张，请稍候…')
+                return
             self.open_pair(idx)
             self.reopen_for_adjustment(side)
         else:
@@ -1768,6 +2041,9 @@ class IDCardProcessor:
         self.refresh_pairs_panel()
 
     def _clear_pairs(self):
+        if getattr(self, '_import_busy', False):
+            self.update_status('正在识别上一张，请稍候…')
+            return
         self.pairs = []
         self.current_open = None
         self._pair_photos = {}
@@ -1775,7 +2051,7 @@ class IDCardProcessor:
             setattr(self, side + '_image', None)
             setattr(self, side + '_points', [])
             setattr(self, side + '_processed', None)
-        self.add_pair()
+        self._append_pair()
         try:
             self.draw_a4_layout()
         except Exception:
@@ -1840,22 +2116,60 @@ class IDCardProcessor:
                       relief=tk.FLAT, padx=8, pady=4,
                       cursor='hand2').pack(side=tk.LEFT)
     def _schedule_ocr(self, idx, side, pil_img):
+        # Audit 2.6/2.8: results are addressed by IMAGE IDENTITY, never
+        # by (idx, side) position -- OCR takes seconds on her PC, and a
+        # delete/swap/clear in between used to land one customer's name
+        # and ID number on another customer's row. Delivery also goes
+        # through a polled queue: the worker thread never writes pair
+        # state and never calls root.after (the codebase's own note in
+        # _detect_async records that after() from a worker can block
+        # forever).
+        if not (0 <= idx < len(self.pairs)):
+            return
+        pair_ref = self.pairs[idx]
+        img_ref = pil_img
+        if not hasattr(self, '_ocr_results'):
+            import queue as _queue
+            self._ocr_results = _queue.Queue()
+            self._poll_ocr_results()
+
         def worker():
             err_text = ''
             try:
-                texts = _ocr_lines(pil_img)
+                texts = _ocr_lines(img_ref)
                 info = _parse_id_front(texts) if side == 'front' else _parse_id_back(texts)
             except Exception as e:
                 info = {}
                 err_text = repr(e)
                 _log_ocr_error(e)
             try:
-                if 0 <= idx < len(self.pairs):
-                    self.pairs[idx][side]['ocr'] = info
-                self.root.after(0, lambda: self._on_ocr_done(idx, side, info, err_text))
+                self._ocr_results.put((pair_ref, side, img_ref, info, err_text))
             except Exception:
                 pass
         _threading.Thread(target=worker, daemon=True).start()
+
+    def _poll_ocr_results(self):
+        try:
+            while True:
+                pair_ref, side, img_ref, info, err_text = self._ocr_results.get_nowait()
+                try:
+                    idx = next((i for i, p in enumerate(self.pairs) if p is pair_ref), -1)
+                    # Deliver ONLY if that slot still holds the very
+                    # image that was sent to OCR; otherwise the result
+                    # belongs to a card that was deleted/swapped/cleared
+                    # meanwhile and dies here.
+                    if pair_ref[side].get('processed') is img_ref:
+                        if idx >= 0:
+                            pair_ref[side]['ocr'] = info
+                        self._on_ocr_done(idx, side, info, err_text)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            self.root.after(150, self._poll_ocr_results)
+        except Exception:
+            pass
 
     def _on_ocr_done(self, idx, side, info, err_text=''):
         if not info and err_text:
@@ -2007,6 +2321,9 @@ class IDCardProcessor:
                   bg='#F5F5F7', fg='#333333', activebackground='#E8E8EA',
                   relief=tk.FLAT, padx=12, pady=4,
                   cursor='hand2').pack(side=tk.LEFT)
+
+        # 恢复上次的水印/排版/增强设置，并挂上自动保存（审计 3.5）
+        self._restore_settings()
 
     def _template_key(self):
         v = self.template_var.get() if hasattr(self, 'template_var') else ''
@@ -2260,9 +2577,18 @@ class IDCardProcessor:
         if not folder:
             return
         self._remember_dir(folder)
+        saved, failed = 0, []
         for gi, sname, img in items:
-            img.convert('RGB').save(os.path.join(folder, f'第{gi}组-{sname}.jpg'), quality=95)
-        messagebox.showinfo('完成', f'已导出 {len(items)} 张裁剪图到所选文件夹')
+            try:
+                img.convert('RGB').save(os.path.join(folder, f'第{gi}组-{sname}.jpg'), quality=95)
+                saved += 1
+            except Exception as e:
+                failed.append(f'第{gi}组-{sname}：{e}')
+        if failed:
+            messagebox.showerror('导出不完整',
+                                 f'已导出 {saved} 张，以下 {len(failed)} 张保存失败：\n' + '\n'.join(failed[:5]))
+        elif saved:
+            messagebox.showinfo('完成', f'已导出 {saved} 张裁剪图到所选文件夹')
 
     def _choose_jpg_mode(self, parent):
         """JPG 导出模式弹窗（对齐 IDCardMerge 子菜单）：完整 A4 / 紧凑拼图，
@@ -2312,36 +2638,57 @@ class IDCardProcessor:
                 self.render_pages()
             pages = getattr(self, 'batch_pages', None) or self.compose_a4_pages()
         if not pages:
+            messagebox.showwarning('提示', '还没有可导出的拼版，请先处理证件')
             return
         folder = filedialog.askdirectory(title='选择保存文件夹', initialdir=self._get_last_dir() or None)
         if not folder:
             return
         self._remember_dir(folder)
+        saved, failed = 0, []
         for i, p in enumerate(pages):
-            p.save(os.path.join(folder, f'证件拼版_{i + 1:02d}.jpg'), quality=95, dpi=(self.dpi, self.dpi))
-        messagebox.showinfo('完成', f'已保存 {len(pages)} 页 JPG 到所选文件夹')
+            try:
+                p.save(os.path.join(folder, f'证件拼版_{i + 1:02d}.jpg'), quality=95, dpi=(self.dpi, self.dpi))
+                saved += 1
+            except Exception as e:
+                failed.append(f'第{i + 1}页：{e}')
+        if failed:
+            messagebox.showerror('导出不完整',
+                                 f'已保存 {saved} 页，以下 {len(failed)} 页保存失败：\n' + '\n'.join(failed[:5]))
+        elif saved:
+            messagebox.showinfo('完成', f'已保存 {saved} 页 JPG 到所选文件夹')
 
     def _pages_to_pdf_bytes(self, pages):
+        # The temp dir holds full-size renders of CUSTOMER ID pages; it
+        # must not be left behind in %TEMP% (audit 3.4). Bytes are fully
+        # materialized by img2pdf.convert before we clean up.
         tmpdir = tempfile.mkdtemp()
-        paths = []
-        for i, p in enumerate(pages):
-            fp = os.path.join(tmpdir, f'page{i + 1}.jpg')
-            p.save(fp, quality=95, dpi=(self.dpi, self.dpi))
-            paths.append(fp)
-        return img2pdf.convert(*paths)
+        try:
+            paths = []
+            for i, p in enumerate(pages):
+                fp = os.path.join(tmpdir, f'page{i + 1}.jpg')
+                p.save(fp, quality=95, dpi=(self.dpi, self.dpi))
+                paths.append(fp)
+            return img2pdf.convert(*paths)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def _export_pages_pdf(self):
         if getattr(self, 'layout_pages', None):
             self.render_pages()
         pages = getattr(self, 'batch_pages', None) or self.compose_a4_pages()
         if not pages:
+            messagebox.showwarning('提示', '还没有可导出的拼版，请先处理证件')
             return
         folder = filedialog.askdirectory(title='选择保存文件夹', initialdir=self._get_last_dir() or None)
         if not folder:
             return
         self._remember_dir(folder)
-        with open(os.path.join(folder, '证件拼版.pdf'), 'wb') as f:
-            f.write(self._pages_to_pdf_bytes(pages))
+        try:
+            with open(os.path.join(folder, '证件拼版.pdf'), 'wb') as f:
+                f.write(self._pages_to_pdf_bytes(pages))
+        except Exception as e:
+            messagebox.showerror('导出失败', f'PDF 没能保存：{e}')
+            return
         messagebox.showinfo('完成', '已保存 证件拼版.pdf 到所选文件夹')
 
     def _export_pages_pdf_single(self):
@@ -2350,25 +2697,40 @@ class IDCardProcessor:
             self.render_pages()
         pages = getattr(self, 'batch_pages', None) or self.compose_a4_pages()
         if not pages:
+            messagebox.showwarning('提示', '还没有可导出的拼版，请先处理证件')
             return
         folder = filedialog.askdirectory(title='选择保存文件夹', initialdir=self._get_last_dir() or None)
         if not folder:
             return
         self._remember_dir(folder)
+        saved, failed = 0, []
         for i, p in enumerate(pages):
-            with open(os.path.join(folder, f'证件拼版_{i + 1:02d}.pdf'), 'wb') as f:
-                f.write(self._pages_to_pdf_bytes([p]))
-        messagebox.showinfo('完成', f'已保存 {len(pages)} 个单页 PDF 到所选文件夹')
+            try:
+                with open(os.path.join(folder, f'证件拼版_{i + 1:02d}.pdf'), 'wb') as f:
+                    f.write(self._pages_to_pdf_bytes([p]))
+                saved += 1
+            except Exception as e:
+                failed.append(f'第{i + 1}页：{e}')
+        if failed:
+            messagebox.showerror('导出不完整',
+                                 f'已保存 {saved} 个，以下 {len(failed)} 个保存失败：\n' + '\n'.join(failed[:5]))
+        elif saved:
+            messagebox.showinfo('完成', f'已保存 {saved} 个单页 PDF 到所选文件夹')
 
     def _print_pages(self):
         if getattr(self, 'layout_pages', None):
             self.render_pages()
         pages = getattr(self, 'batch_pages', None) or self.compose_a4_pages()
         if not pages:
+            messagebox.showwarning('提示', '还没有可打印的拼版，请先处理证件')
             return
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-            tmp.write(self._pages_to_pdf_bytes(pages))
-            temp_file = tmp.name
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+                tmp.write(self._pages_to_pdf_bytes(pages))
+                temp_file = tmp.name
+        except Exception as e:
+            messagebox.showerror('打印失败', f'生成打印文件失败：{e}')
+            return
         try:
             if platform.system() == 'Windows':
                 os.startfile(temp_file, 'print')
@@ -2495,10 +2857,27 @@ class IDCardProcessor:
                 image=photo, anchor=tk.CENTER
             )
     
+    def _close_mark_window(self):
+        """Close the marking window AND clear the references (audit
+        2.5). Cancel / window-X used to call destroy() directly, leaving
+        self.mark_window pointing at a dead window; the identity guard
+        in try_auto_finish then PASSED for the corpse and a late
+        detection result could finish-mark whatever image the workspace
+        held by then."""
+        win = getattr(self, 'mark_window', None)
+        self.mark_window = None
+        self.mark_canvas = None
+        self.is_marking = False
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
     def show_image_for_marking(self, side, image, file_path, existing_points=None):
         """显示图片供用户标记 - 带缩放功能"""
         if self.mark_window is not None:
-            self.mark_window.destroy()
+            self._close_mark_window()
         # 2026-11-12 fix: a marking window closed mid-adjust used to leave
         # adjust_mode/adjust_points stale; the next window then drew the
         # OLD card's quad and never showed the user's own points. Reset
@@ -2589,6 +2968,11 @@ class IDCardProcessor:
         # 控制按钮区域
         btn_frame = ttk.Frame(control_frame)
         btn_frame.pack(side=tk.RIGHT)
+        # Stable refs for the adjust-mode button surgery: it rebuilds
+        # ONLY this button row and never touches the scale row
+        # (audit 1.2/1.3).
+        self._mark_control_frame = control_frame
+        self._mark_btn_frame = btn_frame
         
         # 添加自动识别按钮
         ttk.Button(btn_frame, text="自动识别", 
@@ -2605,7 +2989,7 @@ class IDCardProcessor:
         self.finish_marking_btn.pack(side=tk.LEFT, padx=5)
         
         ttk.Button(btn_frame, text="取消", 
-                  command=self.mark_window.destroy).pack(side=tk.LEFT, padx=5)
+                  command=self._close_mark_window).pack(side=tk.LEFT, padx=5)
         
         # 创建画布框架
         canvas_frame = ttk.Frame(main_frame)
@@ -2652,7 +3036,7 @@ class IDCardProcessor:
         self.mark_window.focus_set()
         
         # 窗口关闭事件
-        self.mark_window.protocol("WM_DELETE_WINDOW", self.mark_window.destroy)
+        self.mark_window.protocol("WM_DELETE_WINDOW", self._close_mark_window)
         
         # 保存原始图片
         self.original_image = image.copy()
@@ -2752,7 +3136,8 @@ class IDCardProcessor:
 
     def ai_detect_corners(self, image):
         """AI 检测：懒加载 SCRFD 模型（exe 同目录或打包内 models 文件夹），
-        模型缺失或检测失败返回 None，由传统检测兜底。"""
+        模型缺失或检测失败返回 None（对齐原版：失败即失败，交给手动标角，
+        没有传统检测自动兜底）。"""
         try:
             detector = getattr(self, "_ai_detector", None)
             if detector is None:
@@ -2773,125 +3158,44 @@ class IDCardProcessor:
                 detector = self._ai_detector
             if not detector:
                 return None
-            img_cv = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+            img_rgb = np.array(image.convert("RGB"))
+            img_cv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
             self._ai_ran = True
             corners = detector.detect(img_cv)
             if not corners:
                 return None
-            arr = np.array(corners, dtype=np.float32)
-            h, w = img_cv.shape[:2]
-            # 2026-11-12 fix: on tight-framed photos (card edge right on the
-            # photo edge -- the common customer case) the model puts a
-            # keypoint a few px OUTSIDE the frame, and the validator then
-            # threw away the whole detection. Clamp points that are only
-            # slightly out (<=2% of the frame) back inside; a quad with a
-            # point far outside is still rejected outright.
-            _tolx, _toly = 0.02 * w, 0.02 * h
-            if (arr[:, 0] < -_tolx).any() or (arr[:, 0] > (w - 1) + _tolx).any() or \
-               (arr[:, 1] < -_toly).any() or (arr[:, 1] > (h - 1) + _toly).any():
-                return None
-            arr[:, 0] = np.clip(arr[:, 0], 0, w - 1)
-            arr[:, 1] = np.clip(arr[:, 1], 0, h - 1)
-            if not self._validate_quadrilateral(arr.copy(), h, w):
-                return None
-            # 2026-11-10: inset edges by 1.0% of card width before warping.
-            # Calibrated on synthetic ground truth: model corners overshoot
-            # ~0.9% of card width; 1.0% drives out-of-card pixels to ~0 while
-            # eating only ~10 output px of the card's blank margin per edge.
-            arr = np.array(_inset_quad([[float(x), float(y)] for x, y in arr], 0.010),
-                           dtype=np.float32)
-            return [[float(x), float(y)] for x, y in arr]
+            # Aligned with the original IDCardMerge v2.2: the decoded
+            # keypoints are used exactly as they come out -- NO
+            # out-of-frame rejection, NO 2% clamping, NO quadrilateral
+            # validator gate, NO 1.0% inset (all four were our own
+            # additions; the original performs none of them). On tight
+            # shots a point may sit a few px outside the frame; the warp
+            # consumes it as-is, exactly like the original.
+            result = [[float(x), float(y)] for x, y in corners]
+            if REFINE_CORNERS:
+                # refineCorners（原版 Detect 的紧接步骤）：只在原图上
+                # 微调已检出的四角，不做任何门槛判断；精修自身出错时
+                # 记录一行日志并原样使用未精修角，绝不让识别因此失败。
+                try:
+                    refined = _refine_corners_np(
+                        img_rgb, np.asarray(result, dtype=np.float64))
+                    refined = np.asarray(refined, dtype=np.float64)
+                    if refined.shape == (4, 2) and np.isfinite(refined).all():
+                        result = [[float(x), float(y)] for x, y in refined]
+                except Exception as _refine_err:
+                    print(f"[core] refine_corners failed, "
+                          f"using raw corners: {_refine_err!r}")
+            return result
         except Exception:
             return None
-
-    def _ai_band_crop(self, image):
-        """找截图里照片所在的横带（上下大片黑边/纯色时）：返回 (裁剪图, y偏移)，不适用返回 (None, 0)"""
-        try:
-            g = np.asarray(image.convert("L"), dtype=np.float32)
-            rs = g.std(axis=1)
-            mask = rs > 10
-            best, cur = (0, 0), None
-            for i, v in enumerate(mask):
-                if v and cur is None:
-                    cur = i
-                if (not v or i == len(mask) - 1) and cur is not None:
-                    end = i if not v else i + 1
-                    if end - cur > best[1] - best[0]:
-                        best = (cur, end)
-                    cur = None
-            h = image.height
-            if not (h * 0.12 < best[1] - best[0] < h * 0.85):
-                return None, 0
-            y0 = max(0, best[0] - 6)
-            y1 = min(h, best[1] + 6)
-            return image.crop((0, y0, image.width, y1)), y0
-        except Exception:
-            return None, 0
 
     def ai_detect_any(self, image):
-        """深度识别：全图没认出时的补救链——横带裁剪→旋转90/270→中心裁剪→分块放大。
-        每步仍走 ai_detect_corners（含四边形合理性校验）；全失败返回 None，交给手动标角。
-        AI 模型缺失时第一步后直接返回，保持传统检测兜底的原有门闩不变。"""
-        corners = self.ai_detect_corners(image)
-        if corners or not getattr(self, "_ai_ran", False):
-            return corners
-        W, H = image.size
-        import time as _time
-        _t0 = _time.time()
-        try:
-            band, y0 = self._ai_band_crop(image)
-            if band is not None:
-                c = self.ai_detect_corners(band)
-                if c:
-                    return [[x, y + y0] for x, y in c]
-        except Exception:
-            pass
-        if _time.time() - _t0 > 20:
-            return None
-        for ang in (90, 270):
-            try:
-                rot = image.rotate(ang, expand=True)
-                c = self.ai_detect_corners(rot)
-                if c:
-                    if ang == 90:
-                        return [[W - 1 - qy, qx] for qx, qy in c]
-                    return [[qy, H - 1 - qx] for qx, qy in c]
-            except Exception:
-                pass
-        if _time.time() - _t0 > 20:
-            return None
-        try:
-            cw, ch = int(W * 0.79), int(H * 0.79)
-            x0, y0 = (W - cw) // 2, (H - ch) // 2
-            c = self.ai_detect_corners(image.crop((x0, y0, x0 + cw, y0 + ch)))
-            if c:
-                return [[x + x0, y + y0] for x, y in c]
-        except Exception:
-            pass
-        if _time.time() - _t0 > 20:
-            return None
-        try:
-            tw, th = int(W * 0.62), int(H * 0.62)
-            fallback = None
-            for (tx, ty) in [(0, 0), (W - tw, 0), (0, H - th), (W - tw, H - th), ((W - tw) // 2, (H - th) // 2)]:
-                if _time.time() - _t0 > 25:
-                    break
-                c = self.ai_detect_corners(image.crop((tx, ty, tx + tw, ty + th)))
-                if not c:
-                    continue
-                pts = [[x + tx, y + ty] for x, y in c]
-                if not _quad_plausible_for_frame(pts, W, H):
-                    continue
-                touches = any(x < tw * 0.015 or x > tw * 0.985 or y < th * 0.015 or y > th * 0.985 for x, y in c)
-                if not touches:
-                    return pts
-                if fallback is None:
-                    fallback = pts
-            if fallback:
-                return fallback
-        except Exception:
-            pass
-        return None
+        """识别入口（对齐原版 IDCardMerge v2.2）：只做一次全图 AI 识别。
+        原版没有任何第二机会——没有横带裁剪、没有旋转重试、没有中心
+        裁剪、没有分块放大、没有传统轮廓兜底；我们自创的那套补救链已
+        整体拆除（分块阶段曾把卡内横带误报成整卡，即"半张卡"事故）。
+        认不出就如实返回 None，交给手动标角。"""
+        return self.ai_detect_corners(image)
 
     def _seed_preset_box(self, side):
         """Auto-detect failed: pre-place a draggable quad (12% image inset)
@@ -3174,19 +3478,22 @@ class IDCardProcessor:
                                      text="调整模式：拖动四个角点调整位置，然后点击'完成调整'或按回车键",
                                      fill="yellow", font=("Arial", 12, "bold"))
         
-        # 修改按钮 - 先移除原有按钮
-        for widget in self.mark_window.winfo_children():
-            if isinstance(widget, ttk.Frame):
-                for child in widget.winfo_children():
-                    if isinstance(child, ttk.Frame):
-                        for btn in child.winfo_children():
-                            if isinstance(btn, (ttk.Button, tk.Button)):
-                                btn.destroy()
-        
-        # 重新添加调整模式的按钮
-        control_frame = self.mark_window.winfo_children()[0].winfo_children()[0]
+        # 修改按钮：只销毁按钮行本身。旧实现按层级遍历找 Button，
+        # 按钮实际住在第四层、一个都没拆掉，新旧两排并存，点旧的
+        # "完成标记"会用调整前的角点处理、把调整无声丢弃（审计 1.2）。
+        if getattr(self, '_mark_btn_frame', None) is not None:
+            try:
+                self._mark_btn_frame.destroy()
+            except Exception:
+                pass
+        # The old 完成标记 button died with its frame; clear the ref or
+        # canvas redraws (display_image_on_canvas) will config() a dead
+        # widget and raise TclError. finish/cancel_adjust recreate it.
+        self.finish_marking_btn = None
+        control_frame = self._mark_control_frame
         btn_frame = ttk.Frame(control_frame)
         btn_frame.pack(side=tk.RIGHT)
+        self._mark_btn_frame = btn_frame
         
         # 创建完成调整按钮
         self.finish_adjust_btn = tk.Button(btn_frame, text="完成调整",
@@ -3263,7 +3570,10 @@ class IDCardProcessor:
         
         # 检查是否点击了点
         for i in range(4):
-            point_id = self.mark_canvas.find_withtag(f"point_{i}")[0]
+            _ids = self.mark_canvas.find_withtag(f"point_{i}")
+            if not _ids:
+                continue
+            point_id = _ids[0]
             coords = self.mark_canvas.coords(point_id)
             
             # 检查点击是否在点内
@@ -3325,15 +3635,18 @@ class IDCardProcessor:
         self.mark_canvas.bind("<B1-Motion>", self.drag_mark_point)
         self.mark_canvas.bind("<ButtonRelease-1>", self.end_drag_mark_point)
         
-        # 更新按钮
-        control_frame = self.mark_window.winfo_children()[0].winfo_children()[0]
-        for widget in control_frame.winfo_children():
-            if isinstance(widget, ttk.Frame):
-                widget.destroy()
-        
-        # 重新添加正常模式的按钮
+        # 更新按钮：只重建按钮行。旧实现销毁 control_frame 下所有
+        # Frame，把缩放滑块、"适窗"钮、百分比标签所在的 scale_frame
+        # 一并拆掉且不再重建--用过一次微调它们就永久消失（审计 1.3）。
+        if getattr(self, '_mark_btn_frame', None) is not None:
+            try:
+                self._mark_btn_frame.destroy()
+            except Exception:
+                pass
+        control_frame = self._mark_control_frame
         btn_frame = ttk.Frame(control_frame)
         btn_frame.pack(side=tk.RIGHT)
+        self._mark_btn_frame = btn_frame
         
         ttk.Button(btn_frame, text="自动识别", 
                   command=lambda: self.auto_detect_corners(side)).pack(side=tk.LEFT, padx=5)
@@ -3349,7 +3662,7 @@ class IDCardProcessor:
         self.finish_marking_btn.pack(side=tk.LEFT, padx=5)
         
         ttk.Button(btn_frame, text="取消", 
-                  command=self.mark_window.destroy).pack(side=tk.LEFT, padx=5)
+                  command=self._close_mark_window).pack(side=tk.LEFT, padx=5)
         
         # 重新绑定键盘回车事件
         self.mark_window.unbind("<Return>")
@@ -3376,15 +3689,18 @@ class IDCardProcessor:
         # 重新显示原始点
         self.display_image_on_canvas()
         
-        # 更新按钮
-        control_frame = self.mark_window.winfo_children()[0].winfo_children()[0]
-        for widget in control_frame.winfo_children():
-            if isinstance(widget, ttk.Frame):
-                widget.destroy()
-        
-        # 重新添加正常模式的按钮
+        # 更新按钮：只重建按钮行。旧实现销毁 control_frame 下所有
+        # Frame，把缩放滑块、"适窗"钮、百分比标签所在的 scale_frame
+        # 一并拆掉且不再重建--用过一次微调它们就永久消失（审计 1.3）。
+        if getattr(self, '_mark_btn_frame', None) is not None:
+            try:
+                self._mark_btn_frame.destroy()
+            except Exception:
+                pass
+        control_frame = self._mark_control_frame
         btn_frame = ttk.Frame(control_frame)
         btn_frame.pack(side=tk.RIGHT)
+        self._mark_btn_frame = btn_frame
         
         ttk.Button(btn_frame, text="自动识别", 
                   command=lambda: self.auto_detect_corners(side)).pack(side=tk.LEFT, padx=5)
@@ -3400,7 +3716,7 @@ class IDCardProcessor:
         self.finish_marking_btn.pack(side=tk.LEFT, padx=5)
         
         ttk.Button(btn_frame, text="取消", 
-                  command=self.mark_window.destroy).pack(side=tk.LEFT, padx=5)
+                  command=self._close_mark_window).pack(side=tk.LEFT, padx=5)
         
         # 重新绑定键盘回车事件
         self.mark_window.unbind("<Return>")
@@ -3912,10 +4228,8 @@ class IDCardProcessor:
             # 在A4区域显示处理结果
             self.show_processed_result(side, processed_with_rounded)
             
-            # 关闭标记窗口
-            if self.mark_window:
-                self.mark_window.destroy()
-                self.mark_window = None
+            # 关闭标记窗口（并清引用，见 _close_mark_window）
+            self._close_mark_window()
             
             self.update_status(f"{side_name}处理完成")
             
@@ -4891,10 +5205,8 @@ class IDCardProcessor:
         self.preview_click_areas = {}
         self.preview_images = {}
         
-        # 关闭标记窗口
-        if self.mark_window:
-            self.mark_window.destroy()
-            self.mark_window = None
+        # 关闭标记窗口（并清引用，见 _close_mark_window）
+        self._close_mark_window()
         
         # 关闭文本编辑窗口
         if self.text_window:
