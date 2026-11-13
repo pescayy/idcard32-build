@@ -9,7 +9,8 @@
   core._pages_to_pdf_bytes：那是身份证 A4 页、按 core 的 300dpi
   盖章，会把 2339×1654 印成非 A4 尺寸），页面即 A4 297×210mm；
 - 自动流程对不上纸边（fallback / no_quad）→ 手动标角窗（复用标角画布）
-  框纸面四角后拉正调光；竖拍照片可用「旋转90°」转正后重处理。
+  框纸面四角后拉正（与自动路同口径：只动几何、不调光，PS 逻辑）；
+  竖拍照片可用「旋转90°」转正后重处理。
 """
 import os, sys, threading, tempfile, shutil
 import numpy as np
@@ -29,7 +30,6 @@ from app_qt import pil_to_qimage, BLUE, PAGE_BG, report_saved
 from mark_dialog import MarkCanvas
 from lic_pipeline import process_license, order_quad, OUT_A4, DEFAULT_MODEL
 from bigdoc import dark_border_fraction
-from lic_enhance import enhance_license
 
 DARK_WARN = 0.08   # 任一边黑边占比超过此值 → 提示疑似黑边
 
@@ -143,6 +143,10 @@ class LicenseDialog(QDialog):
         self.pdf_b.setStyleSheet(_btn_style())
         self.pdf_b.clicked.connect(self.export_pdf)
         top.addWidget(self.pdf_b)
+        self.print_b = QPushButton('打印')
+        self.print_b.setStyleSheet(_btn_style())
+        self.print_b.clicked.connect(self.print_license)
+        top.addWidget(self.print_b)
         lay.addLayout(top)
 
         self.view = QLabel('点「导入执照图」选择营业执照照片或电子档图片')
@@ -181,6 +185,7 @@ class LicenseDialog(QDialog):
         self.rotate_b.setEnabled(has_src)
         self.jpg_b.setEnabled(self.warped is not None)
         self.pdf_b.setEnabled(self.warped is not None)
+        self.print_b.setEnabled(self.warped is not None)
 
     def _show_bgr(self, bgr):
         pil = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
@@ -224,7 +229,7 @@ class LicenseDialog(QDialog):
         if b:
             self.info.setText('正在处理，请稍候…')
             for w in (self.import_b, self.mark_b, self.rotate_b,
-                      self.jpg_b, self.pdf_b):
+                      self.jpg_b, self.pdf_b, self.print_b):
                 w.setEnabled(False)
         else:
             self.import_b.setEnabled(True)
@@ -326,7 +331,11 @@ class LicenseDialog(QDialog):
                        np.float32)
         M = cv2.getPerspectiveTransform(np.asarray(quad, np.float32), dst)
         warped = cv2.warpPerspective(self.src_bgr, M, (W, H))
-        warped, _einfo = enhance_license(warped)
+        # PS 逻辑（2026-11-14 修复）：手动路只许替换角点重走几何段，
+        # 颜色与自动路逐项一致——自动路默认 tone=False 不跑任何颜色
+        # 级，手动路此前却无条件调 enhance_license（LIC_ENH 提亮去
+        # 阴影），确认标角后出图整体发飘、与自动路不是一个色。已删：
+        # LIC_ENH/dehaze 在两条路上都只许显式开启，默认关。
         return warped
 
     # ---------- export ----------
@@ -384,6 +393,34 @@ class LicenseDialog(QDialog):
             QMessageBox.critical(self, '错误', f'导出失败：{e}')
             return
         self._after_save(path)
+
+    # ---------- print ----------
+    def print_license(self):
+        """执照打印：A4 横版整页直打，页面与导出 PDF 同口径——导出
+        PDF 是 img2pdf 把 2339×1654@200dpi 定页成整页 A4（297×210mm、
+        图铺满整页无边距），打印这边同设 A4 横版＋整页（fullPage，
+        pageRect 即纸面），把同一张出图铺满整页绘制，尺寸与内容
+        范围与 PDF 一致。"""
+        if self.warped is None:
+            return
+        from PySide2.QtPrintSupport import QPrinter, QPrintDialog
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setPageSize(QPrinter.A4)
+        printer.setOrientation(QPrinter.Landscape)
+        printer.setFullPage(True)
+        dlg = QPrintDialog(printer, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        self._paint_license(printer)
+        self.win.set_status('营业执照打印任务已发送')
+
+    def _paint_license(self, printer):
+        """把当前出图铺满打印机整页绘制（打印与打印到 PDF 共用，
+        便于无真机时按同一路径验页面尺寸与不裁切）。"""
+        from PySide2.QtGui import QPainter
+        painter = QPainter(printer)
+        painter.drawImage(printer.pageRect(), pil_to_qimage(self._pil()))
+        painter.end()
 
     def _license_pdf_bytes(self):
         """执照 PDF：2339×1654 以 200dpi 定页 = A4 横版 297×210mm。

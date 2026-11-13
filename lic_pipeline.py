@@ -72,9 +72,11 @@ from bigdoc import expand_to_paper_edge, converge_corners, \
     dark_border_fraction, clamp_quad_to_frame, tighten_edges, \
     envelope_quad, is_flat_scan, A4_RATIO, refine_corners_local, \
     edge_station_bounds, framing_ink_check, guard_quad_to_ink
-from bigdoc import _robustify_bounds
+from bigdoc import _robustify_bounds, _edge_geometry
 from lic_enhance import enhance_license
 from lic_dehaze import dehaze_license
+from lic_wedgecut import crop_repave_fill
+from lic_edge_refine import refine_frame_edges
 from lic_undistort import undistort_license, gate_max_dev_px
 
 # Single output spec (2026-11-12 canvas ruling, measured at Qing's
@@ -99,23 +101,65 @@ def order_quad(pts):
                      p[np.argmax(s)], p[np.argmax(d)]])
 
 
-def _quad_sane(quad):
+def _quad_sane(quad, shape_hw=None):
     """Non-raising twin of bigdoc._validate_quad: True only for a finite
-    4x2 quad with non-zero area. Degenerate detector output (a zero-area
-    SCRFD quad reached the pipeline in the 2026-11-11 douyin batch) is
-    filtered with this instead of being allowed to raise downstream."""
+    4x2 quad whose corners are pairwise distinct, which does not cross
+    itself (bowtie), and -- when the source shape is given -- whose true
+    shoelace area and shortest edge clear floors set far below the
+    smallest real licence in the gold set. Degenerate detector output
+    (a zero-area SCRFD quad reached the pipeline in the 2026-11-11
+    douyin batch) is filtered with this instead of being allowed to
+    raise downstream.
+
+    The 2026-11-14 tightening: the old test summed two cross products
+    of corner-difference vectors, which is not a polygon area -- a
+    quad carrying the same corner twice ([264,443] twice, the fault
+    quad that produced a blank output with status ok) keeps both
+    terms non-zero and walked straight through. Floors, from the
+    31-sample gold set (frame quads: shortest edge 487.6 px, smallest
+    area fraction 0.218 of frame): area >= 1% of frame and shortest
+    edge >= 1% of frame diagonal sit >15x below the worst gold
+    sample, so no real licence can trip them; degenerate output
+    (repeated points, slivers, bowties) fails on every count."""
     try:
         q = np.asarray(quad, dtype=float)
     except Exception:
         return False
     if q.shape != (4, 2) or not np.all(np.isfinite(q)):
         return False
+    # Pairwise distinctness: a repeated or near-repeated corner
+    # collapses the quad regardless of scale.
+    pair_d = [float(np.hypot(*(q[i] - q[j])))
+              for i in range(4) for j in range(i + 1, 4)]
+    if min(pair_d) < 2.0:
+        return False
+    # Self-intersection: opposite edges of an ordered quad must not
+    # properly cross.
+    def _orient(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - \
+            (b[1] - a[1]) * (c[0] - a[0])
 
-    def _cross2(a, b):
-        return float(a[0] * b[1] - a[1] * b[0])
-    area2 = abs(_cross2(q[1] - q[0], q[3] - q[0])) + \
-        abs(_cross2(q[2] - q[1], q[0] - q[1]))
-    return area2 > 0
+    def _seg_cross(a, b, c, d):
+        d1 = _orient(c, d, a)
+        d2 = _orient(c, d, b)
+        d3 = _orient(a, b, c)
+        d4 = _orient(a, b, d)
+        return ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0))
+    if _seg_cross(q[0], q[1], q[2], q[3]) or \
+            _seg_cross(q[1], q[2], q[3], q[0]):
+        return False
+    if shape_hw is not None:
+        H, W = float(shape_hw[0]), float(shape_hw[1])
+        area = 0.5 * abs(float(
+            np.dot(q[:, 0], np.roll(q[:, 1], -1))
+            - np.dot(q[:, 1], np.roll(q[:, 0], -1))))
+        if area < 0.01 * H * W:
+            return False
+        edges = [float(np.hypot(*(q[i] - q[(i + 1) % 4])))
+                 for i in range(4)]
+        if min(edges) < 0.01 * float(np.hypot(W, H)):
+            return False
+    return True
 
 
 def contour_detect(bgr):
@@ -143,25 +187,43 @@ def _flatten_illumination(bgr):
     return cv2.cvtColor(flat, cv2.COLOR_GRAY2BGR)
 
 
-def detect_license_quads(bgr, detector=None):
+def detect_license_quads(bgr, detector=None, info=None):
     """Candidate frame quads (4x2 TL,TR,BR,BL) in priority order, each with
     its route name. SCRFD first, then contour, then contour on the
-    illumination-flattened image. May be empty."""
+    illumination-flattened image. May be empty.
+
+    When a dict is passed as info, detection degradation is recorded
+    on it instead of vanishing (2026-11-14 hardening: a bare except
+    here once swallowed a detector broadcast error and the pipeline
+    silently delivered a garbage contour output with status ok):
+    info["scrfd_error"] holds the SCRFD exception text, and
+    info["detect_degraded"] is set True whenever a detector was
+    supplied but produced no usable SCRFD candidate (exception, miss,
+    or a quad the sanity gate rejected) and the contour routes had to
+    carry the photo. The return value is unchanged."""
     out = []
+    scrfd_seen = False
 
     def _add(q, route):
+        nonlocal scrfd_seen
         if q is None:
             return
         oq = order_quad(q)
-        if _quad_sane(oq):
+        if _quad_sane(oq, bgr.shape[:2]):
             out.append((oq, route))
+            if route == "scrfd":
+                scrfd_seen = True
 
     if detector is not None:
         try:
             q = detector.detect(bgr)
-        except Exception:
+        except Exception as exc:
             q = None
+            if info is not None:
+                info["scrfd_error"] = f"{type(exc).__name__}: {exc}"
         _add(q, "scrfd")
+        if info is not None and not scrfd_seen:
+            info["detect_degraded"] = True
     _add(contour_detect(bgr), "contour")
     _add(contour_detect(_flatten_illumination(bgr)), "contour_flat")
     return out
@@ -290,12 +352,77 @@ def _quad_outside_frame(shape_hw, quad):
                 or (q[:, 1] < 0.0).any() or (q[:, 1] > H - 1).any())
 
 
+# Delivery configuration for the framing-refinement stages
+# (FINAL-CONFIG, 2026-11-14): both stages OFF in the shipped
+# pipeline. Neither refinement beat the no-refinement production
+# baseline on the 31-image gold set -- per-edge rebuild (v1):
+# corner mean 43.2 vs baseline 42.7; joint rectangle fit
+# (SPEC-FIT): 47.2 and impurity 256,065 vs baseline 130,526 --
+# because the internal evidence cost is not a reliable proxy for
+# the gold truth and the downstream framing vote is non-monotone
+# in quad quality (SPEC-FIT-RUN.md SS1.4). The code stays in
+# lic_edge_refine for a future round; these constants are the
+# single switch point. The rule-slimming changes of the same
+# round (single spec source in lic_wedgecut, full-depth wedge
+# cut, fill_over_cap_warning, gradient fill, wedge QR guard)
+# are NOT gated by these switches and stay in effect.
+EDGE_REFINE_EDGE_STAGE = False
+EDGE_REFINE_JOINT_STAGE = False
+
+
 def _process_with_cands(bgr, cands, detector, out_size, tone):
     """The pipeline proper, given pre-detected candidate quads."""
     # Try each candidate quad until one reconciles with the A4 paper edge.
     paper, info, route = None, {}, cands[0][1]
     frame_used = cands[0][0]
     expand_errors = []
+    # Edge refinement (2026-11-14, lic_edge_refine): a detector quad's
+    # corners are point estimates -- one shadow-dragged corner tilts
+    # its whole edge line, and the slant survives every later stage
+    # because they all trust the frame. Re-measure each SCRFD edge
+    # along its full length on the original pixels and rebuild the
+    # corners as line intersections before the paper expansion
+    # consumes the quad; edges without trustworthy evidence keep the
+    # detector line, flat scans (corners exact by construction) skip
+    # the stage, and any failure leaves the candidate untouched.
+    # DELIVERY CONFIG: both stages are switched OFF (see the
+    # EDGE_REFINE_* constants above) -- the call below then returns
+    # every candidate untouched and the detector quads flow through
+    # exactly as in the HARDEN+WEDGE production baseline; each
+    # candidate's info still records the disabled state.
+    edge_refine_infos = []
+    refined_cands = []
+    for quad, r in cands:
+        if r != "scrfd":
+            refined_cands.append((quad, r))
+            continue
+        try:
+            if is_flat_scan(bgr, quad):
+                edge_refine_infos.append(
+                    {"route": r, "applied": False,
+                     "reason": "flat_scan_gate"})
+                refined_cands.append((quad, r))
+                continue
+            q2, rinfo = refine_frame_edges(
+                bgr, quad,
+                edge_stage=EDGE_REFINE_EDGE_STAGE,
+                joint_stage=EDGE_REFINE_JOINT_STAGE)
+            if rinfo.get("applied") and not _quad_sane(q2, bgr.shape[:2]):
+                rinfo = dict(rinfo)
+                rinfo["applied"] = False
+                rinfo["reason"] = "refined_insane"
+                q2 = quad
+        except Exception as exc:
+            edge_refine_infos.append(
+                {"route": r, "applied": False,
+                 "error": f"{type(exc).__name__}: {exc}"})
+            refined_cands.append((quad, r))
+            continue
+        rinfo = dict(rinfo)
+        rinfo["route"] = r
+        edge_refine_infos.append(rinfo)
+        refined_cands.append((q2, r))
+    cands = refined_cands
     for quad, r in cands:
         try:
             p_try, i_try = expand_to_paper_edge(bgr, quad)
@@ -305,7 +432,7 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
             expand_errors.append(f"{r}: {type(exc).__name__}: {exc}")
             continue
         info = i_try
-        if p_try is not None and _quad_sane(p_try):
+        if p_try is not None and _quad_sane(p_try, bgr.shape[:2]):
             paper, route, frame_used = p_try, r, quad
             break
         if p_try is not None:
@@ -325,6 +452,8 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
         info = dict(info)
         info["expand_fallback"] = True
 
+    info = dict(info)
+    info["edge_refine"] = edge_refine_infos
     try:
         paper2, cinfo = converge_corners(bgr, paper)
     except Exception as exc:
@@ -338,6 +467,11 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
     info["converge_info"] = cinfo
     warp_src = bgr
     warp_quad = paper2
+    # Wedge-cut stage bookkeeping (wired 2026-11-14): the quad the
+    # delivered warp was sampled from, and the framing block's ink
+    # bounds (None when the framing block never ran).
+    stage_quad = None
+    bounds_r = None
 
     flat = bool(info.get("flat_scan"))
     if fallback is None and not flat:
@@ -388,10 +522,18 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
         info["frame_clamp"] = fc_info
         te_q, te_info = tighten_edges(bgr, fc_q, frame_used)
         info["tighten"] = te_info
-        # The envelope's default target margins (250/370 output px)
-        # are physical sizes -- 21mm / 31mm on the old 300dpi canvas.
-        # Scale them with the canvas so the framed licence keeps the
-        # same physical margins at 200dpi (~167 / ~247 px).
+        # The envelope's target margins stay the physical sizes
+        # (250/370 output px = 21mm / 31mm on the old 300dpi
+        # canvas, scaled with the canvas): the envelope is a
+        # candidate GENERATOR working on the photo's real paper,
+        # and the electronic standard is enforced at exactly one
+        # place -- the wedge stage's repaste (SPEC-FIT audit
+        # disposition). A SPEC-FIT trial retargeted the envelope
+        # at the standard's pair means (119/166); measured on the
+        # 31 gold set it cost +1.4 px of global corner mean (four
+        # envelope images +4..+11) for no margin benefit the
+        # repaste does not already deliver, so it was reverted
+        # the same round -- see SPEC-FIT-RUN.md.
         m_lr = 250.0 * out_w / 3508.0
         m_tb = 370.0 * out_h / 2480.0
         env_q, env_info = envelope_quad(bgr, frame_used, out_size,
@@ -540,6 +682,7 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
         info["framing"] = {"choice": best[1], "scores": scores}
         paper2 = best[2]
         warped = best[3]
+        stage_quad = paper2
 
     if warped is None:
         if _quad_outside_frame(warp_src.shape[:2], warp_quad):
@@ -555,6 +698,83 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
         M = cv2.getPerspectiveTransform(warp_quad.astype(np.float32),
                                         dst)
         warped = cv2.warpPerspective(warp_src, M, (W, H))
+        stage_quad = warp_quad
+
+    # Crop + repaste + gradient-fill stage (lic_wedgecut, ying's
+    # per-edge rule 2026-11-13; prototype gold-set verdict: baseline
+    # four metrics zero drift, clutter total -27.9%, zero images
+    # worse -- wired 2026-11-14). Runs on the homographic warp,
+    # BEFORE the TPS arm below, so its frame guard can use exact
+    # warp geometry: the pipeline's frame quad mapped through the
+    # same homography, plus the station-measured ink reach the
+    # framing guards already computed (rescaled into canvas px at
+    # each edge's midpoint). Per edge it crops the output's clutter
+    # wedge at the full measured depth (the geometric frame guard
+    # is the only stop), repastes onto the standard canvas with
+    # the frame centred on the electronic standard's position, and
+    # fills the gaps by extending the adjacent paper edge's own
+    # colours outward. Flat scans are hard-gated out
+    # (pixel-faithful originals); a frame edge mapped outside the
+    # canvas refuses inside lic_wedgecut and the warp passes
+    # through unchanged. An over-cap fill no longer moves the
+    # paste there: it is recorded as an explicit warning inside
+    # lic_wedgecut (fill_over_cap_warning), because it means the
+    # framing quad is probably off (SPEC-FIT round).
+    # paper_quad is deliberately NOT modified: the stage lives
+    # purely in output space.
+    if flat:
+        info["wedge_cut"] = {"applied": False,
+                             "reason": "flat_scan_gate"}
+    elif stage_quad is None:
+        info["wedge_cut"] = {"applied": False,
+                             "reason": "no_warp_quad"}
+    else:
+        try:
+            _dst = np.array([[0, 0], [out_size[0] - 1, 0],
+                             [out_size[0] - 1, out_size[1] - 1],
+                             [0, out_size[1] - 1]], np.float32)
+            _M = cv2.getPerspectiveTransform(
+                stage_quad.astype(np.float32), _dst)
+            _frame_out = cv2.perspectiveTransform(
+                frame_used.astype(np.float32).reshape(4, 1, 2),
+                _M).reshape(4, 2)
+            _reach = None
+            if bounds_r is not None:
+                _ink_r = bounds_r[0]
+                _fgeo = _edge_geometry(frame_used)
+                _reach = []
+                for _i in range(4):
+                    _a, _b, _n, _mid = _fgeo[_i]
+                    _r_src = float(np.max(_ink_r[_i])) \
+                        if len(_ink_r[_i]) else 0.0
+                    _p_out = cv2.perspectiveTransform(
+                        np.array([[_mid + _n * _r_src]], np.float32),
+                        _M)[0, 0]
+                    _m_out = cv2.perspectiveTransform(
+                        np.array([[_mid]], np.float32), _M)[0, 0]
+                    _reach.append(float(np.hypot(*(_p_out - _m_out))))
+            _qr_before = _qr_readable(warped)
+            _w2, winfo = crop_repave_fill(warped, _frame_out,
+                                          _reach)
+            if _qr_before and winfo.get("applied") \
+                    and not _qr_readable(_w2):
+                # Self-verification, the TPS arm's house pattern:
+                # this stage exists to clean margins, and a crop +
+                # translation that costs a previously readable QR
+                # its decode (a marginal code flips on sampling
+                # phase alone -- measured: a 6 px shift flipped
+                # Image-14-06-14 both ways) has traded content for
+                # cosmetics. Keep the pre-stage warp and SAY so.
+                winfo = dict(winfo)
+                winfo["applied"] = False
+                winfo["accepted"] = False
+                winfo["reverted_qr_loss"] = True
+            else:
+                warped = _w2
+        except Exception as exc:
+            winfo = {"applied": False,
+                     "error": f"{type(exc).__name__}: {exc}"}
+        info["wedge_cut"] = winfo
 
     # TPS dewarp (lic_undistort), photo route only. Flat scans are
     # hard-gated out above all: they are pixel-faithful originals and
@@ -628,6 +848,9 @@ def _process_license_impl(bgr, detector=None, out_size=OUT_A4,
         the correction (the bow is still in the output; UI should say
         so or offer manual marking, not pretend otherwise)
       info:   expand/converge/envelope/enhance/dark-border diagnostics;
+        info["scrfd_error"] / info["detect_degraded"] are present when
+        the SCRFD detector threw or produced no usable candidate and
+        the contour routes carried the photo (2026-11-14 hardening);
         info["autorotate"] is present when a sideways source was
         auto-rotated (chosen direction + trigger evidence);
         info["dewarp"] carries the TPS arm's verdict on photo routes
@@ -638,12 +861,28 @@ def _process_license_impl(bgr, detector=None, out_size=OUT_A4,
         from core import CardDetectorAI
         detector = CardDetectorAI(model_path or DEFAULT_MODEL)
 
-    cands = detect_license_quads(bgr, detector)
+    det_info = {}
+    cands = detect_license_quads(bgr, detector, det_info)
+
+    def _with_det_info(res):
+        """Merge the detection trace (scrfd_error / detect_degraded)
+        under the result's own info, so a photo carried by the contour
+        routes or the frame-quad fallback is visibly degraded in the
+        result instead of looking like a clean SCRFD success."""
+        if not det_info:
+            return res
+        info = dict(det_info)
+        info.update(res["info"])
+        res = dict(res)
+        res["info"] = info
+        return res
+
     if not cands:
-        return {"status": "no_quad", "route": None, "flat": False,
-                "warped": None, "paper_quad": None, "fallback": None,
-                "dewarp_skipped_high_bow": False,
-                "info": {"reason": "no frame quad detected"}}
+        return _with_det_info(
+            {"status": "no_quad", "route": None, "flat": False,
+             "warped": None, "paper_quad": None, "fallback": None,
+             "dewarp_skipped_high_bow": False,
+             "info": {"reason": "no frame quad detected"}})
 
     if _depth == 0 and not is_flat_scan(bgr, cands[0][0]):
         trig = _transpose_evidence(cands[0][0])
@@ -678,7 +917,7 @@ def _process_license_impl(bgr, detector=None, out_size=OUT_A4,
                             "scores": {k: list(v) for k, v
                                        in scores.items()}}
                         base["info"] = info
-                        return base
+                        return _with_det_info(base)
                 rr = dict(rr)
                 if rr["paper_quad"] is not None:
                     rr["paper_quad"] = _unrotate_quad(rr["paper_quad"],
@@ -691,7 +930,8 @@ def _process_license_impl(bgr, detector=None, out_size=OUT_A4,
                 return rr
             # both rotations failed: fall through to the original path
 
-    return _process_with_cands(bgr, cands, detector, out_size, tone)
+    return _with_det_info(_process_with_cands(bgr, cands, detector,
+                                              out_size, tone))
 
 
 def process_license(bgr, detector=None, out_size=OUT_A4, model_path=None,

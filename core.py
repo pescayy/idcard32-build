@@ -1,7 +1,7 @@
 # IDCardMuse core: UI-free processing pipeline extracted verbatim from
 # IDCardProcessor_ort.py (1110 fix build). Logic identical to the Tk app;
 # only tk variable reads were replaced with plain attributes.
-import os, sys, glob, gc, io, json, math, base64, tempfile, time, shutil
+import os, sys, glob, gc, io, json, math, base64, tempfile, time, shutil, threading
 import numpy as np
 import cv2
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter, ImageOps
@@ -32,6 +32,18 @@ def _order_points_np(pts):
     rect[1] = pts[np.argmin(diff)]
     rect[3] = pts[np.argmax(diff)]
     return rect
+
+def _log_detect_error(msg):
+    """检测侧异常留痕（与 ocr_qt.log_ocr_error 同口径）：写到程序旁边的
+    detect_error.log，避免模型缺失/损坏时窗口版无声降级、用户无从知晓。"""
+    try:
+        base = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) \
+            else os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(base, 'detect_error.log'), 'a', encoding='utf-8') as f:
+            f.write(time.strftime('%Y-%m-%d %H:%M:%S') + ' ' + str(msg) + '\n')
+    except Exception:
+        pass
+
 
 class CardDetectorAI:
     """SCRFD 证件关键点检测（算法摘自云星球 V7.3.1，经三方对测验证）。
@@ -107,17 +119,27 @@ class CardDetectorAI:
                                      (127.5, 127.5, 127.5), swapRB=True)
         if self._sess is not None:
             raw = self._sess.run(None, {self._iname: blob})
-            groups = {1: [], 4: [], 8: []}
-            for a in raw:
-                groups[a.shape[2]].append((a.shape[1], a))
-            for k in groups:
-                groups[k] = [a for _, a in sorted(groups[k], key=lambda t: -t[0])]
-            outs = []
-            for i in range(3):
-                outs += [groups[1][i], groups[4][i], groups[8][i]]
         else:
             self._cv_net.setInput(blob)
-            outs = self._cv_net.forward(self._cv_net.getUnconnectedOutLayersNames())
+            raw = self._cv_net.forward(self._cv_net.getUnconnectedOutLayersNames())
+        # Both runtimes return the same 9 SCRFD heads, but NOT in the
+        # same order: ORT hands them back interleaved per FPN level,
+        # OpenCV DNN grouped by type (all scores, then all bboxes,
+        # then all keypoints -- measured on the fallback path,
+        # 2026-11-14). Classify by channel count (1=score, 4=bbox,
+        # 8=kps), sort each class by row count descending (stride
+        # 8, 16, 32) and interleave: the layout the parse loop below
+        # consumes. Feeding the raw DNN order into that loop pairs
+        # stride-8 anchors with stride-16 score rows and dies on a
+        # broadcast error -- or, on other shapes, parses garbage.
+        groups = {1: [], 4: [], 8: []}
+        for a in raw:
+            groups[a.shape[2]].append((a.shape[1], a))
+        for k in groups:
+            groups[k] = [a for _, a in sorted(groups[k], key=lambda t: -t[0])]
+        outs = []
+        for i in range(3):
+            outs += [groups[1][i], groups[4][i], groups[8][i]]
         scores_list, bboxes_list, kpss_list = [], [], []
         for idx, stride in enumerate(self._feat_stride_fpn):
             scores = outs[idx * self.fmc][0]
@@ -162,7 +184,9 @@ class CardDetectorAI:
         # exactly the canonical [TL, TR, BR, BL] this pipeline consumes.
         # (An older comment here claimed the raw order was already
         # TL-first; it is not -- downstream geometric re-sorts were
-        # masking the one-position rotation.)
+        # masking the one-position rotation.) Re-verified 2026-11-14 on
+        # synthetic front/back cards in all rotations: raw order warps
+        # sideways, the rotated order warps upright (CORE-MERGE.md).
         pts_list = [raw[1], raw[2], raw[3], raw[0]]
         # Degenerate-case guard only: if the rotated quad self-crosses,
         # fall back to a geometric sort rather than emit a bow-tie.
@@ -499,6 +523,13 @@ class Core:
         self.pairs = []
         self.detector_ai = None
         self.ai_available = False
+        # AI 检测器懒加载状态（get_ai_detector 维护）：_ai_detector 为
+        # None=未尝试 / False=不可用（原因见 _ai_error）/ 实例=可用；
+        # detector_ai 与 ai_available 是同一状态的对外镜像，执照窗等
+        # 其他模块一律经 get_ai_detector 共用这一个检测器。
+        self._ai_detector = None
+        self._ai_error = None
+        self._ai_lock = threading.Lock()
         self.current_marking_side = 'front'
         self.dpi = 300
         self.mm_to_pixel = self.dpi / 25.4
@@ -578,16 +609,20 @@ class Core:
                     placements.append((card, x, margin + j * (ch + gap_y)))
                 pages.append(placements)
         else:
-            spacing = int(20 * s)
+            # 标准（每组一页）：落位与 Tk 大包 _layout_positions 的
+            # standard 公式逐项一致（IDCardMerge 本体取证）：单卡双向
+            # 居中；双卡上沿 0.25·页高−卡高/2 与 0.75·页高−卡高/2
+            # （A4 纵向即 47.25/195.75mm、净距 94.5mm）。旧实现是整组
+            # 居中＋20mm 卡距（原版「清单」模式的摆法），装错了模式。
+            x = (pw - cw) // 2
             for g in groups:
                 imgs = [prep(im) for im in g]
-                total_h = len(imgs) * ch + (len(imgs) - 1) * spacing
-                y = (ph - total_h) // 2
-                x = (pw - cw) // 2
-                placements = []
-                for im in imgs:
-                    placements.append((im, x, y))
-                    y += ch + spacing
+                if len(imgs) == 1:
+                    ys = [(ph - ch) // 2]
+                else:
+                    ys = [int(0.25 * ph - ch / 2.0),
+                          int(0.75 * ph - ch / 2.0)][:len(imgs)]
+                placements = [(im, x, y) for im, y in zip(imgs, ys)]
                 pages.append(placements)
         self.layout_pages = pages
         return pages
@@ -696,6 +731,53 @@ class Core:
             return [[float(x), float(y)] for x, y in corners]
         except Exception:
             return None
+
+    def get_ai_detector(self):
+        """懒加载并缓存唯一的 SCRFD 检测器（线程安全，双重检查锁）。
+
+        成功返回 CardDetectorAI 实例，并同步对外镜像 detector_ai /
+        ai_available；模型文件缺失或加载失败返回 None，把原因记进
+        self._ai_error 并写 detect_error.log，且闩锁置位——后续调用
+        直接返回 None，不再重复构造、重复抛错、重复被吞（旧实现构造
+        抛错时不置闩锁，每次导入都白跑一遍失败加载）。UI 层据
+        _ai_error 区分「模型不可用」与「照片没认出」，如实提示。"""
+        det = self._ai_detector
+        if det is not None:
+            return det if det is not False else None
+        with self._ai_lock:
+            det = self._ai_detector
+            if det is not None:
+                return det if det is not False else None
+            candidates = []
+            if getattr(sys, "frozen", False):
+                candidates.append(os.path.join(os.path.dirname(sys.executable),
+                                  "models", "carddetection_scrfd34gkps.onnx"))
+                candidates.append(os.path.join(getattr(sys, "_MEIPASS", ""),
+                                  "models", "carddetection_scrfd34gkps.onnx"))
+            candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "models", "carddetection_scrfd34gkps.onnx"))
+            model = next((c for c in candidates if c and os.path.exists(c)), None)
+            if not model:
+                self._ai_detector = False
+                self.ai_available = False
+                self._ai_error = ('识别模型文件缺失'
+                                  '（models/carddetection_scrfd34gkps.onnx 未找到）')
+                _log_detect_error(self._ai_error + '；搜索路径：'
+                                  + ' | '.join(candidates))
+                return None
+            try:
+                det = CardDetectorAI(model)
+            except Exception as e:
+                self._ai_detector = False
+                self.ai_available = False
+                self._ai_error = f'识别模型加载失败：{e!r}'
+                _log_detect_error(self._ai_error)
+                return None
+            self._ai_detector = det
+            self.detector_ai = det
+            self.ai_available = True
+            self._ai_error = None
+            return det
 
     def ai_detect_corners(self, image):
         """AI 检测：懒加载 SCRFD 模型（exe 同目录或打包内 models 文件夹），
