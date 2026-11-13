@@ -1891,7 +1891,9 @@ class IDCardProcessor:
         stays responsive while recognition runs; failures stay as
         待标角 and are counted in the status line. With start_idx,
         filling starts at that pair/side and continues into
-        following pairs."""
+        following pairs. Without start_idx, existing pairs' empty
+        slots are filled first (pair order, front before back);
+        only overflow opens new pairs."""
         files = [f for f in files if f]
         if not files:
             return
@@ -1900,14 +1902,33 @@ class IDCardProcessor:
             return
         self._remember_dir(files[0])
         if start_idx is None:
-            # 启动时自带的那个空组先撤掉，免得导入完平白多出一个空组
-            if len(self.pairs) == 1 and \
-                    self.pairs[0]['front']['image'] is None and \
-                    self.pairs[0]['back']['image'] is None:
-                self.pairs = []
-                self.current_open = None
-            chunks = [files[i:i + 2] for i in range(0, len(files), 2)]
-            pair_seq = [(None, ('front', 'back')) for _ in chunks]
+            # Fill-first (Qing's live feedback 2026-11-13): dropped-in
+            # files used to ALWAYS open new pairs, so adding the back
+            # photo of an already-imported front spilled into a fresh
+            # pair and wore the wrong side label. Now existing pairs'
+            # empty slots are filled first, in pair order (front
+            # before back within a pair); only the overflow opens new
+            # pairs, two at a time as before. The pristine start-up
+            # pair is just an existing pair under this rule: filling
+            # it in place leaves no trailing empty pair, so the old
+            # delete-it-first step is gone.
+            rest = list(files)
+            pair_seq = []
+            chunks = []
+            for pi, pair in enumerate(self.pairs):
+                if not rest:
+                    break
+                slots = tuple(sd for sd in ('front', 'back')
+                              if pair[sd]['image'] is None)
+                if not slots:
+                    continue
+                chunks.append(rest[:len(slots)])
+                rest = rest[len(slots):]
+                pair_seq.append((pi, slots))
+            while rest:
+                chunks.append(rest[:2])
+                rest = rest[2:]
+                pair_seq.append((None, ('front', 'back')))
         else:
             first_order = ('front', 'back') if start_side == 'front' else ('back', 'front')
             chunks = [files[:len(first_order)]]
@@ -2450,7 +2471,8 @@ class IDCardProcessor:
         # original size opened far too big). '原始大小' (1.0) stays on the
         # toolbar; state['scale'] is set from fit_scale() before the
         # first render() below.
-        state = {'idx': 0, 'photos': [], 'drag': None, 'scale': 1.0}
+        state = {'idx': 0, 'photos': [], 'drag': None, 'scale': 1.0,
+                 'user_zoom': False, 'auto_fit': False}
         win = ToplevelWithIcon(self.root)
         win.title('可交互排版预览（支持拖放）')
         # Clamp to the screen and center it (Qing's small Acer is
@@ -2513,15 +2535,37 @@ class IDCardProcessor:
             return (dw, dh, max(10, int(cw * sc)), max(10, int(ch * sc)), ox, oy)
 
         def fit_scale():
+            # Prefer the canvas's real size once it has one. Before
+            # the window is mapped, Tk reports the canvas as 1x1 and
+            # the old max(200, ...) floor turned that into a ~5%
+            # scale -- the preview opened as a thumbnail on Qing's
+            # machine (2026-11-13). The fallback derives the viewport
+            # from the window geometry (ww/wh, already computed above)
+            # minus the packed chrome's requested sizes, which Tk
+            # knows before the window is ever mapped.
             try:
-                win.update_idletasks()
-                vw = max(200, canvas.winfo_width() - 8)
-                vh = max(200, canvas.winfo_height() - 8)
+                cw_now, ch_now = canvas.winfo_width(), canvas.winfo_height()
             except Exception:
-                vw, vh = 860, 800
+                cw_now, ch_now = 0, 0
+            if cw_now > 50 and ch_now > 50:
+                vw, vh = cw_now - 8, ch_now - 8
+            else:
+                try:
+                    chrome_h = (toolbar.winfo_reqheight()
+                                + header.winfo_reqheight()
+                                + bar.winfo_reqheight()
+                                + xsb.winfo_reqheight())
+                    vw = max(200, ww - ysb.winfo_reqwidth() - 8)
+                    vh = max(200, wh - chrome_h - 8)
+                except Exception:
+                    vw, vh = 860, 800
             return min(vw / pw, vh / ph)
 
         def set_scale(sc):
+            # Toolbar zoom buttons only: from here on the user owns
+            # the scale, and the one-time auto refit below must never
+            # override a manual choice.
+            state['user_zoom'] = True
             state['scale'] = sc
             render()
 
@@ -2603,6 +2647,15 @@ class IDCardProcessor:
                 return
             _cfg_guard['busy'] = True
             try:
+                # One-time refit: the initial scale may have come
+                # from the geometry fallback before the canvas had a
+                # real size. The first time the canvas reports a real
+                # size (>50px), refit exactly once -- unless the user
+                # already took the scale over with a toolbar button.
+                if not state['auto_fit'] and not state['user_zoom'] \
+                        and event.width > 50 and event.height > 50:
+                    state['auto_fit'] = True
+                    state['scale'] = fit_scale()
                 render()
             finally:
                 _cfg_guard['busy'] = False
@@ -2781,8 +2834,9 @@ class IDCardProcessor:
         to choose (2026-11-12). This flow always asks first; the
         system default is never used as a silent target and is never
         changed. Route A: the standard Windows print dialog
-        (pywin32/MFC PrintDlg -- printer list, copies, properties)
-        plus GDI printing of the composed 300dpi page images.
+        (Win32 PrintDlg via ctypes, PD_RETURNDC -- printer list,
+        copies, properties) plus GDI printing of the composed
+        300dpi page images.
         Route B (only if A fails before anything is spooled): a small
         Tk picker fed by winspool EnumPrintersW via ctypes, same GDI
         path. Cancelling prints nothing; any failure shows an error
@@ -2796,30 +2850,50 @@ class IDCardProcessor:
                 '打印不可用',
                 '打印组件（pywin32）没有随程序打包，无法选择打印机。\n本次没有打印任何内容。')
             return False
+        route_a_error = None
         try:
             return self._print_via_printdlg(page_images, job_name)
-        except Exception:
-            pass  # nothing was spooled yet; fall through to the picker
+        except Exception as e:
+            # Route A raises only before anything is spooled (its
+            # own contract), so falling through cannot double-print.
+            # The error text is KEPT, not swallowed: if Route B also
+            # fails, both errors are shown, so the next failure
+            # report carries the evidence. (A silently swallowed
+            # Route A error hid a broken dialog call for a whole
+            # release -- 2026-11-13.)
+            route_a_error = e
         try:
             return self._print_via_picker(page_images, job_name)
         except Exception as e:
-            messagebox.showerror(
-                '打印失败',
-                f'没能把打印任务发出去：{e}\n本次没有打印到任何打印机。')
+            msg = f'没能把打印任务发出去：{e}\n本次没有打印到任何打印机。'
+            if route_a_error is not None:
+                msg += f'\n（系统打印对话框路线先前失败：{route_a_error}）'
+            messagebox.showerror('打印失败', msg)
             return False
 
     def _spool_images_gdi(self, dc, page_images, job_name, copies):
-        """GDI-print PIL page images (300dpi A4) through a win32ui DC.
+        """GDI-print PIL page images through a win32ui DC at true size.
 
-        GetDeviceCaps indices 110-113 are the fixed Win32 ABI values
-        PHYSICALWIDTH / PHYSICALHEIGHT / PHYSICALOFFSETX /
-        PHYSICALOFFSETY; the image is stretched onto the physical
-        page (the composed pages already carry their own margins).
+        Every page image in this app is composed at 300 dpi
+        (self.dpi), so an image of W x H px is W*25.4/300 mm wide --
+        each image's millimetre size is derived from its own pixels,
+        never a hardcoded paper size, so ID pages and licence pages
+        print at the same true scale. The target box follows the
+        Photoshop convention (print at 100% of physical size):
+        LOGPIXELSX / LOGPIXELSY (GetDeviceCaps 88 / 90) give device
+        pixels per inch, hence px-per-mm = caps/25.4; the box origin
+        is the paper's physical origin, which in DC coordinates sits
+        at (-PHYSICALOFFSETX, -PHYSICALOFFSETY) (caps 112 / 113)
+        because DC (0,0) is the printable area's corner. The old
+        code stretched the image over PHYSICALWIDTH/HEIGHT (caps
+        110/111) instead, conflating the driver's physical-page
+        pixel counts with the image's own size; output on Qing's
+        printer came out slightly small (2026-11-13).
         """
         from PIL import ImageWin
         hdc = dc.GetHandleOutput()
-        phys_w = dc.GetDeviceCaps(110)
-        phys_h = dc.GetDeviceCaps(111)
+        px_per_mm_x = dc.GetDeviceCaps(88) / 25.4
+        px_per_mm_y = dc.GetDeviceCaps(90) / 25.4
         off_x = dc.GetDeviceCaps(112)
         off_y = dc.GetDeviceCaps(113)
         try:
@@ -2827,10 +2901,15 @@ class IDCardProcessor:
                 dc.StartDoc(job_name)
                 try:
                     for img in page_images:
+                        rgb = img.convert('RGB')
+                        w_mm = rgb.width * 25.4 / 300.0
+                        h_mm = rgb.height * 25.4 / 300.0
+                        x0, y0 = -off_x, -off_y
+                        x1 = x0 + int(round(w_mm * px_per_mm_x))
+                        y1 = y0 + int(round(h_mm * px_per_mm_y))
                         dc.StartPage()
-                        dib = ImageWin.Dib(img.convert('RGB'))
-                        dib.draw(hdc, (-off_x, -off_y,
-                                       -off_x + phys_w, -off_y + phys_h))
+                        dib = ImageWin.Dib(rgb)
+                        dib.draw(hdc, (x0, y0, x1, y1))
                         dc.EndPage()
                 finally:
                     dc.EndDoc()
@@ -2838,40 +2917,112 @@ class IDCardProcessor:
             dc.DeleteDC()
 
     def _print_via_printdlg(self, page_images, job_name):
-        """Route A: the standard Windows printer dialog (PrintDlg)."""
-        import win32con
+        """Route A: the standard Windows print dialog (PrintDlg).
+
+        Implemented on the raw Win32 PrintDlg API via ctypes -- the
+        same technique as _enum_printers_ctypes below -- and NOT on
+        win32ui.CreatePrintDialog. Reason (signatures verified
+        against pywin32's official docs 2026-11-13): the documented
+        signature is CreatePrintDialog(idRes, bPrintSetupOnly,
+        dwFlags, parent, dll) -- the flags are the THIRD parameter.
+        The previous code passed the flags word as the first
+        argument (idRes), so the MFC dialog could never open; the
+        exception was silently swallowed by the caller and Route A
+        was dead for a whole release without anyone seeing why.
+        PrintDlg with PD_RETURNDC keeps the full system dialog
+        (printer list, copies, the driver's Properties sheet) and
+        returns a ready printer HDC, which is wrapped with
+        win32ui.CreateDCFromHandle(int) -- pywin32's documented way
+        to obtain a PyCDC from an integer handle.
+
+        Contract (unchanged): returns False on user cancel; raises
+        only BEFORE anything is spooled, so the caller may fall
+        back to Route B; once spooling starts, a failure is
+        reported here and False is returned (never fall back after
+        spooling -- that could double-print).
+        """
+        import ctypes
+        from ctypes import wintypes
         import win32ui
-        pd = win32ui.CreatePrintDialog(
-            win32con.PD_RETURNDC | win32con.PD_NOSELECTION |
-            win32con.PD_NOPAGENUMS)
-        if pd.DoModal() != win32con.IDOK:
-            self.update_status('已取消打印')
-            return False
-        # Still pre-spool: any failure above the StartDoc line may
-        # raise out to the picker fallback; once spooling starts, a
-        # failure is reported here instead of re-asking (which could
-        # double-print).
+
+        PD_RETURNDC = 0x00000100
+        PD_NOSELECTION = 0x00000004
+        PD_NOPAGENUMS = 0x00000008
+
+        class PRINTDLG(ctypes.Structure):
+            # Field order/types per the Win32 PRINTDLG definition
+            # (commdlg.h); pointer-sized members use c_void_p so the
+            # layout follows the process bitness (32-bit target).
+            _fields_ = [('lStructSize', wintypes.DWORD),
+                        ('hwndOwner', wintypes.HWND),
+                        ('hDevMode', ctypes.c_void_p),
+                        ('hDevNames', ctypes.c_void_p),
+                        ('hDC', ctypes.c_void_p),
+                        ('Flags', wintypes.DWORD),
+                        ('nFromPage', wintypes.WORD),
+                        ('nToPage', wintypes.WORD),
+                        ('nMinPage', wintypes.WORD),
+                        ('nMaxPage', wintypes.WORD),
+                        ('nCopies', wintypes.WORD),
+                        ('hInstance', wintypes.HINSTANCE),
+                        ('lCustData', wintypes.LPARAM),
+                        ('lpfnPrintHook', ctypes.c_void_p),
+                        ('lpfnSetupHook', ctypes.c_void_p),
+                        ('lpPrintTemplateName', wintypes.LPCWSTR),
+                        ('lpSetupTemplateName', wintypes.LPCWSTR),
+                        ('hPrintTemplate', ctypes.c_void_p),
+                        ('hSetupTemplate', ctypes.c_void_p)]
+
+        pd = PRINTDLG()
+        pd.lStructSize = ctypes.sizeof(PRINTDLG)
         try:
-            dc = pd.GetPrinterDC()
+            pd.hwndOwner = self.root.winfo_id()
         except Exception:
-            dc = pd.GetDC()
+            pd.hwndOwner = None
+        pd.Flags = PD_RETURNDC | PD_NOSELECTION | PD_NOPAGENUMS
+        pd.nCopies = 1
+        comdlg32 = ctypes.WinDLL('comdlg32.dll')
+        kernel32 = ctypes.WinDLL('kernel32.dll')
         try:
-            copies = int(pd.GetCopies())
-        except Exception:
-            copies = 1
-        copies = min(max(copies, 1), 20)
-        try:
-            self._spool_images_gdi(dc, page_images, job_name, copies)
-        except Exception as e:
+            if not comdlg32.PrintDlgW(ctypes.byref(pd)):
+                ext = comdlg32.CommDlgExtendedError()
+                if ext:
+                    raise RuntimeError(f'系统打印对话框出错（错误码 {ext}）')
+                self.update_status('已取消打印')
+                return False
+            if not pd.hDC:
+                raise RuntimeError('系统打印对话框没有返回打印机')
+            # Copies exactly as the user set them in the dialog.
+            # PD_USEDEVMODECOPIESANDCOLLATE is deliberately NOT set:
+            # with it, nCopies would always read back 1 and the copy
+            # count would silently depend on the driver honouring
+            # DEVMODE copies; spooling the extra copies ourselves
+            # matches what this dialog route has always done.
+            copies = min(max(int(pd.nCopies), 1), 20)
             try:
-                dc.DeleteDC()
+                dc = win32ui.CreateDCFromHandle(pd.hDC)
             except Exception:
-                pass
-            messagebox.showerror('打印失败',
-                                 f'打印过程中出错：{e}\n请检查所选打印机后重试。')
-            return False
-        messagebox.showinfo('打印', '打印任务已发送到打印机')
-        return True
+                ctypes.WinDLL('gdi32.dll').DeleteDC(pd.hDC)
+                raise
+            # _spool_images_gdi owns the DC from here (DeleteDC in
+            # its finally block).
+            try:
+                self._spool_images_gdi(dc, page_images, job_name, copies)
+            except Exception as e:
+                messagebox.showerror('打印失败',
+                                     f'打印过程中出错：{e}\n请检查所选打印机后重试。')
+                return False
+            messagebox.showinfo('打印', '打印任务已发送到打印机')
+            return True
+        finally:
+            # PrintDlg allocates hDevMode / hDevNames on OK and on
+            # cancel alike; they are global memory handles and must
+            # be GlobalFree'd. The HDC is not one of them -- it is
+            # released by DeleteDC in the spool helper.
+            if pd.hDevMode:
+                kernel32.GlobalFree(pd.hDevMode)
+            if pd.hDevNames:
+                kernel32.GlobalFree(pd.hDevNames)
 
     def _enum_printers_ctypes(self):
         """Installed printer names via winspool EnumPrintersW (stdlib
@@ -2943,6 +3094,38 @@ class IDCardProcessor:
             pass
         return None
 
+    def _make_printer_dc(self, printer_name):
+        """Build a PyCDC for a named printer, from pywin32
+        signatures verified against the official docs (2026-11-13).
+
+        Primary: win32ui.CreateDC() takes NO arguments and returns
+        an uninitialised PyCDC; PyCDC.CreatePrinterDC(name) then
+        binds it to the printer. This is the pattern shown in
+        pywin32's own printing how-to. (The previous code called
+        win32ui.CreateDC('WINSPOOL', name, None) -- that 3-argument
+        shape belongs to win32gui.CreateDC, and win32ui's zero-arg
+        version is why the real machine reported "CreateDC() takes
+        exactly 0 arguments (3 given)".)
+
+        Fallback: win32gui.CreateDC('WINSPOOL', name, None) returns
+        an integer HDC handle, wrapped into a PyCDC by
+        win32ui.CreateDCFromHandle(int).
+
+        Either way the returned PyCDC owns a deletable DC, which
+        _spool_images_gdi releases via DeleteDC().
+        """
+        import win32ui
+        try:
+            dc = win32ui.CreateDC()
+            dc.CreatePrinterDC(printer_name)
+            return dc
+        except Exception:
+            import win32gui
+            hdc = win32gui.CreateDC('WINSPOOL', printer_name, None)
+            if not hdc:
+                raise RuntimeError(f'无法为打印机「{printer_name}」创建打印通道')
+            return win32ui.CreateDCFromHandle(hdc)
+
     def _print_via_picker(self, page_images, job_name):
         """Route B: own printer picker + GDI printing via win32ui."""
         import win32ui
@@ -2994,7 +3177,7 @@ class IDCardProcessor:
         if not result['printer']:
             self.update_status('已取消打印')
             return False
-        dc = win32ui.CreateDC('WINSPOOL', result['printer'], None)
+        dc = self._make_printer_dc(result['printer'])
         self._spool_images_gdi(dc, page_images, job_name, result['copies'])
         messagebox.showinfo('打印', '打印任务已发送到打印机')
         return True
