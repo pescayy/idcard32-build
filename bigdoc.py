@@ -190,44 +190,122 @@ def expand_to_paper_edge(bgr, quad, target_ratio=A4_RATIO):
         cand, n = _edge_candidates(gray, a, b, centroid, pl)
         cand_lists.append(cand)
         normals.append(n)
-    best = None
+
+    # Face-content guard data (2026-11-13, emblem diagnosis): the
+    # gradient candidates above cannot see a paper edge that has no
+    # brightness step (white sheet on a pale desk), and prior (3)
+    # then stops the expansion at the tightest defensible line --
+    # straight through the emblem riding the frame->paper margin.
+    # edge_station_bounds measures, per edge, how far out the face's
+    # own ink reaches (ink) and where the paper truly ends (extent)
+    # from THIS frame quad, in the same outward-offset units the
+    # combos below are built from. ink_need = worst ink + a guard
+    # margin (the ink read under-reads a pale apex by ~5px, measured
+    # on Image-14-55-28: 36.0 read vs 40.6 true).
+    ink_need = None
+    ext_cand = [None] * 4
+    try:
+        bnd = edge_station_bounds(bgr, np.asarray(quad, float))
+    except Exception:
+        bnd = None
+    if bnd is not None:
+        ink_r, ext_r, _oob_r = _robustify_bounds(*bnd[:3])
+        ink_need = [float(np.max(ink_r[i])) + 5.0 for i in range(4)]
+        ext_cand = [max(0.0, float(np.percentile(ext_r[i], 30)) - 2.0)
+                    for i in range(4)]
+
     import itertools
-    for combo in itertools.product(*[range(len(c)) for c in cand_lists]):
-        offs = [cand_lists[i][combo[i]][0] for i in range(4)]
-        strength = sum(cand_lists[i][combo[i]][1] for i in range(4))
-        paper = _quad_from_offsets(edges, normals, offs)
-        if paper is None or not np.all(np.isfinite(paper)):
-            # A degenerate edge (coincident points) makes _line divide
-            # by a zero norm and the intersections come out NaN. Such a
-            # combo is not a candidate at all -- previously it could be
-            # returned as the "best" paper (NaN keys never lose a
-            # comparison) and crashed converge_corners downstream
-            # (2026-11-11 batch, douyin n01/n12). Skipping it cannot
-            # change any finite outcome: a NaN key never displaces a
-            # finite best, and a finite key never displaces a NaN best
-            # either -- so whenever the old code returned a finite
-            # paper, no NaN combo had won.
-            continue
-        dev = abs(_aspect(paper) - target_ratio)
-        # Selection priors, in order:
-        # 1) quad must reconcile with the A4 aspect ratio (~0.7% granularity);
-        # 2) the printed frame is centered on the sheet, so opposite margins
-        #    are near-equal -- penalize asymmetry (kills runaway edges that
-        #    walked onto an underlying white sheet/desk panel);
-        # 3) then prefer the tightest total expansion, then strongest evidence.
-        # A slightly loose fit beats a refusal: worst case it carries a thin
-        # background sliver, while a refusal costs a full manual fallback.
-        asym = (abs(offs[0] - offs[2]) / perp[0] + abs(offs[1] - offs[3]) / perp[1])
-        total_off = float(sum(offs))
-        key = (round(dev, 2), round(asym, 2), total_off, -strength)
-        if best is None or key < best[0]:
-            best = (key, paper, offs, strength, dev)
+
+    def _pick(lists, need, slack_first=False):
+        best = None
+        for combo in itertools.product(*[range(len(c)) for c in lists]):
+            offs = [lists[i][combo[i]][0] for i in range(4)]
+            if need is not None and any(
+                    offs[i] < need[i] - 1e-9 for i in range(4)):
+                continue
+            strength = sum(lists[i][combo[i]][1] for i in range(4))
+            paper = _quad_from_offsets(edges, normals, offs)
+            if paper is None or not np.all(np.isfinite(paper)):
+                # A degenerate edge (coincident points) makes _line
+                # divide by a zero norm and the intersections come
+                # out NaN. Such a combo is not a candidate at all --
+                # previously it could be returned as the "best"
+                # paper (NaN keys never lose a comparison) and
+                # crashed converge_corners downstream (2026-11-11
+                # batch, douyin n01/n12). Skipping it cannot change
+                # any finite outcome: a NaN key never displaces a
+                # finite best, and a finite key never displaces a
+                # NaN best either -- so whenever the old code
+                # returned a finite paper, no NaN combo had won.
+                continue
+            dev = abs(_aspect(paper) - target_ratio)
+            # Selection priors, in order:
+            # 1) quad must reconcile with the A4 aspect ratio
+            #    (~0.7% granularity);
+            # 2) the printed frame is centered on the sheet, so
+            #    opposite margins are near-equal -- penalize
+            #    asymmetry (kills runaway edges that walked onto an
+            #    underlying white sheet/desk panel);
+            # 3) then prefer the tightest total expansion, then
+            #    strongest evidence.
+            # A slightly loose fit beats a refusal: worst case it
+            # carries a thin background sliver, while a refusal
+            # costs a full manual fallback.
+            asym = (abs(offs[0] - offs[2]) / perp[0]
+                    + abs(offs[1] - offs[3]) / perp[1])
+            total_off = float(sum(offs))
+            if slack_first:
+                # Guard re-pick only (2026-11-13, emblem fix round):
+                # the aspect prior already had its say in the
+                # unconstrained pick; when the content guard forces
+                # ONE edge out (Image-14-54-06: left need 74, only
+                # candidate 110), letting dev/asym lead again makes
+                # the ratio "reconcile" by inflating the OTHER edges
+                # (bottom 22 -> 66 onto a desk, gold paper offset
+                # ~0) -- pure background gain, corners dragged with
+                # it. Inside the guard's feasible set, A4 sanity is
+                # a hard filter (dev <= 0.06, the same bound the
+                # caller applies) and the winner is the combo that
+                # expands least beyond the measured needs; dev and
+                # asym only break ties.
+                if dev > 0.06:
+                    continue
+                slack = float(sum(offs[i] - need[i] for i in range(4)))
+                key = (round(slack, 1), round(dev, 2), round(asym, 2),
+                       -strength)
+            else:
+                key = (round(dev, 2), round(asym, 2), total_off,
+                       -strength)
+            if best is None or key < best[0]:
+                best = (key, paper, offs, strength, dev)
+        return best
+
+    best = _pick(cand_lists, None)
+    guard_phase = 0
+    if best is not None and ink_need is not None and any(
+            best[2][i] < ink_need[i] - 1e-9 for i in range(4)):
+        # The unconstrained winner cuts face content on some edge.
+        # Re-pick among content-clearing combos only, with the
+        # measured paper-extent line added as a candidate source
+        # (the true edge often has no gradient peak to offer). The
+        # priors are unchanged INSIDE the feasible set: "tightest"
+        # may only ever choose among lines that do not cut content.
+        lists2 = [list(cand_lists[i]) + [(ext_cand[i], 0.0)]
+                  for i in range(4)]
+        best2 = _pick(lists2, ink_need, slack_first=True)
+        if best2 is not None and best2[4] <= 0.06:
+            best = best2
+            guard_phase = 2
     if best is None:
         return None, {}
     _, paper, offs, strength, dev = best
     info = {"expansions_px": [float(o) for o in offs],
             "aspect": float(_aspect(paper)), "aspect_dev": float(dev),
             "strength": float(strength)}
+    if ink_need is not None:
+        info["ink_guard"] = {
+            "need_px": [round(float(v), 1) for v in ink_need],
+            "phase": guard_phase}
     if dev > 0.06:  # could not reconcile with A4 at all: distrust
         return None, info
     return paper, info
@@ -709,6 +787,7 @@ def tighten_edges(bgr, quad, frame_quad=None, max_frac=0.012,
     """
     q = _validate_quad(quad, "tighten_edges")
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    sat = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[:, :, 1].astype(np.float32)
     M = cv2.getPerspectiveTransform(
         q.astype(np.float32),
         np.array([[0, 0], [99, 0], [99, 99], [0, 99]], np.float32))
@@ -732,16 +811,33 @@ def tighten_edges(bgr, quad, frame_quad=None, max_frac=0.012,
         pts0 = a[None, :] + ts[:, None] * (b - a)[None, :]
         steps = int(np.ceil(bound))
         intr = []
+        n_content_stop = 0
         for p in pts0:
             fracs = []
+            conts = []
             for d in range(0, steps + 1):
                 c = p + nin * (float(d) + max(2, r // 2))
                 fracs.append(_paper_fraction(gray, c, r, paper_level))
+                conts.append(_content_fraction(sat, c, r))
             d_hit = float(bound)
             for d in range(len(fracs)):
                 if fracs[d] >= 0.6 and \
                         (d + 1 >= len(fracs) or fracs[d + 1] >= 0.6):
                     d_hit = float(d)
+                    break
+                # Vivid layout content (the gilt/red emblem riding
+                # the frame band, printed ornament) is NOT intrusion:
+                # the gray-only paper test reads the dark red emblem
+                # as background and the march happily walks the edge
+                # across it (2026-11-13 emblem diagnosis: tighten
+                # added 11.35px of cut on Image-14-53-06). Stop the
+                # march where sustained vivid content begins; the
+                # intrusion depth is then only what lay OUTSIDE the
+                # content, which is all tighten may ever remove.
+                if conts[d] >= 0.45 and \
+                        (d + 1 >= len(conts) or conts[d + 1] >= 0.45):
+                    d_hit = float(d)
+                    n_content_stop += 1
                     break
             intr.append(d_hit)
         intr = np.array(intr)
@@ -759,7 +855,44 @@ def tighten_edges(bgr, quad, frame_quad=None, max_frac=0.012,
         detail.append({"bound_px": round(float(bound), 2),
                        "intrusion_p90": round(p90, 2),
                        "hit_frac": round(hit_frac, 3),
-                       "shift_px": round(float(t), 2)})
+                       "shift_px": round(float(t), 2),
+                       "content_stops": int(n_content_stop)})
+    # Ink-line travel cap (2026-11-13, emblem diagnosis): however the
+    # marches above voted, no edge may travel inward past the measured
+    # face-ink line (edge_station_bounds on the frame quad). The old
+    # only guard was the frame reserve (2px short of the FRAME line),
+    # which never fires for content riding OUTSIDE the frame band --
+    # the emblem sits exactly there. Headroom per station = input
+    # edge's distance from the frame line minus the ink distance; the
+    # binding station caps the whole edge (a straight edge, a single
+    # shift). An edge already inside the ink line gets cap 0: tighten
+    # cannot repair upstream cuts, but it must never deepen them.
+    if frame_quad is not None and any(s < 0.0 for s in shifts):
+        try:
+            bnd = edge_station_bounds(bgr, np.asarray(frame_quad,
+                                                      float))
+        except Exception:
+            bnd = None
+        if bnd is not None:
+            ink_r = _robustify_bounds(*bnd[:3])[0]
+            fgeo = _edge_geometry(np.asarray(frame_quad, float))
+            for i in range(4):
+                if shifts[i] >= 0.0:
+                    continue
+                a_f, b_f, n_f, _mf = fgeo[i]
+                a_q, b_q = geo[i][0], geo[i][1]
+                head = []
+                for si, t in enumerate(np.linspace(
+                        0.04, 0.96, len(ink_r[i]))):
+                    p_f = a_f + (b_f - a_f) * t
+                    p_q = a_q + (b_q - a_q) * t
+                    head.append(float(np.dot(p_q - p_f, n_f))
+                                - float(ink_r[i][si]))
+                cap = max(0.0, min(head)) if head else 0.0
+                if -shifts[i] > cap:
+                    detail[i]["ink_cap_px"] = round(float(cap), 2)
+                    detail[i]["shift_px"] = round(float(cap), 2)
+                    shifts[i] = -cap
     info = {"edges": detail, "paper_level": round(paper_level, 1)}
     if all(s == 0.0 for s in shifts):
         return q, dict(info, applied=False)
@@ -778,6 +911,19 @@ def _dark_fraction(gray, center, r, dark_level):
         return 0.0
     patch = gray[y0:y1, x0:x1]
     return float((patch < dark_level).mean())
+
+
+def _content_fraction(sat, center, r, sat_min=110):
+    """Fraction of vivid (saturated) pixels in the patch: printed
+    layout content -- emblem, ornament, red seals -- is vivid; paper
+    and ordinary desk background are not."""
+    x, y = int(center[0]), int(center[1])
+    H, W = sat.shape
+    x0, x1 = max(0, x - r), min(W, x + r + 1)
+    y0, y1 = max(0, y - r), min(H, y + r + 1)
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return float((sat[y0:y1, x0:x1] > sat_min).mean())
 
 
 def _paper_fraction_sat(gray, sat, center, r, paper_level, sat_max=110):
@@ -881,8 +1027,18 @@ def edge_station_bounds(bgr, frame_quad, samples=41):
                     "pf": float(((gp >= paper_level)
                                  & (sp <= 110)).mean()),
                     "df": float((gp < ink_level).mean()),
-                    "sf": float(((sp > 130)
-                                 & (gp < paper_level)).mean()),
+                    # Saturated at ANY brightness counts as ink: the
+                    # pale gilt arc of an emblem can read BRIGHTER than
+                    # the paper level, and the old (sp > 130) &
+                    # (gp < paper_level) form sailed straight over it
+                    # (2026-11-13 emblem diagnosis, Image-14-55-36:
+                    # the arc was invisible to the ink test and the
+                    # chosen envelope sliced it). Paper itself is
+                    # guarded by pf's sp <= 110, so a vivid run is
+                    # never paper; whether it is FACE ink is decided
+                    # by scan_ahead's paper-resumption requirement,
+                    # exactly as for dark runs.
+                    "sf": float((sp > 130).mean()),
                     "g": float(gray[min(max(y, 0), H - 1),
                                     min(max(x, 0), W - 1)]),
                     "s": float(sat[min(max(y, 0), H - 1),
@@ -1066,8 +1222,45 @@ def edge_station_bounds(bgr, frame_quad, samples=41):
                     continue
                 misses += 1
                 if misses >= 2:
-                    extent = last_good
-                    break
+                    # Bright-paper rescue (2026-11-13, emblem
+                    # diagnosis, Image-14-53-06): a false plateau can
+                    # be captured on the frame band's own shaded strip
+                    # (uniform mid-tone, low saturation), anchoring
+                    # ref low and last_good at 0; the march then dies
+                    # in the transition band (shaded strip, the
+                    # frame's dark outer line) a few px before the
+                    # margin's sustained BRIGHT paper, and records
+                    # extent 0 for a sheet gold shows running ~140px
+                    # further. Before giving up, scan a SHORT window
+                    # ahead (25px -- a transition band, never far
+                    # enough to jump onto a different sheet) for the
+                    # same sustained strict-paper run the rest of
+                    # this module demands (3 consecutive pf >= 0.6);
+                    # if it exists, the paper plainly continues:
+                    # adopt it and march on.
+                    rescue = None
+                    run2 = 0
+                    d2 = d + step
+                    while d2 <= min(d + 25.0, d_cap):
+                        pr2 = probe(d2)
+                        if pr2 is None:
+                            break
+                        if pr2["pf"] >= 0.6:
+                            run2 += 1
+                            if run2 >= 3:
+                                rescue = d2 - 2 * step
+                                break
+                        else:
+                            run2 = 0
+                        d2 += step
+                    if rescue is None:
+                        extent = last_good
+                        break
+                    last_good = rescue
+                    ref_hist = []
+                    misses = 0
+                    d = rescue + step
+                    continue
                 d += step
             if extent is None:
                 extent = d_cap
@@ -1114,8 +1307,95 @@ def _robustify_bounds(ink_all, ext_all, oob_all, grace=12.0):
     return ink2, ext2, oob2
 
 
-def _envelope_solve(bgr, frame, bounds, out_wh, m_lr, m_tb, m_min,
-                    graze=0.0, slack=0.0):
+def framing_ink_check(frame_quad, bounds, quad, tol=0.25):
+    """Face-ink violations of a framing candidate quad, per edge.
+
+    bounds is the robustified (ink, ext, oob, level) tuple from
+    edge_station_bounds on frame_quad. A station violates when the
+    candidate's edge sits inside the measured ink line there (need =
+    ink + 1.5, the envelope's own convention): the framing would cut
+    face content at that station. Returns (counts, worst): per-edge
+    violating-station counts and the deepest shortfall in px.
+    """
+    ink_all, _ext_all, _oob_all, _lvl = bounds
+    geo = _edge_geometry(np.asarray(frame_quad, float))
+    q = np.asarray(quad, float)
+    counts = [0, 0, 0, 0]
+    worst = 0.0
+    for i in range(4):
+        a, b, n, _m = geo[i]
+        qa, qb = q[i], q[(i + 1) % 4]
+        for si, t in enumerate(np.linspace(0.04, 0.96,
+                                           len(ink_all[i]))):
+            p_f = a + (b - a) * t
+            p_q = qa + (qb - qa) * t
+            dist = float(np.dot(p_q - p_f, n))
+            need = max(0.0, float(ink_all[i][si]) + 1.5)
+            if dist < need - tol:
+                counts[i] += 1
+                worst = max(worst, need - dist)
+    return counts, worst
+
+
+def guard_quad_to_ink(frame_quad, bounds, quad, margin=5.0):
+    """Repair a framing candidate: push each edge OUT until it clears
+    the measured face-ink line (+ margin, covering the ink read's
+    known ~5px under-read of a pale apex), never past the measured
+    paper extent or the image border (the envelope's need_allow
+    rules, oob clamp included). Two passes; the second re-measures
+    after the corner rebuild. Returns (quad, counts, worst) with the
+    residual violations under framing_ink_check's standard need --
+    (original quad, its counts, its worst) when no repair applies or
+    the rebuild degenerates.
+    """
+    ink_all, ext_all, oob_all, _lvl = bounds
+    frame = np.asarray(frame_quad, float)
+    geo = _edge_geometry(frame)
+    cur = np.asarray(quad, float)
+
+    def need_allow(i, si):
+        need = max(0.0, float(ink_all[i][si]) + margin)
+        allow = float(ext_all[i][si]) - (0.0 if oob_all[i][si]
+                                          else 1.0)
+        if oob_all[i][si] and need > allow:
+            need = allow
+        return need, allow
+
+    def dists(q, i):
+        a, b, n, _m = geo[i]
+        qa, qb = q[i], q[(i + 1) % 4]
+        out = []
+        for si, t in enumerate(np.linspace(0.04, 0.96,
+                                           len(ink_all[i]))):
+            p_f = a + (b - a) * t
+            p_q = qa + (qb - qa) * t
+            out.append(float(np.dot(p_q - p_f, n)))
+        return out
+
+    for _pass in range(2):
+        shifts = [0.0] * 4
+        for i in range(4):
+            ds = dists(cur, i)
+            req = 0.0
+            cap = float("inf")
+            for si, dist in enumerate(ds):
+                nd, al = need_allow(i, si)
+                req = max(req, nd - dist)
+                cap = min(cap, al - dist)
+            if req > 0.05:
+                shifts[i] = max(0.0, min(req, cap))
+        if all(s <= 0.05 for s in shifts):
+            break
+        nxt = _rebuild_from_edge_shifts(cur, shifts)
+        if nxt is None:
+            break
+        cur = nxt
+    counts, worst = framing_ink_check(frame, bounds, cur)
+    return cur, counts, worst
+
+
+def _envelope_solve_pair(bgr, frame, bounds, out_wh, m_lr, m_tb, m_min,
+                         graze=0.0, slack=0.0):
     ink_all, ext_all, oob_all, _lvl = bounds
     W, H = float(out_wh[0]), float(out_wh[1])
     canvas = np.array([[0, 0], [W, 0], [W, H], [0, H]], dtype=np.float64)
@@ -1240,6 +1520,155 @@ def _envelope_solve(bgr, frame, bounds, out_wh, m_lr, m_tb, m_min,
     if ink_v or ext_v:
         return None, info
     return quad, info
+
+
+def _envelope_solve_edges(bgr, frame, bounds, out_wh, m_lr, m_tb,
+                          m_min, graze=0.0, slack=0.0):
+    """Per-edge (asymmetric) envelope solve: each edge settles in its
+    OWN feasible window instead of sharing one margin per pair.
+
+    The pair solve couples top and bottom through a single margin:
+    when one side's extent read fails or runs short, the pair window
+    is empty and the whole envelope dies -- including the side whose
+    own window was wide (2026-11-13 emblem diagnosis: BOTH disaster
+    samples got envelope None this way, so nothing protected the
+    emblem). Here a short bottom can no longer veto a feasible top.
+    Margins stay at their targets wherever the target itself is
+    feasible, so a normally-shot flat sheet still lands symmetric;
+    asymmetry appears only where the measurements force it, and the
+    final full-violation gate is identical to the pair solve's.
+    """
+    ink_all, ext_all, oob_all, _lvl = bounds
+    W, H = float(out_wh[0]), float(out_wh[1])
+    canvas = np.array([[0, 0], [W, 0], [W, H], [0, H]], dtype=np.float64)
+    geo = _edge_geometry(frame)
+    img_h, img_w = bgr.shape[:2]
+
+    def need_allow(i, si):
+        need = max(0.0, float(ink_all[i][si]) + 1.5 - graze)
+        allow = float(ext_all[i][si]) - (0.0 if oob_all[i][si] else 1.0) \
+            + (0.0 if oob_all[i][si] else slack)
+        if oob_all[i][si] and need > allow:
+            need = allow
+        return need, allow
+
+    hard_bad = 0
+    for i in range(4):
+        for si in range(len(ink_all[i])):
+            nd, al = need_allow(i, si)
+            if nd > al + 0.5:
+                hard_bad += 1
+    if hard_bad:
+        return None, {"reason": "station window empty",
+                      "hard_bad": int(hard_bad)}
+
+    def build(ms):
+        mt, mr, mb, ml = ms
+        rect = np.array([[ml, mt], [W - mr, mt],
+                         [W - mr, H - mb], [ml, H - mb]],
+                        dtype=np.float64)
+        hf = cv2.getPerspectiveTransform(frame.astype(np.float32),
+                                         rect.astype(np.float32))
+        q = cv2.perspectiveTransform(
+            canvas.reshape(1, 4, 2).astype(np.float32),
+            np.linalg.inv(hf).astype(np.float32)).reshape(4, 2)
+        return q.astype(np.float64)
+
+    def edge_viol(quad, i):
+        ink_v = ext_v = 0
+        a, b, n, _m = geo[i]
+        qa, qb = quad[i], quad[(i + 1) % 4]
+        for si, t in enumerate(np.linspace(0.04, 0.96,
+                                           len(ink_all[i]))):
+            p_f = a + (b - a) * t
+            p_q = qa + (qb - qa) * t
+            dist = float(np.dot(p_q - p_f, n))
+            nd, al = need_allow(i, si)
+            if dist < nd - 0.25:
+                ink_v += 1
+            if dist > al + 0.25:
+                ext_v += 1
+        return ink_v, ext_v
+
+    targets = [float(m_tb), float(m_lr), float(m_tb), float(m_lr)]
+    margins = list(targets)
+
+    def settle_edge(i):
+        target = targets[i]
+        m_hi = max(target * 1.6, m_min + 1.0)
+
+        def mk(m):
+            ms = list(margins)
+            ms[i] = m
+            return build(ms)
+        if edge_viol(mk(m_hi), i)[0] > 0:
+            return None  # even the widest framing cuts the frame
+        lo, hi = m_min, m_hi
+        for _ in range(14):
+            mid = (lo + hi) / 2.0
+            if edge_viol(mk(mid), i)[0] == 0:
+                hi = mid
+            else:
+                lo = mid
+        m_ink_min = hi
+        if edge_viol(mk(m_min), i)[1] > 0:
+            return None  # even the tightest framing leaves the paper
+        lo, hi = m_min, m_hi
+        for _ in range(14):
+            mid = (lo + hi) / 2.0
+            if edge_viol(mk(mid), i)[1] == 0:
+                lo = mid
+            else:
+                hi = mid
+        m_ext_max = lo
+        if m_ink_min > m_ext_max + 0.5:
+            return None
+        return float(min(max(target, m_ink_min), m_ext_max))
+
+    for _round in range(2):
+        for i in range(4):
+            v = settle_edge(i)
+            if v is None:
+                return None, {"reason": f"edge {i} infeasible",
+                              "solver": "per-edge"}
+            margins[i] = v
+    quad = build(margins)
+    ink_v = ext_v = 0
+    for i in range(4):
+        iv, ev = edge_viol(quad, i)
+        ink_v += iv
+        ext_v += ev
+    for c in quad:  # corner pokes beyond station coverage
+        if c[0] < -1.5 or c[1] < -1.5 or c[0] > img_w - 0.5 \
+                or c[1] > img_h - 0.5:
+            ext_v += 1
+    info = {"margins_out": [round(margins[0], 1), round(margins[1], 1),
+                            round(margins[2], 1), round(margins[3], 1)],
+            "violations": [int(ink_v), int(ext_v)],
+            "min_extent": [round(float(np.min(e)), 1) for e in ext_all],
+            "max_ink": [round(float(np.max(k)), 1) for k in ink_all],
+            "solver": "per-edge"}
+    if ink_v or ext_v:
+        return None, info
+    return quad, info
+
+
+def _envelope_solve(bgr, frame, bounds, out_wh, m_lr, m_tb, m_min,
+                    graze=0.0, slack=0.0):
+    """Pair (symmetric-margin) solve first -- its results are the
+    historical envelope wherever it succeeds. Per-edge solve only as
+    the rescue when the pair coupling kills a feasible envelope."""
+    quad, info = _envelope_solve_pair(bgr, frame, bounds, out_wh,
+                                      m_lr, m_tb, m_min, graze, slack)
+    if quad is not None:
+        info["solver"] = "pair"
+        return quad, info
+    quad2, info2 = _envelope_solve_edges(bgr, frame, bounds, out_wh,
+                                         m_lr, m_tb, m_min, graze,
+                                         slack)
+    if quad2 is not None:
+        return quad2, info2
+    return None, info
 
 
 def envelope_quad(bgr, frame_quad, out_wh, m_lr=250.0, m_tb=370.0,

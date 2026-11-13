@@ -35,18 +35,44 @@
 # The image is returned pixel-identical unless the measured bow both
 # exceeds the gate and is verifiably reduced by the correction:
 #   * ruler incomplete (an edge band not found)  -> pass through
-#   * max edge deviation <= GATE_MAX_DEV px      -> pass through
+#   * max edge deviation <= gate (physical, see below) -> pass through
 #   * fitted field exceeds the displacement cap  -> pass through
 #   * re-measured deviation not better than pre  -> pass through
 # info always reports the measured per-edge deviations so callers can
 # log what the ruler saw.
+#
+# Threshold units (2026-11-12, gate-tightening batch): the gate, the
+# field cap and the control-point pitch were calibrated in pixels of
+# the old 3508x2480 (A4 @300dpi) warp canvas. When the output canvas
+# was capped at 2339x1654 (A4 @200dpi) those pixel constants silently
+# changed physical meaning -- the same physical bow read ~2/3 the
+# pixels, so genuinely curled sheets fell below the gate while two
+# flat sheets' phantom readings cleared it and got bent. All three
+# lengths are now stated in millimetres on the document and converted
+# to pixels of whatever canvas the warp actually has (the warped
+# width spans the 297mm sheet width), so the arm's behaviour no
+# longer depends on the output resolution. _GRID_STEP stays a pixel
+# count on purpose: it is the field's evaluation grid, not a
+# threshold, and at 8px it remains finer than the control-point
+# pitch at either canvas.
 import numpy as np
 import cv2
 
-GATE_MAX_DEV = 8.0     # px at the warped width; at/below -> untouched
-_MAX_DISP = 90.0       # px; fitted field beyond this is not trusted
+DOC_WIDTH_MM = 297.0   # the warped canvas spans the A4 sheet width
+GATE_MAX_DEV_MM = 8.0 * 25.4 / 300.0    # 0.677mm; was 8.0px @300dpi
+_MAX_DISP_MM = 90.0 * 25.4 / 300.0      # 7.62mm;  was 90.0px @300dpi
+_MIN_SPACING_MM = 14.0 * 25.4 / 300.0   # 1.185mm; was 14.0px @300dpi
 _GRID_STEP = 8         # TPS evaluated on a coarse grid, then upsampled
-_MIN_SPACING = 14.0    # px between TPS control points along an edge
+
+
+def _px_per_mm(width_px):
+    """Pixels per millimetre on a warp of the given width."""
+    return float(width_px) / DOC_WIDTH_MM
+
+
+def gate_max_dev_px(width_px):
+    """The bow gate in pixels for a warp of the given width."""
+    return GATE_MAX_DEV_MM * _px_per_mm(width_px)
 
 
 # ------------------------------------------------------------------ ruler
@@ -220,6 +246,10 @@ def undistort_license(bgr):
     whenever the correction does not provably help (see module header).
     """
     info = {"triggered": False}
+    H, W = bgr.shape[:2]
+    ppm = _px_per_mm(W)
+    gate_px = GATE_MAX_DEV_MM * ppm
+    info["gate_px"] = gate_px
     ana = _analyse_edges(frame_edge_points(bgr))
     if len(ana) < 4:
         info["reason"] = "ruler_incomplete"
@@ -228,7 +258,7 @@ def undistort_license(bgr):
     before = {k: v["max_dev"] for k, v in ana.items()}
     info["max_dev_before"] = max(before.values())
     info["edges_before"] = before
-    if info["max_dev_before"] <= GATE_MAX_DEV:
+    if info["max_dev_before"] <= gate_px:
         info["reason"] = "below_gate"
         return bgr, info
 
@@ -241,14 +271,13 @@ def undistort_license(bgr):
             tgt = np.stack([e["line"], p[:, 1]], 1)
         else:
             tgt = np.stack([p[:, 0], e["line"]], 1)
-        idx = _thin_idx(p, _MIN_SPACING)
+        idx = _thin_idx(p, _MIN_SPACING_MM * ppm)
         src_pts.append(p[idx])
         dst_pts.append(tgt[idx])
     src = np.concatenate(src_pts)
     dst = np.concatenate(dst_pts)
     info["n_ctrl"] = int(len(src))
 
-    H, W = bgr.shape[:2]
     S = float(W)
     model = _tps_solve(dst / S, src / S)
     model = (model[0], model[1], dst / S)
@@ -268,7 +297,7 @@ def undistort_license(bgr):
     disp = np.hypot(mapx - gx.astype(np.float32),
                     mapy - gy.astype(np.float32))
     info["field_max_disp"] = float(disp.max())
-    if info["field_max_disp"] > _MAX_DISP:
+    if info["field_max_disp"] > _MAX_DISP_MM * ppm:
         info["reason"] = "field_too_large"
         return bgr, info
     mapx = cv2.resize(mapx, (W, H), interpolation=cv2.INTER_CUBIC)
