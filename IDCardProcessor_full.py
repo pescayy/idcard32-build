@@ -829,7 +829,7 @@ class IDCardProcessor:
                  bg='#F5F6F8', fg='#888888', font=("Arial", 10),
                  anchor=tk.CENTER).pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
 
-        # 银行卡功能按钮：保留对象引用（clear_all 等代码会引用它），不再摆出
+        # 银行卡功能按钮：保留对象引用（切换模式的代码会引用它），不再摆出
         self.card_mode_btn = ttk.Button(main_frame, text="银行卡功能",
                                         command=self.toggle_card_mode, width=12)
 
@@ -874,201 +874,6 @@ class IDCardProcessor:
         
         # 仅重新绘制布局，不清除身份证图片
         self.draw_a4_layout()
-    
-    def show_help(self):
-        """显示帮助信息"""
-        help_text = """
-        _                         ____                    _ 
-        | |     _    _           | __ )        __ _      (_)
-  _    | |     | |  | |           |  _ \       / _` |       | |
- | |_ _| |    | |__| |          | |_) |      | (_| |      | |
-  \___/      \__,_|          |____/      \__,_|     |_|
-
-
-                                                                        
-        欢迎使用 身份证图片处理器V3.0  -By:JuBai 公众号：云雪星球
-        操作指南：
-        
-        1. 上传图片：
-           - 点击人像面/国徽面/银行卡区域上传图片
-           - 或直接将图片拖拽到对应区域
-        
-        2. 标记角点（两种方式）：
-           - 手动标记：在标记窗口中依次点击4个角点（左上→右上→右下→左下）
-           - 自动识别：点击"自动识别"按钮，系统将尝试自动检测证件边缘
-        
-        3. 调整角点：
-           - 如果对自动识别的点不满意，可以进入调整模式
-           - 在调整模式中，可以拖动四个角点微调位置
-        
-        4. 快速操作：
-           - 标记完4个点后按回车键可以完成标记
-           - 在工作区域单击预览画面可以再次进入调整模式
-        
-        5. 生成A4排版：
-           - 处理完图片后点击"生成A4排版"
-           - 默认使用白色背景，可在预览页面切换透明背景
-        
-        6. 保存文件：
-           - 保存A4图片：支持PNG/JPG格式
-           - 保存PDF：高质量PDF格式
-           - 单独保存：可单独保存人像面/国徽面/银行卡
-        
-        7. 编辑文字：
-           - 在A4预览页面可添加文字
-           - 可拖动文字调整位置
-        
-        8. 其他功能：
-           - 重置所有：清空所有数据
-           - 银行卡功能：切换到银行卡模式，可在同一A4排版中添加银行卡
-           - 打印：直接打印A4图片
-        
-        注意：身份证和银行卡外圆角均为透明背景
-        """
-        messagebox.showinfo("操作指南", help_text)
-    
-    def on_canvas_resize(self, event):
-        """画布大小变化时的处理"""
-        if hasattr(self, 'is_in_edit_mode') and self.is_in_edit_mode:
-            self.draw_a4_layout()
-    
-    def setup_drag_drop(self):
-        """设置拖拽功能"""
-        try:
-            # 注册拖拽目标
-            self.a4_canvas.drop_target_register(DND_FILES)
-            
-            # 绑定拖拽事件
-            self.a4_canvas.dnd_bind('<<DropEnter>>', self.on_drag_enter)
-            self.a4_canvas.dnd_bind('<<DropLeave>>', self.on_drag_leave)
-            # Audit 1.1: drops on the A4 canvas go through the NEW
-            # multi-file handler like everywhere else; the legacy
-            # single-file on_drop must never be bound again.
-            self.a4_canvas.dnd_bind('<<Drop>>', self.on_files_dropped)
-            
-            print("拖拽功能已启用")
-        except Exception as e:
-            print(f"拖拽功能设置失败: {e}")
-    
-    def on_drag_enter(self, event):
-        """拖拽进入事件"""
-        self.a4_canvas.config(cursor="hand2")
-        self.update_status("拖拽文件到对应区域")
-    
-    def on_drag_leave(self, event):
-        """拖拽离开事件"""
-        self.a4_canvas.config(cursor="")
-        self.update_status("就绪")
-        
-        # 清除悬停效果
-        if self.drag_over_side == "front":
-            self.a4_canvas.itemconfig(self.front_preview_area, outline="#BBDEFB", width=1)
-        elif self.drag_over_side == "back":
-            self.a4_canvas.itemconfig(self.back_preview_area, outline="#F8BBD0", width=1)
-        elif self.drag_over_side == "card":
-            self.a4_canvas.itemconfig(self.card_preview_area, outline="#C8E6C9", width=1)
-        self.drag_over_side = None
-        
-        # 取消悬停定时器
-        if self.hover_timer:
-            self.root.after_cancel(self.hover_timer)
-            self.hover_timer = None
-    
-    def on_drop(self, event):
-        """处理拖拽释放事件"""
-        try:
-            # 恢复光标
-            self.a4_canvas.config(cursor="")
-            
-            # 获取拖拽的文件路径
-            file_path = event.data
-            
-            # 处理可能的格式（去除花括号）
-            if isinstance(file_path, str):
-                file_path = file_path.strip('{}')
-            
-            if file_path:
-                # 检查文件类型
-                valid_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
-                file_ext = os.path.splitext(file_path.lower())[1]
-                
-                if file_ext in valid_extensions:
-                    # 获取鼠标位置（相对于画布）
-                    x = self.a4_canvas.winfo_pointerx() - self.a4_canvas.winfo_rootx()
-                    y = self.a4_canvas.winfo_pointery() - self.a4_canvas.winfo_rooty()
-                    
-                    # 获取区域信息
-                    info = self.canvas_info
-                    
-                    if not self.card_mode:
-                        # 身份证模式
-                        # 检查是否在人像面区域
-                        if (info.get('margin_x', 0) <= x <= info.get('margin_x', 0) + info.get('id_width', 0) and
-                            info.get('front_y', 0) <= y <= info.get('front_y', 0) + info.get('id_height', 0)):
-                            self.process_dropped_file(file_path, "front")
-                        
-                        # 检查是否在国徽面区域
-                        elif (info.get('margin_x', 0) <= x <= info.get('margin_x', 0) + info.get('id_width', 0) and
-                              info.get('back_y', 0) <= y <= info.get('back_y', 0) + info.get('id_height', 0)):
-                            self.process_dropped_file(file_path, "back")
-                        else:
-                            messagebox.showinfo("提示", "请将图片拖拽到人像面或国徽面区域")
-                    else:
-                        # 银行卡模式 - 检查是否在银行卡区域
-                        if (info.get('card_margin_x', 0) <= x <= info.get('card_margin_x', 0) + info.get('card_width', 0) and
-                            info.get('card_y', 0) <= y <= info.get('card_y', 0) + info.get('card_height', 0)):
-                            self.process_dropped_file(file_path, "card")
-                        else:
-                            messagebox.showinfo("提示", "请将图片拖拽到银行卡区域")
-                else:
-                    messagebox.showerror("错误", "不支持的文件类型，请上传图片文件")
-        
-        except Exception as e:
-            messagebox.showerror("错误", f"处理拖拽文件失败: {str(e)}")
-            print(f"拖拽错误详情: {e}")
-        
-        # 清除悬停效果
-        if self.drag_over_side == "front":
-            self.a4_canvas.itemconfig(self.front_preview_area, outline="#BBDEFB", width=1)
-        elif self.drag_over_side == "back":
-            self.a4_canvas.itemconfig(self.back_preview_area, outline="#F8BBD0", width=1)
-        elif self.drag_over_side == "card":
-            self.a4_canvas.itemconfig(self.card_preview_area, outline="#C8E6C9", width=1)
-        self.drag_over_side = None
-        
-        # 取消悬停定时器
-        if self.hover_timer:
-            self.root.after_cancel(self.hover_timer)
-            self.hover_timer = None
-    
-    def process_dropped_file(self, file_path, side):
-        """处理拖拽的文件"""
-        try:
-            # 加载图片
-            image = Image.open(file_path)
-            
-            # 限制图片大小
-            max_size = (1200, 1200)
-            image.thumbnail(max_size, Image.Resampling.LANCZOS)
-            
-            self._remember_dir(file_path)
-            # 在A4预览区域显示缩略图
-            self.show_preview_image(side, image)
-            
-            # 显示原始图片，等待用户标记
-            self.show_image_for_marking(side, image, file_path)
-            
-            if side == "front":
-                side_name = "身份证人像面"
-            elif side == "back":
-                side_name = "身份证国徽面"
-            else:
-                side_name = "银行卡"
-                
-            self.update_status(f"已通过拖拽加载{side_name}图片，请开始标记")
-            
-        except Exception as e:
-            messagebox.showerror("错误", f"加载图片失败: {str(e)}")
     
     def draw_a4_layout(self):
         """绘制A4布局（人像面、国徽面和银行卡区域）"""
@@ -1578,6 +1383,11 @@ class IDCardProcessor:
                     ok = getattr(self, side + '_processed', None) is not None
             except Exception:
                 ok = False
+            if not corners:
+                try:
+                    self.update_status('未检测到高精度边框，请手动标角')
+                except Exception:
+                    pass
             try:
                 on_done(ok)
             except Exception:
@@ -1952,9 +1762,13 @@ class IDCardProcessor:
             self._import_busy = False
             try:
                 self.refresh_pairs_panel()
+                for _pi in range(len(self.pairs)):
+                    self._maybe_swap_pair_sides(_pi)
                 _msg = f"批量导入完成：自动处理 {state['ok']} 张，待手动标角 {state['manual']} 张"
                 if state['bad']:
                     _msg += f"，另有 {len(state['bad'])} 张读不了：{'、'.join(state['bad'][:3])}"
+                if state.get('undetected'):
+                    _msg += f"；未检测到高精度边框（需手动标角）：{'、'.join(state['undetected'][:3])}"
                 self.update_status(_msg)
             except Exception:
                 pass
@@ -2007,6 +1821,9 @@ class IDCardProcessor:
                     state['ok'] += 1
                 else:
                     state['manual'] += 1
+                    if not corners:
+                        state.setdefault('undetected', []).append(
+                            path.replace('\\', '/').split('/')[-1])
                 try:
                     self._stash_workspace()
                 except Exception:
@@ -2080,6 +1897,12 @@ class IDCardProcessor:
     def _clear_pairs(self):
         if getattr(self, '_import_busy', False):
             self.update_status('正在识别上一张，请稍候…')
+            return
+        # 对齐原版「清空数据＋清空确认」（对账 B3）：有已导入内容时
+        # 先弹确认，防误触把整批顾客证件清掉。
+        _has = any(p[s].get('image') is not None or p[s].get('processed') is not None
+                   for p in self.pairs for s in ('front', 'back'))
+        if _has and not messagebox.askyesno('清空确认', '确定要清空全部证件数据吗？清空后不能恢复。'):
             return
         self.pairs = []
         self.current_open = None
@@ -2176,6 +1999,11 @@ class IDCardProcessor:
             try:
                 texts = _ocr_lines(img_ref)
                 info = _parse_id_front(texts) if side == 'front' else _parse_id_back(texts)
+                # Raw lines ride along for the import side check
+                # (_maybe_swap_pair_sides); pair state is only written
+                # on the UI thread in _poll_ocr_results, never here.
+                info = dict(info)
+                info['_texts'] = texts
             except Exception as e:
                 info = {}
                 err_text = repr(e)
@@ -2197,9 +2025,17 @@ class IDCardProcessor:
                     # belongs to a card that was deleted/swapped/cleared
                     # meanwhile and dies here.
                     if pair_ref[side].get('processed') is img_ref:
+                        _clean = info
+                        if idx >= 0 and isinstance(info, dict):
+                            _texts = info.get('_texts')
+                            _clean = {k: v for k, v in info.items() if not k.startswith('_')}
+                            pair_ref[side]['ocr'] = _clean
+                            if _texts:
+                                pair_ref[side]['_ocr_texts'] = _texts
+                                pair_ref[side]['_side_verdict'] = self._detect_side_by_ocr(_texts)
+                        self._on_ocr_done(idx, side, _clean, err_text)
                         if idx >= 0:
-                            pair_ref[side]['ocr'] = info
-                        self._on_ocr_done(idx, side, info, err_text)
+                            self._maybe_swap_pair_sides(idx)
                 except Exception:
                     pass
         except Exception:
@@ -2339,7 +2175,7 @@ class IDCardProcessor:
         ttk.Combobox(row2, values=list(range(1, 7)), textvariable=self.wm_rows_var, width=4, state='readonly').pack(side=tk.LEFT)
         tk.Label(row2, text='排版', bg='#EEF0F3').pack(side=tk.LEFT, padx=(12, 0))
         self.template_var = tk.StringVar(value='标准（每组一页）')
-        ttk.Combobox(row2, textvariable=self.template_var, values=['标准（每组一页）', '紧凑拼版'], width=14, state='readonly').pack(side=tk.LEFT)
+        ttk.Combobox(row2, textvariable=self.template_var, values=['标准（每组一页）', '紧凑拼版', '单列居中（清单）'], width=14, state='readonly').pack(side=tk.LEFT)
 
         # 第三行：整条橙色大按钮
         tk.Button(bar, text='生成 A4 并预览', command=self.show_batch_preview,
@@ -2365,7 +2201,11 @@ class IDCardProcessor:
 
     def _template_key(self):
         v = self.template_var.get() if hasattr(self, 'template_var') else ''
-        return 'compact' if '紧凑' in v else 'standard'
+        if '紧凑' in v:
+            return 'compact'
+        if '清单' in v:
+            return 'list'
+        return 'standard'
 
     def collect_pair_images(self):
         self._stash_workspace()
@@ -2376,8 +2216,49 @@ class IDCardProcessor:
                 groups.append(imgs)
         return groups
 
+
+    def _layout_positions(self, mode, n, pw, ph, cw, ch):
+        """全程序唯一的排版落位函数：批量线 compute_layout 与旧单组线
+        generate_a4_layout 共用，不许再各写一份公式。
+        mode: 'standard' / 'list' / 'compact'；n 为本页卡数；
+        pw/ph 页尺寸、cw/ch 卡尺寸（像素）；返回 [(x, y), ...] 左上角
+        坐标，顺序与入页卡序一致。
+        公式出自 IDCardMerge v2.2 本体取证（merge-layout-geometry.md，
+        预览窗排版引擎 func17），页单位 pt 换算 u = pw/595：
+        standard＝「上下居中（推荐）」：n=1 双向居中；n=2 时
+        X=(PW-W)/2，Y=0.25*PH-H/2 与 0.75*PH-H/2（A4 纵向即上沿
+        47.25/195.75mm、净距 94.5mm）；n>=3 转原版网格。
+        list＝「单列居中（清单）」：整组居中、卡距 20pt。
+        compact＝「纵向紧凑（双列）」：列距 max(10pt, (PW-2W)/3)，
+        Y=60pt+行*(H+15pt)。"""
+        u = pw / 595.0
+        if n <= 0:
+            return []
+        if mode == 'compact':
+            gap = max(10.0 * u, (pw - 2.0 * cw) / 3.0)
+            return [(gap + (i % 2) * (cw + gap),
+                     60.0 * u + (i // 2) * (ch + 15.0 * u)) for i in range(n)]
+        if mode == 'list':
+            gap = 20.0 * u
+            total = n * ch + (n - 1) * gap
+            y0 = max(20.0 * u, (ph - total) / 2.0)
+            x = (pw - cw) / 2.0
+            return [(x, y0 + i * (ch + gap)) for i in range(n)]
+        # standard
+        x = (pw - cw) / 2.0
+        if n == 1:
+            return [(x, (ph - ch) / 2.0)]
+        if n == 2:
+            return [(x, 0.25 * ph - ch / 2.0), (x, 0.75 * ph - ch / 2.0)]
+        cols = 3 if n > 4 else 2
+        gap = max(10.0 * u, (pw - cols * cw) / (cols + 1.0))
+        return [(gap + (i % cols) * (cw + gap),
+                 80.0 * u + (i // cols) * (ch + 40.0 * u)) for i in range(n)]
+
     def compute_layout(self):
-        """计算排版位置清单：[[(卡片图, x, y), ...], ...]，坐标为 A4 页 300dpi 像素"""
+        """计算排版位置清单：[[(卡片图, x, y), ...], ...]，坐标为 A4 页 300dpi 像素。
+        落位一律走 _layout_positions（全程序唯一实现）。standard/list
+        每组一页；compact 全卡双列连续排、满页换页。"""
         groups = self.collect_pair_images()
         if not groups:
             self.layout_pages = []
@@ -2395,37 +2276,32 @@ class IDCardProcessor:
                 return bg
             return img.convert('RGB')
 
+        mode = self._template_key()
         pages = []
-        if self._template_key() == 'compact':
+        if mode == 'compact':
             cards = [prep(im) for g in groups for im in g]
-            margin = int(10 * s)
-            gap_y = int(4 * s)
-            cols = 2
-            gap_x = pw - 2 * margin - cols * cw
-            rows = max(1, int((ph - 2 * margin + gap_y) // (ch + gap_y)))
-            per = cols * rows
-            for start in range(0, len(cards), per):
-                placements = []
-                for j, card in enumerate(cards[start:start + per]):
-                    r, c = divmod(j, cols)
-                    x = margin + c * (cw + gap_x)
-                    y = margin + r * (ch + gap_y)
-                    placements.append((card, x, y))
+            placements = []
+            i = 0
+            for card in cards:
+                x, y = self._layout_positions('compact', i + 1, pw, ph, cw, ch)[i]
+                if y + ch > ph and placements:
+                    pages.append(placements)
+                    placements = []
+                    i = 0
+                    x, y = self._layout_positions('compact', 1, pw, ph, cw, ch)[0]
+                placements.append((card, int(x), int(y)))
+                i += 1
+            if placements:
                 pages.append(placements)
         else:
-            spacing = int(20 * s)
             for g in groups:
                 imgs = [prep(im) for im in g]
-                total_h = len(imgs) * ch + (len(imgs) - 1) * spacing
-                y = (ph - total_h) // 2
-                x = (pw - cw) // 2
-                placements = []
-                for im in imgs:
-                    placements.append((im, x, y))
-                    y += ch + spacing
-                pages.append(placements)
+                pos = self._layout_positions(mode, len(imgs), pw, ph, cw, ch)
+                pages.append([(im, int(x), int(y))
+                              for im, (x, y) in zip(imgs, pos)])
         self.layout_pages = pages
         return pages
+
 
     def render_pages(self, layout=None):
         """按位置清单渲染 A4 页图（含水印），写入 self.batch_pages"""
@@ -2467,25 +2343,27 @@ class IDCardProcessor:
         s = self.mm_to_pixel
         pw, ph = int(self.a4_width * s), int(self.a4_height * s)
         cw, ch = int(self.id_width * s), int(self.id_height * s)
-        # Open fit-to-page by default (Qing's live feedback 2026-11-12:
-        # original size opened far too big). '原始大小' (1.0) stays on the
-        # toolbar; state['scale'] is set from fit_scale() before the
-        # first render() below.
-        state = {'idx': 0, 'photos': [], 'drag': None, 'scale': 1.0,
-                 'user_zoom': False, 'auto_fit': False}
+        # 预览按 IDCardMerge v2.2 原版逻辑页口径重做（对账 P1/P2/P3/P5/B1；
+        # 依据 PREVIEW-GEOMETRY.md 本体取证）：页以逻辑宽 595 为基准
+        # 呈现——占窗宽约 57%、左右居中、上边贴齐，页高按 A4 比例、
+        # 溢出纵向滚动；缩放一律以逻辑页为基准，不再有把 300dpi 光栅
+        # 当屏幕像素 1:1 摆的「原始大小」。state['scale'] 的单位是
+        # 「页显示宽 / 视口宽」，打开默认 0.567（595/1050 口径）。
+        state = {'idx': 0, 'photos': [], 'drag': None, 'scale': 0.567,
+                 'free': False, 'selected': None}
         win = ToplevelWithIcon(self.root)
         win.title('可交互排版预览（支持拖放）')
-        # Clamp to the screen and center it (Qing's small Acer is
-        # 768-class tall: a fixed 900x960 window opens taller than
-        # the screen and the bottom bar becomes unreachable).
+        # 原版固定 1050x650；青的小屏（768 高）放不下时按屏钳制。
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        ww, wh = min(900, sw - 40), min(960, sh - 80)
+        ww, wh = min(1050, sw - 40), min(650, sh - 80)
         win.geometry(f'{ww}x{wh}+{max(0, (sw - ww) // 2)}+{max(0, (sh - wh) // 2)}')
 
-        # 顶部工具条（对齐 IDCardMerge 交互预览：按钮在上、颜色分工，个个是真功能）
+        # 顶排六钮（原版顺序与颜色语义：裁剪素/JPG蓝/单页PDF蓝/
+        # 合并PDF绿/打印素/自由排版橙贴右）
         toolbar = tk.Frame(win, bg='white')
         toolbar.pack(side=tk.TOP, fill=tk.X)
         _btn_font = ('Arial', 10)
+
         def _tbtn(text, cmd, bg=None, fg=None):
             kw = dict(text=text, command=cmd, font=_btn_font, relief=tk.FLAT,
                       padx=12, pady=5, cursor='hand2')
@@ -2494,13 +2372,22 @@ class IDCardProcessor:
             b = tk.Button(toolbar, **kw)
             b.pack(side=tk.LEFT, padx=3, pady=5)
             return b
-        _tbtn('导出裁剪', self._export_crops)
-        _tbtn('导出为 JPG', lambda: self._export_pages_jpg(ask_mode=True), bg='#2E7CF6')
-        _tbtn('导出单页 PDF', self._export_pages_pdf_single, bg='#2E7CF6')
-        _tbtn('导出合并 PDF', self._export_pages_pdf, bg='#43C93B')
-        _tbtn('系统直接打印', self._print_pages)
-        _tbtn('原始大小', lambda: set_scale(1.0))
-        _tbtn('整页显示', lambda: set_scale(fit_scale()))
+        _tbtn('✂️ 导出裁剪', self._export_crops)
+        _tbtn('📂 导出为 JPG', self._export_pages_jpg, bg='#2E7CF6')
+        _tbtn('📑 导出单页 PDF', self._export_pages_pdf_single, bg='#2E7CF6')
+        _tbtn('📑 导出合并 PDF', self._export_pages_pdf, bg='#43C93B')
+        _tbtn('🖨️ 系统直接打印', self._print_pages)
+
+        def _toggle_free():
+            # 原版 func27 语义：开关只翻转许可并原地保留当前位置，
+            # 从不重排；关时清选中。文案双态、恒橙。
+            state['free'] = not state['free']
+            state['selected'] = None
+            state['drag'] = None
+            free_btn.config(text='🛑 锁定当前排版' if state['free'] else '🛠 开启自由排版')
+            render()
+        free_btn = _tbtn('🛠 开启自由排版', _toggle_free, bg='#FF9500')
+        free_btn.pack(side=tk.RIGHT, padx=3, pady=5)
 
         header = tk.Label(win, text='', bg='#808080', fg='#F0F0F0', font=('Arial', 10))
         header.pack(side=tk.TOP, fill=tk.X)
@@ -2517,145 +2404,109 @@ class IDCardProcessor:
         xsb.grid(row=1, column=0, sticky='ew')
 
         def metrics():
-            sc = state['scale']
-            dw, dh = int(pw * sc), int(ph * sc)
-            # Center the page in the viewport (the original centers its
-            # page; the old fixed 24px anchor left a gray void whenever
-            # the window was larger than the scaled page -- Qing flagged
-            # it live 2026-11-12). Falls back to 24 whenever the page
-            # fills or exceeds the viewport, and before the canvas has
-            # a real size. on_motion/on_release read the same metrics(),
-            # so drag clamping/release math stay consistent.
+            # 页宽 = 视口宽 * scale（逻辑页口径）；水平居中、上边贴齐
+            # （oy=0）、纵向溢出滚动。k = 屏幕像素/页像素。
             try:
-                vw, vh = canvas.winfo_width(), canvas.winfo_height()
+                vw = canvas.winfo_width()
             except Exception:
-                vw, vh = 0, 0
-            ox = max(24, (vw - dw) // 2)
-            oy = max(24, (vh - dh) // 2)
-            return (dw, dh, max(10, int(cw * sc)), max(10, int(ch * sc)), ox, oy)
-
-        def fit_scale():
-            # Prefer the canvas's real size once it has one. Before
-            # the window is mapped, Tk reports the canvas as 1x1 and
-            # the old max(200, ...) floor turned that into a ~5%
-            # scale -- the preview opened as a thumbnail on Qing's
-            # machine (2026-11-13). The fallback derives the viewport
-            # from the window geometry (ww/wh, already computed above)
-            # minus the packed chrome's requested sizes, which Tk
-            # knows before the window is ever mapped.
-            try:
-                cw_now, ch_now = canvas.winfo_width(), canvas.winfo_height()
-            except Exception:
-                cw_now, ch_now = 0, 0
-            if cw_now > 50 and ch_now > 50:
-                vw, vh = cw_now - 8, ch_now - 8
-            else:
-                try:
-                    chrome_h = (toolbar.winfo_reqheight()
-                                + header.winfo_reqheight()
-                                + bar.winfo_reqheight()
-                                + xsb.winfo_reqheight())
-                    vw = max(200, ww - ysb.winfo_reqwidth() - 8)
-                    vh = max(200, wh - chrome_h - 8)
-                except Exception:
-                    vw, vh = 860, 800
-            return min(vw / pw, vh / ph)
-
-        def set_scale(sc):
-            # Toolbar zoom buttons only: from here on the user owns
-            # the scale, and the one-time auto refit below must never
-            # override a manual choice.
-            state['user_zoom'] = True
-            state['scale'] = sc
-            render()
+                vw = 0
+            if vw <= 50:
+                vw = max(200, ww - 24)
+            dw = max(10, int(vw * state['scale']))
+            dh = int(dw * ph / pw)
+            k = dw / pw
+            ox = max(0, (vw - dw) // 2)
+            oy = 0
+            return (dw, dh, max(10, int(cw * k)), max(10, int(ch * k)), ox, oy, k)
 
         def render():
-            dw, dh, dcw, dch, ox, oy = metrics()
-            sc = state['scale']
+            dw, dh, dcw, dch, ox, oy, k = metrics()
             canvas.delete('all')
             state['photos'] = []
             try:
                 vw, vh = canvas.winfo_width(), canvas.winfo_height()
             except Exception:
                 vw, vh = 0, 0
-            canvas.configure(scrollregion=(0, 0, max(vw, ox + dw + 24), max(vh, oy + dh + 24)))
+            canvas.configure(scrollregion=(0, 0, max(vw, ox + dw), max(vh, oy + dh)))
             canvas.create_rectangle(ox, oy, ox + dw, oy + dh, fill='white', outline='black')
             for i, (img, x, y) in enumerate(layout[state['idx']]):
-                dx, dy = ox + int(x * sc), oy + int(y * sc)
+                dx, dy = ox + int(x * k), oy + int(y * k)
                 tag = f'card{i}'
-                canvas.create_rectangle(dx, dy, dx + dcw, dy + dch, outline='#999999', tags=(tag,))
+                sel = state['selected'] == i
+                canvas.create_rectangle(dx, dy, dx + dcw, dy + dch,
+                                        outline='#2FBF71' if sel else '#999999',
+                                        width=2 if sel else 1, tags=(tag,))
                 thumb = img.resize((dcw, dch), Image.Resampling.LANCZOS)
                 photo = ImageTk.PhotoImage(thumb, master=self.root)
                 state['photos'].append(photo)
                 canvas.create_image(dx, dy, image=photo, anchor=tk.NW, tags=(tag,))
             header.config(text=f"--- 第 {state['idx'] + 1} 页 A4 画布 ---")
-            info.config(text=f"第 {state['idx'] + 1} / {len(layout)} 页 · 显示 {int(sc * 100)}% · 拖动卡片可调整位置，保存/打印按新位置")
+            info.config(text=f"第 {state['idx'] + 1} / {len(layout)} 页 · 拖动卡片可调整位置，保存/打印按新位置")
 
-        def on_press(event):
+        def _card_at():
             items = canvas.find_withtag('current')
             if not items:
-                return
+                return None
             for t in canvas.gettags(items[0]):
                 if t.startswith('card'):
-                    state['drag'] = (int(t[4:]), canvas.canvasx(event.x), canvas.canvasy(event.y))
-                    return
+                    return int(t[4:])
+            return None
+
+        def on_press(event):
+            # 原版双检语义：自由排版关时全卡锁死（点选、拖动都不
+            # 发生）；开后须先点选卡片，拖的永远是被选中的那张。
+            if not state['free']:
+                return
+            i = _card_at()
+            state['selected'] = i
+            state['drag'] = (i, canvas.canvasx(event.x), canvas.canvasy(event.y)) if i is not None else None
+            render()
 
         def on_motion(event):
-            if not state['drag']:
+            if not state['free'] or not state['drag']:
                 return
-            dw, dh, dcw, dch, ox, oy = metrics()
             i, lx, ly = state['drag']
             dx = canvas.canvasx(event.x) - lx
             dy = canvas.canvasy(event.y) - ly
-            tag = f'card{i}'
-            box = canvas.bbox(tag)
+            if not (dx or dy):
+                return
+            # 原版 Dragged：增量原样累加，无页界钳制、无吸附。
+            canvas.move(f'card{i}', dx, dy)
+            state['drag'] = (i, lx + dx, ly + dy)
+            # 拖动中显示过被拖卡中心的整页横/竖参考线，松手隐藏。
+            dw, dh, dcw, dch, ox, oy, k = metrics()
+            box = canvas.bbox(f'card{i}')
+            canvas.delete('guide')
             if box:
-                if box[0] + dx < ox:
-                    dx = ox - box[0]
-                if box[2] + dx > ox + dw:
-                    dx = ox + dw - box[2]
-                if box[1] + dy < oy:
-                    dy = oy - box[1]
-                if box[3] + dy > oy + dh:
-                    dy = oy + dh - box[3]
-            if dx or dy:
-                canvas.move(tag, dx, dy)
-                state['drag'] = (i, lx + dx, ly + dy)
+                cx = (box[0] + box[2]) / 2
+                cy = (box[1] + box[3]) / 2
+                canvas.create_line(ox, cy, ox + dw, cy, fill='#2FBF71', dash=(4, 3), tags=('guide',))
+                canvas.create_line(cx, oy, cx, oy + dh, fill='#2FBF71', dash=(4, 3), tags=('guide',))
 
         def on_release(event):
             if not state['drag']:
                 return
             i = state['drag'][0]
             state['drag'] = None
+            canvas.delete('guide')
             box = canvas.bbox(f'card{i}')
             if box:
-                _dw, _dh, _dcw, _dch, ox, oy = metrics()
+                _dw, _dh, _dcw, _dch, ox, oy, k = metrics()
                 img, _x, _y = layout[state['idx']][i]
-                layout[state['idx']][i] = (img, (box[0] - ox) / state['scale'], (box[1] - oy) / state['scale'])
+                layout[state['idx']][i] = (img, (box[0] - ox) / k, (box[1] - oy) / k)
 
         canvas.bind('<ButtonPress-1>', on_press)
         canvas.bind('<B1-Motion>', on_motion)
         canvas.bind('<ButtonRelease-1>', on_release)
         canvas.bind('<MouseWheel>', lambda e: canvas.yview_scroll(int(-e.delta / 120), 'units'))
         canvas.bind('<Shift-MouseWheel>', lambda e: canvas.xview_scroll(int(-e.delta / 120), 'units'))
-        # Re-center on resize/maximize. render() never resizes the
-        # canvas itself (setting scrollregion is not a size change),
-        # so this cannot loop; the guard covers layout storms anyway.
         _cfg_guard = {'busy': False}
+
         def _on_canvas_configure(event):
             if _cfg_guard['busy']:
                 return
             _cfg_guard['busy'] = True
             try:
-                # One-time refit: the initial scale may have come
-                # from the geometry fallback before the canvas had a
-                # real size. The first time the canvas reports a real
-                # size (>50px), refit exactly once -- unless the user
-                # already took the scale over with a toolbar button.
-                if not state['auto_fit'] and not state['user_zoom'] \
-                        and event.width > 50 and event.height > 50:
-                    state['auto_fit'] = True
-                    state['scale'] = fit_scale()
                 render()
             finally:
                 _cfg_guard['busy'] = False
@@ -2664,19 +2515,98 @@ class IDCardProcessor:
         bar.pack(side=tk.BOTTOM, fill=tk.X)
         info = tk.Label(bar, text='', bg='#F0F0F0', fg='#555555', font=('Arial', 9))
         info.pack(side=tk.LEFT, padx=8, pady=4)
-        ttk.Button(bar, text='下一页', command=lambda: (state.update(idx=(state['idx'] + 1) % len(layout)), render())).pack(side=tk.RIGHT, padx=4, pady=3)
-        ttk.Button(bar, text='上一页', command=lambda: (state.update(idx=(state['idx'] - 1) % len(layout)), render())).pack(side=tk.RIGHT, padx=4, pady=3)
-        state['scale'] = fit_scale()
+
+        def _zoom(f):
+            state['scale'] = min(1.6, max(0.2, state['scale'] * f))
+            render()
+        ttk.Button(bar, text='放大', command=lambda: _zoom(1.25)).pack(side=tk.RIGHT, padx=4, pady=3)
+        ttk.Button(bar, text='缩小', command=lambda: _zoom(0.8)).pack(side=tk.RIGHT, padx=4, pady=3)
+        ttk.Button(bar, text='下一页', command=lambda: (state.update(idx=(state['idx'] + 1) % len(layout), selected=None, drag=None), render())).pack(side=tk.RIGHT, padx=4, pady=3)
+        ttk.Button(bar, text='上一页', command=lambda: (state.update(idx=(state['idx'] - 1) % len(layout), selected=None, drag=None), render())).pack(side=tk.RIGHT, padx=4, pady=3)
         render()
+
+
+    def _export_base_name(self, pair_idx):
+        """导出文件名前缀（原版命名 %s 的取值）：优先该组正面 OCR 读到
+        的姓名；没有则用该组第一张源图文件名（去扩展名）；再没有用
+        「证件」。原版命名（对照表 §5）：%s_IDCard.pdf、
+        %s_IDCard_%d.pdf、%s_IDCard_%d.jpg、裁剪 %s_Crop_P%d_%d.jpg。"""
+        name = ''
+        try:
+            pair = self.pairs[pair_idx]
+            name = (pair['front'].get('ocr') or {}).get('姓名', '') or ''
+            if not name:
+                for side in ('front', 'back'):
+                    p = pair[side].get('path')
+                    if p:
+                        name = os.path.splitext(os.path.basename(p))[0]
+                        break
+        except Exception:
+            name = ''
+        name = ''.join(c for c in str(name).strip() if c not in '\\/:*?"<>|')
+        return name or '证件'
+
+    @staticmethod
+    def _detect_side_by_ocr(texts):
+        """只凭 OCR 文本判面别，判不准返回 None（不许猜）：正面看身份
+        号码（17 位+校验位且校验通过）或姓名+住址字段同时出现；反面
+        看签发机关/有效期限字段。两边特征同时出现同样判不准。"""
+        flat = ''.join(texts).replace(' ', '')
+        front = False
+        m = _re.search(r'[0-9]{17}[0-9Xx]', flat)
+        if m and _id_checksum_ok(m.group(0).upper()):
+            front = True
+        elif any('姓名' in t for t in texts) and any('住址' in t for t in texts):
+            front = True
+        back = any(('签发机关' in t) or ('有效期限' in t) for t in texts)
+        if front and not back:
+            return 'front'
+        if back and not front:
+            return 'back'
+        return None
+
+    def _maybe_swap_pair_sides(self, idx):
+        """导入面别纠正（大包施工单第 5 项）：一组两面都已处理且都判
+        出面别、且判定与槽位正好相反时，整组对调摆正；任一面判不准
+        就不动、不猜。对调走 swap_pair_sides 同一套数据交换口径。"""
+        if getattr(self, '_import_busy', False):
+            return False
+        if not (0 <= idx < len(self.pairs)):
+            return False
+        pair = self.pairs[idx]
+        verdicts = {}
+        for side in ('front', 'back'):
+            slot = pair[side]
+            if slot.get('processed') is None:
+                return False
+            v = slot.get('_side_verdict')
+            if v is None:
+                texts = slot.get('_ocr_texts')
+                if not texts:
+                    return False
+                v = self._detect_side_by_ocr(texts)
+                slot['_side_verdict'] = v
+            verdicts[side] = v
+        if verdicts.get('front') == 'back' and verdicts.get('back') == 'front':
+            pair['front'], pair['back'] = pair['back'], pair['front']
+            if getattr(self, 'current_open', None) == idx:
+                self._load_pair_to_workspace(idx)
+            self.refresh_pairs_panel()
+            self.update_status(f'第{idx + 1}组正反面放反了，已自动对调摆正')
+            return True
+        return False
 
     def _export_crops(self):
         """导出裁剪：把各组已拉正的证件图逐张存到所选文件夹（真功能）"""
         items = []
         for gi, pair in enumerate(self.pairs):
+            base = None
             for side, sname in (('front', '正面'), ('back', '反面')):
                 img = pair[side].get('processed') if isinstance(pair.get(side), dict) else None
                 if img is not None:
-                    items.append((gi + 1, sname, img))
+                    if base is None:
+                        base = self._export_base_name(gi)
+                    items.append((gi + 1, sname, img, base, side))
         if not items:
             messagebox.showwarning('提示', '还没有已处理的证件可导出')
             return
@@ -2685,9 +2615,9 @@ class IDCardProcessor:
             return
         self._remember_dir(folder)
         saved, failed = 0, []
-        for gi, sname, img in items:
+        for gi, sname, img, base, side_key in items:
             try:
-                img.convert('RGB').save(os.path.join(folder, f'第{gi}组-{sname}.jpg'), quality=95)
+                img.convert('RGB').save(os.path.join(folder, f'{base}_Crop_P{gi}_{0 if side_key == "front" else 1}.jpg'), quality=95)
                 saved += 1
             except Exception as e:
                 failed.append(f'第{gi}组-{sname}：{e}')
@@ -2697,53 +2627,13 @@ class IDCardProcessor:
         elif saved:
             messagebox.showinfo('完成', f'已导出 {saved} 张裁剪图到所选文件夹')
 
-    def _choose_jpg_mode(self, parent):
-        """JPG 导出模式弹窗（对齐 IDCardMerge 子菜单）：完整 A4 / 紧凑拼图，
-        默认预选当前排版，返回 'full' / 'compact' / None"""
-        result = {'mode': None}
-        dlg = ToplevelWithIcon(parent)
-        dlg.title('选择 JPG 导出模式')
-        dlg.geometry('380x210')
-        dlg.transient(parent)
-        dlg.grab_set()
-        tk.Label(dlg, text='请选择需要导出的画布类型：', font=('Arial', 10)).pack(anchor='w', padx=18, pady=(16, 8))
-        var = tk.StringVar(value='compact' if self._template_key() == 'compact' else 'full')
-        tk.Radiobutton(dlg, text='完整 A4 画布（带白边，适合直接打印）', variable=var, value='full', font=('Arial', 10)).pack(anchor='w', padx=26, pady=3)
-        tk.Radiobutton(dlg, text='紧凑证件拼图（无多余白边，适合插入 Word/Excel）', variable=var, value='compact', font=('Arial', 10)).pack(anchor='w', padx=26, pady=3)
-        brow = tk.Frame(dlg)
-        brow.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=12)
-        tk.Button(brow, text='下一步', bg='#2E7CF6', fg='white', activebackground='#2E7CF6',
-                  activeforeground='white', relief=tk.FLAT, padx=16, pady=4,
-                  command=lambda: (result.update(mode=var.get()), dlg.destroy())).pack(side=tk.RIGHT)
-        tk.Button(brow, text='取消', relief=tk.FLAT, padx=16, pady=4,
-                  command=dlg.destroy).pack(side=tk.RIGHT, padx=8)
-        dlg.wait_window()
-        return result['mode']
-
-    def _export_pages_jpg(self, ask_mode=False):
-        mode = None
-        if ask_mode:
-            mode = self._choose_jpg_mode(self.root)
-            if mode is None:
-                return
-        pages = None
-        if mode is not None and (mode == 'compact') != (self._template_key() == 'compact'):
-            # 按所选模式临时重排导出（不改主界面设置、不动当前拖好的排版）
-            saved_var = self.template_var.get()
-            saved_layout = getattr(self, 'layout_pages', None)
-            saved_pages = getattr(self, 'batch_pages', None)
-            try:
-                self.template_var.set('紧凑拼版' if mode == 'compact' else '标准（每组一页）')
-                lay2 = self.compute_layout()
-                pages = self.render_pages(lay2) if lay2 else []
-            finally:
-                self.template_var.set(saved_var)
-                self.layout_pages = saved_layout
-                self.batch_pages = saved_pages
-        if pages is None:
-            if getattr(self, 'layout_pages', None):
-                self.render_pages()
-            pages = getattr(self, 'batch_pages', None) or self.compose_a4_pages()
+    def _export_pages_jpg(self):
+        """导出为 JPG：按原版流程点钮直接选文件夹保存，不再先弹自创
+        的「选择 JPG 导出模式」窗（对账 F2：该窗自称对齐 IDCardMerge
+        子菜单，经查无据，本轮去除）。命名按原版 %s_IDCard_%d.jpg。"""
+        if getattr(self, 'layout_pages', None):
+            self.render_pages()
+        pages = getattr(self, 'batch_pages', None) or self.compose_a4_pages()
         if not pages:
             messagebox.showwarning('提示', '还没有可导出的拼版，请先处理证件')
             return
@@ -2751,10 +2641,11 @@ class IDCardProcessor:
         if not folder:
             return
         self._remember_dir(folder)
+        base = self._export_base_name(0)
         saved, failed = 0, []
         for i, p in enumerate(pages):
             try:
-                p.save(os.path.join(folder, f'证件拼版_{i + 1:02d}.jpg'), quality=95, dpi=(self.dpi, self.dpi))
+                p.save(os.path.join(folder, f'{base}_IDCard_{i + 1}.jpg'), quality=95, dpi=(self.dpi, self.dpi))
                 saved += 1
             except Exception as e:
                 failed.append(f'第{i + 1}页：{e}')
@@ -2763,6 +2654,7 @@ class IDCardProcessor:
                                  f'已保存 {saved} 页，以下 {len(failed)} 页保存失败：\n' + '\n'.join(failed[:5]))
         elif saved:
             messagebox.showinfo('完成', f'已保存 {saved} 页 JPG 到所选文件夹')
+
 
     def _pages_to_pdf_bytes(self, pages):
         # The temp dir holds full-size renders of CUSTOMER ID pages; it
@@ -2791,12 +2683,12 @@ class IDCardProcessor:
             return
         self._remember_dir(folder)
         try:
-            with open(os.path.join(folder, '证件拼版.pdf'), 'wb') as f:
+            with open(os.path.join(folder, f'{self._export_base_name(0)}_IDCard.pdf'), 'wb') as f:
                 f.write(self._pages_to_pdf_bytes(pages))
         except Exception as e:
             messagebox.showerror('导出失败', f'PDF 没能保存：{e}')
             return
-        messagebox.showinfo('完成', '已保存 证件拼版.pdf 到所选文件夹')
+        messagebox.showinfo('完成', f"已保存 {self._export_base_name(0)}_IDCard.pdf 到所选文件夹")
 
     def _export_pages_pdf_single(self):
         """导出单页 PDF：每一页 A4 单独存一个 PDF 文件到所选文件夹"""
@@ -2813,7 +2705,7 @@ class IDCardProcessor:
         saved, failed = 0, []
         for i, p in enumerate(pages):
             try:
-                with open(os.path.join(folder, f'证件拼版_{i + 1:02d}.pdf'), 'wb') as f:
+                with open(os.path.join(folder, f'{self._export_base_name(0)}_IDCard_{i + 1}.pdf'), 'wb') as f:
                     f.write(self._pages_to_pdf_bytes([p]))
                 saved += 1
             except Exception as e:
@@ -3991,6 +3883,17 @@ class IDCardProcessor:
             self.mark_canvas.delete(item)
         self.point_circles = []
         
+        # 原版规格（对账 B5）：半透明面＋绿色实线框＋四绿点白圈边。
+        # Tk canvas 无 alpha 填充，半透明面用 stipple 近似；青色虚线
+        # 是云雪星球底子自带的旧样式，本轮改掉。
+        if len(self.adjust_points) == 4:
+            _poly_pts = []
+            for (px, py) in self.adjust_points:
+                _poly_pts += [px * self.current_scale, py * self.current_scale]
+            _poly = self.mark_canvas.create_polygon(
+                _poly_pts, fill='#2FBF71', stipple='gray25', outline='')
+            self.point_circles.append(_poly)
+
         # 绘制四个角点（可拖动）
         colors = ["#2FBF71", "#2FBF71", "#2FBF71", "#2FBF71"]  # unified green handles, same as IDCardMerge
         labels = ["左上", "右上", "右下", "左下"]
@@ -4026,7 +3929,7 @@ class IDCardProcessor:
             
             line_id = self.mark_canvas.create_line(
                 x1, y1, x2, y2,
-                fill="cyan", width=2, dash=(5, 2)
+                fill="#2FBF71", width=2
             )
             self.point_circles.append(line_id)
     
@@ -4327,7 +4230,7 @@ class IDCardProcessor:
             self.crosshair_lines.append(
                 self.mark_canvas.create_line(
                     0, y, canvas_width, y,
-                    fill="cyan", dash=(5, 2), width=1
+                    fill="#2FBF71", width=1
                 )
             )
         
@@ -4336,7 +4239,7 @@ class IDCardProcessor:
             self.crosshair_lines.append(
                 self.mark_canvas.create_line(
                     x, 0, x, canvas_height,
-                    fill="cyan", dash=(5, 2), width=1
+                    fill="#2FBF71", width=1
                 )
             )
         
@@ -4467,7 +4370,7 @@ class IDCardProcessor:
             self.crosshair_lines.append(
                 self.mark_canvas.create_line(
                     0, canvas_y, canvas_width, canvas_y,
-                    fill="cyan", dash=(5, 2), width=1
+                    fill="#2FBF71", width=1
                 )
             )
         
@@ -4476,7 +4379,7 @@ class IDCardProcessor:
             self.crosshair_lines.append(
                 self.mark_canvas.create_line(
                     canvas_x, 0, canvas_x, canvas_height,
-                    fill="cyan", dash=(5, 2), width=1
+                    fill="#2FBF71", width=1
                 )
             )
     
@@ -4995,38 +4898,27 @@ class IDCardProcessor:
         return Image.fromarray(result_rgb)
     
     def generate_a4_layout(self):
-        """生成A4排版 - 不再询问背景，使用当前选择的背景"""
-        # 检查是否有处理过的图片
+        """生成A4排版（旧单组线）：落位与批量线共用 _layout_positions
+        的 standard 公式，不再自带一份组居中＋20mm 的旧公式。"""
         front_available = hasattr(self, 'front_processed') and self.front_processed is not None
         back_available = hasattr(self, 'back_processed') and self.back_processed is not None
         card_available = hasattr(self, 'card_processed') and self.card_processed is not None
-        
+
         if not front_available and not back_available and not card_available:
             messagebox.showwarning("警告", "请先处理至少一张图片")
             return
-            
+
         try:
-            # 使用当前背景设置
             use_transparent = self.use_transparent
-            
-            # 计算A4尺寸（像素）
             a4_width_px = int(self.a4_width * self.mm_to_pixel)
             a4_height_px = int(self.a4_height * self.mm_to_pixel)
-            
-            # 创建A4画布
             if use_transparent:
                 a4_image = Image.new('RGBA', (a4_width_px, a4_height_px), (255, 255, 255, 0))
             else:
                 a4_image = Image.new('RGB', (a4_width_px, a4_height_px), 'white')
-            
-            # 证件尺寸（像素）
             id_width_px = int(self.id_width * self.mm_to_pixel)
             id_height_px = int(self.id_height * self.mm_to_pixel)
-            
-            # 增加A4排版证件之间的距离 - 从10mm增加到20mm
-            spacing = int(20 * self.mm_to_pixel)  # 增加到20mm间距
-            
-            # 确定图片数量和类型
+
             images = []
             if front_available:
                 images.append(("front", self.front_processed, "身份证人像面"))
@@ -5034,697 +4926,37 @@ class IDCardProcessor:
                 images.append(("back", self.back_processed, "身份证国徽面"))
             if card_available:
                 images.append(("card", self.card_processed, "银行卡"))
-            
-            # 计算总高度和起始位置
-            total_height = len(images) * id_height_px + (len(images) - 1) * spacing
-            start_y = (a4_height_px - total_height) // 2
-            
-            # 居中放置图片
-            for i, (side, img, name) in enumerate(images):
-                # 确保图片尺寸正确
+
+            positions = self._layout_positions('standard', len(images),
+                                               a4_width_px, a4_height_px,
+                                               id_width_px, id_height_px)
+            for (side, img, name), (x_pos, y_pos) in zip(images, positions):
                 if img.size != (id_width_px, id_height_px):
                     img = img.resize((id_width_px, id_height_px), Image.Resampling.LANCZOS)
-                
-                # 计算位置（水平居中）
-                x_pos = (a4_width_px - id_width_px) // 2
-                y_pos = start_y + i * (id_height_px + spacing)
-                
-                # 如果是白色背景，需要特殊处理透明图片
+                x_pos, y_pos = int(x_pos), int(y_pos)
                 if not use_transparent:
-                    # 对于白色背景，确保图片是RGB模式
                     if img.mode == 'RGBA':
-                        # 创建白色背景的RGB图像
                         rgb_image = Image.new('RGB', img.size, (255, 255, 255))
-                        # 将RGBA图像粘贴到白色背景上，透明区域会自动填充为白色
                         rgb_image.paste(img, (0, 0), img if img.mode == 'RGBA' else None)
                         img = rgb_image
                     elif img.mode != 'RGB':
                         img = img.convert('RGB')
-                    
-                    # 直接粘贴到白色背景上
                     a4_image.paste(img, (x_pos, y_pos))
                 else:
-                    # 对于透明背景，确保图片是RGBA模式
                     if img.mode != 'RGBA':
                         img = img.convert('RGBA')
-                    
-                    # 使用alpha通道粘贴，保持透明背景
                     a4_image.paste(img, (x_pos, y_pos), img)
-            
-            # 保存A4排版图片
+
             self.a4_layout_image = a4_image
             self.a4_use_transparent = use_transparent
-            self.a4_images_info = images  # 保存图片信息供PDF生成使用
-            
-            # 显示A4排版在画布上
-            self.show_a4_layout_on_canvas(a4_image)
-            
+            self.a4_images_info = images
+            # 旧画布预览（show_a4_layout_on_canvas）已随隐藏工作区下线删除，
+            # 排版结果改走批量预览窗查看；此处只存图与状态。
             self.update_status("A4排版已生成，可以保存或打印")
-            
         except Exception as e:
             messagebox.showerror("错误", f"生成A4排版失败: {str(e)}")
-    
-    def show_a4_layout_on_canvas(self, a4_image):
-        """在A4画布上显示排版结果"""
-        # 清空画布
-        self.a4_canvas.delete("all")
-        self.is_in_edit_mode = False
-        
-        canvas_width = self.a4_canvas.winfo_width()
-        canvas_height = self.a4_canvas.winfo_height()
-        
-        if canvas_width <= 1 or canvas_height <= 1:
-            canvas_width = 780
-            canvas_height = 700
-        
-        # 缩放图片以适应画布
-        display_img = a4_image.copy()
-        display_img.thumbnail((canvas_width-20, canvas_height-20), Image.Resampling.LANCZOS)
-        photo = ImageTk.PhotoImage(display_img, master=self.root)
-        
-        # 保存图片引用
-        self.a4_preview_img = photo
-        
-        # 在画布上显示A4排版
-        self.a4_canvas.create_image(
-            canvas_width/2, canvas_height/2,
-            image=photo, anchor=tk.CENTER
-        )
-        
-        # 绘制A4边框
-        border_width = 1
-        self.a4_canvas.create_rectangle(
-            border_width, border_width,
-            canvas_width - border_width, canvas_height - border_width,
-            outline="#CCCCCC", width=border_width
-        )
-        
-        # 添加标题
-        self.a4_canvas.create_text(
-            canvas_width/2, 20,
-            text="A4排版预览 - 已就绪，可以保存或打印",
-            fill="green", font=("Arial", 14, "bold")
-        )
-        
-        # 添加返回按钮
-        back_btn = tk.Button(self.a4_frame, text="返回编辑",
-                            command=self.draw_a4_layout,
-                            bg="#4CAF50", fg="white",
-                            font=("Arial", 10), padx=15, pady=5)
-        self.a4_canvas.create_window(
-            canvas_width - 80, canvas_height - 30,
-            window=back_btn
-        )
-        
-        # 添加保存和打印按钮
-        save_btn = tk.Button(self.a4_frame, text="保存图片",
-                           command=self.save_a4_image,
-                           bg="#2196F3", fg="white",
-                           font=("Arial", 10), padx=15, pady=5)
-        self.a4_canvas.create_window(
-            canvas_width/2 - 150, canvas_height - 30,
-            window=save_btn
-        )
-        
-        # 添加保存PDF按钮
-        save_pdf_btn = tk.Button(self.a4_frame, text="保存PDF",
-                               command=self.save_a4_pdf,
-                               bg="#9C27B0", fg="white",
-                               font=("Arial", 10), padx=15, pady=5)
-        self.a4_canvas.create_window(
-            canvas_width/2, canvas_height - 30,
-            window=save_pdf_btn
-        )
-        
-        print_btn = tk.Button(self.a4_frame, text="打印图片",
-                            command=self.print_a4_image,
-                            bg="#FF9800", fg="white",
-                            font=("Arial", 10), padx=15, pady=5)
-        self.a4_canvas.create_window(
-            canvas_width/2 + 150, canvas_height - 30,
-            window=print_btn
-        )
-        
-        # 背景选择区域
-        bg_frame = tk.Frame(self.a4_frame, bg="white")
-        
-        tk.Label(bg_frame, text="背景:", bg="white").pack(side=tk.LEFT, padx=5)
-        
-        # 背景选择单选按钮
-        self.bg_var = tk.StringVar(value="white")  # 默认白色背景
-        white_rb = tk.Radiobutton(bg_frame, text="白色", variable=self.bg_var, 
-                                 value="white", bg="white", command=self.change_background)
-        white_rb.pack(side=tk.LEFT)
-        
-        trans_rb = tk.Radiobutton(bg_frame, text="透明", variable=self.bg_var, 
-                                 value="transparent", bg="white", command=self.change_background)
-        trans_rb.pack(side=tk.LEFT)
-        
-        self.a4_canvas.create_window(
-            canvas_width/2, canvas_height - 70,
-            window=bg_frame
-        )
-        
-        # 重新生成按钮
-        regen_btn = tk.Button(self.a4_frame, text="重新生成",
-                            command=self.regenerate_a4_layout,
-                            bg="#607D8B", fg="white",
-                            font=("Arial", 10), padx=15, pady=5)
-        self.a4_canvas.create_window(
-            80, canvas_height - 30,
-            window=regen_btn
-        )
-        
-        # 编辑文字按钮
-        text_btn = tk.Button(self.a4_frame, text="编辑文字",
-                           command=self.toggle_text_edit,
-                           bg="#795548", fg="white",
-                           font=("Arial", 10), padx=15, pady=5)
-        self.a4_canvas.create_window(
-            80, canvas_height - 70,
-            window=text_btn
-        )
-        
-        # 单独保存按钮
-        save_single_btn = tk.Button(self.a4_frame, text="单独保存",
-                                  command=self.show_single_save_menu,
-                                  bg="#FF5722", fg="white",
-                                  font=("Arial", 10), padx=15, pady=5)
-        self.a4_canvas.create_window(
-            canvas_width - 80, canvas_height - 70,
-            window=save_single_btn
-        )
-    
-    def change_background(self):
-        """切换背景"""
-        if self.bg_var.get() == "transparent":
-            self.use_transparent = True
-            self.background_color = "transparent"
-            self.update_status("已切换到透明背景")
-        else:
-            self.use_transparent = False
-            self.background_color = "white"
-            self.update_status("已切换到白色背景")
-        
-        # 如果已有A4排版，重新生成
-        if hasattr(self, 'a4_layout_image'):
-            self.regenerate_a4_layout()
-    
-    def show_single_save_menu(self):
-        """显示单独保存菜单"""
-        menu = tk.Menu(self.root, tearoff=0)
-        
-        if hasattr(self, 'front_processed') and self.front_processed is not None:
-            menu.add_command(label="保存人像面", command=lambda: self.save_single_side("front"))
-        
-        if hasattr(self, 'back_processed') and self.back_processed is not None:
-            menu.add_command(label="保存国徽面", command=lambda: self.save_single_side("back"))
-        
-        if hasattr(self, 'card_processed') and self.card_processed is not None:
-            menu.add_command(label="保存银行卡", command=lambda: self.save_single_side("card"))
-        
-        if menu.index("end") is not None:
-            menu.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
-    
-    def regenerate_a4_layout(self):
-        """重新生成A4排版（使用当前背景设置）"""
-        self.generate_a4_layout()
-    
-    def save_a4_image(self):
-        """保存A4图片（根据当前背景设置保存）"""
-        if not hasattr(self, 'a4_layout_image'):
-            messagebox.showwarning("警告", "请先生成A4排版")
-            return
-        
-        # 根据当前背景设置确定默认扩展名
-        default_ext = ".png" if self.use_transparent else ".jpg"
-        filetypes = [("PNG文件", "*.png"), ("JPEG文件", "*.jpg"), ("所有文件", "*.*")]
-        
-        file_path = filedialog.asksaveasfilename(
-            title="保存A4图片",
-            defaultextension=default_ext,
-            filetypes=filetypes
-        )
-        
-        if file_path:
-            try:
-                # 根据文件扩展名保存
-                ext = os.path.splitext(file_path.lower())[1]
-                if ext == '.png':
-                    # PNG格式，如果原图不是RGBA模式，转换为RGBA
-                    if self.a4_layout_image.mode != 'RGBA':
-                        save_image = self.a4_layout_image.convert('RGBA')
-                    else:
-                        save_image = self.a4_layout_image
-                    save_image.save(file_path, dpi=(self.dpi, self.dpi))
-                else:
-                    # JPG格式，确保是RGB模式
-                    if self.a4_layout_image.mode != 'RGB':
-                        save_image = self.a4_layout_image.convert('RGB')
-                    else:
-                        save_image = self.a4_layout_image
-                    save_image.save(file_path, dpi=(self.dpi, self.dpi), quality=95)
-                    
-                self.update_status(f"A4图片已保存: {file_path}")
-                messagebox.showinfo("成功", f"A4图片已保存到:\n{file_path}")
-            except Exception as e:
-                messagebox.showerror("错误", f"保存失败: {str(e)}")
-    
-    def save_a4_pdf(self):
-        """保存A4图片为PDF - 使用img2pdf库"""
-        if not hasattr(self, 'a4_layout_image'):
-            messagebox.showwarning("警告", "请先生成A4排版")
-            return
-        
-        file_path = filedialog.asksaveasfilename(
-            title="保存A4 PDF",
-            defaultextension=".pdf",
-            filetypes=[("PDF文件", "*.pdf"), ("所有文件", "*.*")]
-        )
-        
-        if file_path:
-            try:
-                # 创建临时文件保存图片
-                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                    temp_file = tmp.name
-                    # 保存为JPG格式（PDF不支持透明背景）
-                    if self.a4_layout_image.mode != 'RGB':
-                        save_image = self.a4_layout_image.convert('RGB')
-                    else:
-                        save_image = self.a4_layout_image
-                    save_image.save(temp_file, dpi=(self.dpi, self.dpi), quality=100)
-                
-                # 使用img2pdf将图片转换为PDF
-                with open(file_path, "wb") as pdf_file:
-                    pdf_file.write(img2pdf.convert(temp_file))
-                
-                # 删除临时文件
-                os.unlink(temp_file)
-                
-                self.update_status(f"A4 PDF已保存: {file_path}")
-                messagebox.showinfo("成功", f"A4 PDF已保存到:\n{file_path}")
-            except Exception as e:
-                messagebox.showerror("错误", f"保存PDF失败: {str(e)}\n\n请确保已安装img2pdf库: pip install img2pdf")
-    
-    def save_single_side(self, side):
-        """单独保存人像面、国徽面或银行卡的图片"""
-        if side == "front":
-            image = self.front_processed
-            side_name = "身份证人像面"
-        elif side == "back":
-            image = self.back_processed
-            side_name = "身份证国徽面"
-        else:
-            image = self.card_processed
-            side_name = "银行卡"
-        
-        if image is None:
-            messagebox.showwarning("警告", f"请先处理{side_name}图片")
-            return
-        
-        file_path = filedialog.asksaveasfilename(
-            title=f"保存{side_name}",
-            defaultextension=".png",
-            filetypes=[("PNG文件", "*.png"), ("JPEG文件", "*.jpg"), ("所有文件", "*.*")]
-        )
-        
-        if file_path:
-            try:
-                # 根据文件扩展名保存
-                ext = os.path.splitext(file_path.lower())[1]
-                if ext == '.png':
-                    # PNG格式，确保是RGBA模式以保持透明背景
-                    if image.mode != 'RGBA':
-                        save_image = image.convert('RGBA')
-                    else:
-                        save_image = image
-                    save_image.save(file_path, dpi=(self.dpi, self.dpi))
-                else:
-                    # JPG格式，确保是RGB模式（透明背景会转换为白色）
-                    if image.mode != 'RGB':
-                        # 创建一个白色背景的RGB图像
-                        rgb_image = Image.new('RGB', image.size, (255, 255, 255))
-                        # 将RGBA图像粘贴到白色背景上
-                        if image.mode == 'RGBA':
-                            rgb_image.paste(image, (0, 0), image)
-                        else:
-                            rgb_image.paste(image, (0, 0))
-                        save_image = rgb_image
-                    else:
-                        save_image = image
-                    save_image.save(file_path, dpi=(self.dpi, self.dpi), quality=95)
-                    
-                self.update_status(f"{side_name}图片已保存: {file_path}")
-                messagebox.showinfo("成功", f"{side_name}图片已保存到:\n{file_path}")
-            except Exception as e:
-                messagebox.showerror("错误", f"保存失败: {str(e)}")
-    
-    def toggle_text_edit(self):
-        """切换文本编辑模式"""
-        if not hasattr(self, 'a4_layout_image'):
-            messagebox.showwarning("警告", "请先生成A4排版")
-            return
-        
-        self.text_edit_mode = not self.text_edit_mode
-        
-        if self.text_edit_mode:
-            self.show_text_edit_window()
-        else:
-            if self.text_window:
-                self.text_window.destroy()
-                self.text_window = None
-    
-    def show_text_edit_window(self):
-        """显示文本编辑窗口（可拖动版本）"""
-        if self.text_window is not None:
-            self.text_window.destroy()
-        
-        # 创建文本编辑窗口
-        self.text_window = ToplevelWithIcon(self.root)
-        self.text_window.title("添加文字 - 可在A4预览区域拖动文字")
-        
-        # 设置窗口尺寸
-        self.text_window.geometry("500x400")
-        self.center_window(self.text_window)
-        
-        # 主框架
-        main_frame = ttk.Frame(self.text_window, padding=20)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # 文字输入区域
-        ttk.Label(main_frame, text="输入要添加的文字:").pack(anchor=tk.W, pady=(0, 5))
-        
-        self.text_entry = tk.Text(main_frame, height=5, width=50, font=("Arial", 12))
-        self.text_entry.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        
-        # 字体设置区域
-        font_frame = ttk.Frame(main_frame)
-        font_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        # 字体大小选择
-        ttk.Label(font_frame, text="字体大小:").pack(side=tk.LEFT, padx=(0, 10))
-        
-        self.font_size = tk.IntVar(value=24)
-        font_size_spin = ttk.Spinbox(font_frame, from_=10, to=50, textvariable=self.font_size, width=10)
-        font_size_spin.pack(side=tk.LEFT, padx=(0, 20))
-        
-        # 字体颜色选择
-        ttk.Label(font_frame, text="文字颜色:").pack(side=tk.LEFT, padx=(0, 10))
-        
-        self.text_color = tk.StringVar(value="black")
-        colors = [("黑色", "black"), ("红色", "red"), ("蓝色", "blue"), ("绿色", "green")]
-        
-        for text, value in colors:
-            rb = ttk.Radiobutton(font_frame, text=text, variable=self.text_color, value=value)
-            rb.pack(side=tk.LEFT, padx=5)
-        
-        # 位置设置区域
-        pos_frame = ttk.Frame(main_frame)
-        pos_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        ttk.Label(pos_frame, text="初始位置:").pack(side=tk.LEFT, padx=(0, 10))
-        
-        # X坐标
-        ttk.Label(pos_frame, text="X:").pack(side=tk.LEFT)
-        self.pos_x = tk.IntVar(value=100)
-        pos_x_spin = ttk.Spinbox(pos_frame, from_=0, to=1000, textvariable=self.pos_x, width=8)
-        pos_x_spin.pack(side=tk.LEFT, padx=(0, 10))
-        
-        # Y坐标
-        ttk.Label(pos_frame, text="Y:").pack(side=tk.LEFT)
-        self.pos_y = tk.IntVar(value=100)
-        pos_y_spin = ttk.Spinbox(pos_frame, from_=0, to=1000, textvariable=self.pos_y, width=8)
-        pos_y_spin.pack(side=tk.LEFT)
-        
-        # 按钮区域
-        btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(fill=tk.X, pady=(10, 0))
-        
-        ttk.Button(btn_frame, text="添加到图片并拖动", command=self.add_draggable_text).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="取消", command=self.text_window.destroy).pack(side=tk.LEFT, padx=5)
-        
-        # 提示信息
-        ttk.Label(main_frame, text="提示: 添加文字后可以在A4预览区域拖动文字调整位置", 
-                 font=("Arial", 10, "italic"), foreground="gray").pack(pady=(10, 0))
-        
-        # 窗口关闭时退出文本编辑模式
-        self.text_window.protocol("WM_DELETE_WINDOW", lambda: self.toggle_text_edit())
-    
-    def add_draggable_text(self):
-        """添加可拖动的文字"""
-        text = self.text_entry.get("1.0", tk.END).strip()
-        if not text:
-            messagebox.showwarning("警告", "请输入要添加的文字")
-            return
-        
-        try:
-            # 关闭文本编辑窗口
-            if self.text_window:
-                self.text_window.destroy()
-                self.text_window = None
-                self.text_edit_mode = False
-            
-            # 设置拖动模式
-            self.dragging_text = {
-                'text': text,
-                'color': self.text_color.get(),
-                'size': self.font_size.get(),
-                'x': self.pos_x.get(),
-                'y': self.pos_y.get(),
-                'id': None  # 画布对象ID
-            }
-            
-            # 在A4画布上添加可拖动文字
-            self.add_text_to_canvas()
-            
-            self.update_status("文字已添加到图片，可以拖动调整位置")
-            
-        except Exception as e:
-            messagebox.showerror("错误", f"添加文字失败: {str(e)}")
-    
-    def add_text_to_canvas(self):
-        """在A4画布上添加可拖动文字"""
-        if not hasattr(self, 'dragging_text') or self.dragging_text is None:
-            return
-        
-        # 清空之前的文字对象
-        for text_obj in self.text_objects:
-            self.a4_canvas.delete(text_obj['id'])
-        self.text_objects = []
-        
-        # 添加新文字对象
-        text_id = self.a4_canvas.create_text(
-            self.dragging_text['x'],
-            self.dragging_text['y'],
-            text=self.dragging_text['text'],
-            fill=self.dragging_text['color'],
-            font=("Arial", self.dragging_text['size'], "bold"),
-            anchor=tk.NW
-        )
-        
-        # 保存文字对象信息
-        self.text_objects.append({
-            'id': text_id,
-            'text': self.dragging_text['text'],
-            'color': self.dragging_text['color'],
-            'size': self.dragging_text['size'],
-            'x': self.dragging_text['x'],
-            'y': self.dragging_text['y']
-        })
-        
-        # 绑定拖动事件
-        self.a4_canvas.tag_bind(text_id, "<Button-1>", self.start_text_drag)
-        self.a4_canvas.tag_bind(text_id, "<B1-Motion>", self.drag_text)
-        self.a4_canvas.tag_bind(text_id, "<ButtonRelease-1>", self.stop_text_drag)
-        
-        # 更新文字位置信息
-        self.dragging_text['id'] = text_id
-    
-    def start_text_drag(self, event):
-        """开始拖动文字"""
-        self.text_start_x = event.x
-        self.text_start_y = event.y
-        
-        # 高亮显示当前拖动的文字
-        if self.dragging_text and self.dragging_text['id']:
-            self.a4_canvas.itemconfig(self.dragging_text['id'], fill="red")
-    
-    def drag_text(self, event):
-        """拖动文字"""
-        if self.dragging_text and self.dragging_text['id']:
-            # 计算移动距离
-            dx = event.x - self.text_start_x
-            dy = event.y - self.text_start_y
-            
-            # 移动文字
-            self.a4_canvas.move(self.dragging_text['id'], dx, dy)
-            
-            # 更新起始位置
-            self.text_start_x = event.x
-            self.text_start_y = event.y
-            
-            # 更新文字位置信息
-            if self.text_objects:
-                for text_obj in self.text_objects:
-                    if text_obj['id'] == self.dragging_text['id']:
-                        coords = self.a4_canvas.coords(text_obj['id'])
-                        text_obj['x'] = coords[0]
-                        text_obj['y'] = coords[1]
-    
-    def stop_text_drag(self, event):
-        """停止拖动文字"""
-        if self.dragging_text and self.dragging_text['id']:
-            # 恢复文字颜色
-            self.a4_canvas.itemconfig(self.dragging_text['id'], fill=self.dragging_text['color'])
-    
-    def apply_text_to_image(self):
-        """将文字应用到图片"""
-        if not self.text_objects:
-            messagebox.showinfo("提示", "没有要添加的文字")
-            return
-        
-        try:
-            # 创建临时副本
-            text_image = self.a4_layout_image.copy()
-            
-            # 创建绘图对象
-            draw = ImageDraw.Draw(text_image)
-            
-            # 获取A4图片的尺寸
-            img_width, img_height = text_image.size
-            
-            # 获取画布上文字的缩放比例
-            canvas_width = self.a4_canvas.winfo_width()
-            canvas_height = self.a4_canvas.winfo_height()
-            
-            # 计算缩放比例
-            scale_x = img_width / canvas_width
-            scale_y = img_height / canvas_height
-            
-            # 设置字体
-            try:
-                # 尝试使用系统字体
-                font_paths = ["simhei.ttf", "arial.ttf", "C:/Windows/Fonts/msyh.ttc"]
-                font = None
-                for font_path in font_paths:
-                    try:
-                        font = ImageFont.truetype(font_path, self.text_objects[0]['size'])
-                        break
-                    except:
-                        continue
-                if font is None:
-                    font = ImageFont.load_default()
-            except:
-                font = ImageFont.load_default()
-            
-            # 添加所有文字
-            for text_obj in self.text_objects:
-                # 缩放坐标
-                x = text_obj['x'] * scale_x
-                y = text_obj['y'] * scale_y
-                
-                # 添加文字
-                draw.text((x, y), text_obj['text'], font=font, fill=text_obj['color'])
-            
-            # 更新A4图片
-            self.a4_layout_image = text_image
-            
-            # 更新预览
-            self.show_a4_layout_on_canvas(text_image)
-            
-            self.update_status("文字已应用到图片")
-            
-        except Exception as e:
-            messagebox.showerror("错误", f"应用文字失败: {str(e)}")
-    
-    def print_a4_image(self):
-        """打印A4图片"""
-        if not hasattr(self, 'a4_layout_image'):
-            messagebox.showwarning("警告", "请先生成A4排版")
-            return
 
-        system = platform.system()
-        if system == 'Windows':
-            # Ask-first printer flow (never the silent default).
-            if self._print_images_windows([self.a4_layout_image], 'A4排版'):
-                self.update_status("打印任务已发送")
-            return
 
-        try:
-            # 创建临时文件
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                temp_file = tmp.name
-                # 保存为PNG格式
-                self.a4_layout_image.save(temp_file, dpi=(self.dpi, self.dpi))
-
-            # 根据操作系统调用打印命令
-            if system == 'Darwin':
-                # macOS系统
-                subprocess.run(["lpr", temp_file])
-                messagebox.showinfo("打印", "打印任务已发送到打印机")
-            else:
-                # Linux系统
-                subprocess.run(["lp", temp_file])
-                messagebox.showinfo("打印", "打印任务已发送到打印机")
-            
-            # 稍后删除临时文件
-            self.root.after(5000, lambda: os.unlink(temp_file) if os.path.exists(temp_file) else None)
-            
-            self.update_status("打印任务已发送")
-            
-        except Exception as e:
-            messagebox.showerror("错误", f"打印失败: {str(e)}")
-    
-    def clear_all(self):
-        """清除所有数据"""
-        self.front_image = None
-        self.back_image = None
-        self.pairs = []
-        self.current_open = None
-        self._pair_photos = {}
-        if hasattr(self, 'pairs_list_frame'):
-            self.refresh_pairs_panel()
-        self.card_image = None
-        self.front_points = []
-        self.back_points = []
-        self.card_points = []
-        self.front_processed = None
-        self.back_processed = None
-        self.card_processed = None
-        self.is_marking = False
-        self.adjust_mode = False
-        self.adjust_points = []
-        self.dragging_point_index = None
-        self.point_circles = []
-        self.preview_click_areas = {}
-        self.preview_images = {}
-        
-        # 关闭标记窗口（并清引用，见 _close_mark_window）
-        self._close_mark_window()
-        
-        # 关闭文本编辑窗口
-        if self.text_window:
-            self.text_window.destroy()
-            self.text_window = None
-        
-        # 重置文本编辑模式
-        self.text_edit_mode = False
-        self.text_objects = []
-        self.dragging_text = None
-        
-        # 重置银行卡模式
-        self.card_mode = False
-        self.card_mode_btn.config(text="银行卡功能")
-        
-        # 重置背景设置
-        self.background_color = "white"
-        self.use_transparent = False
-        
-        # 重新绘制A4布局
-        self.draw_a4_layout()
-        
-        self.update_status("已清除所有数据，请重新上传图片")
-    
     def update_status(self, message):
         """更新状态栏"""
         self.status_var.set(message)

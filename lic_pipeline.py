@@ -70,10 +70,12 @@ import cv2
 
 from bigdoc import expand_to_paper_edge, converge_corners, \
     dark_border_fraction, clamp_quad_to_frame, tighten_edges, \
-    envelope_quad, is_flat_scan, A4_RATIO, refine_corners_local
+    envelope_quad, is_flat_scan, A4_RATIO, refine_corners_local, \
+    edge_station_bounds, framing_ink_check, guard_quad_to_ink
+from bigdoc import _robustify_bounds
 from lic_enhance import enhance_license
 from lic_dehaze import dehaze_license
-from lic_undistort import undistort_license, GATE_MAX_DEV
+from lic_undistort import undistort_license, gate_max_dev_px
 
 # Single output spec (2026-11-12 canvas ruling, measured at Qing's
 # shop from her PS "image size" dialog): A4 landscape @200dpi. The
@@ -396,22 +398,69 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
                                         m_lr=m_lr, m_tb=m_tb)
         info["envelope"] = env_info
 
+        # Face-content guard (2026-11-13, emblem diagnosis): measure
+        # once where the licence face's own ink reaches on each edge
+        # (edge_station_bounds on the frame quad). Until now NO
+        # framing candidate was ever checked against it -- the score
+        # (QR, dark border) is blind to a cut emblem, because cutting
+        # INTO the face removes bright content instead of adding a
+        # dark band. Two defences below:
+        #   guarded -- the tighten quad repaired outward past the
+        #     ink line wherever it falls short (guard_quad_to_ink);
+        #   veto -- _consider refuses any candidate that still cuts
+        #     measured face ink, exactly as it refuses out-of-frame
+        #     quads. If every candidate is vetoed, the least-cutting
+        #     one is taken as an explicit fallback (recorded), never
+        #     silently.
+        bounds_r = None
+        try:
+            _b = edge_station_bounds(bgr, frame_used)
+        except Exception:
+            _b = None
+        if _b is not None:
+            _ink, _ext, _oob = _robustify_bounds(*_b[:3])
+            bounds_r = (_ink, _ext, _oob, _b[3])
+
         cands = [("expand", paper2, paper2, 0.0),
                  ("tighten", te_q, te_q, 0.01)]
+        if bounds_r is not None:
+            g_q, g_counts, g_worst = guard_quad_to_ink(
+                frame_used, bounds_r, te_q)
+            info["ink_guard"] = {
+                "tighten_counts": framing_ink_check(
+                    frame_used, bounds_r, te_q)[0],
+                "guarded_counts": g_counts,
+                "guarded_worst": round(float(g_worst), 1)}
+            if g_q is not None and not np.allclose(g_q, te_q):
+                cands.append(("guarded", g_q, g_q, 0.015))
         if env_q is not None:
             cands.append(("envelope", env_q, env_q, 0.02))
         best = None
         scores = {}
+        vetoed = []
 
         def _consider(name, q_ret, q_w, pref):
             """Warp and score one candidate. Zero-fabrication guard:
             a quad reaching outside the source image would print
             filled (black) pixels, so the candidate is void on the
-            spot, however clean its border would otherwise look."""
+            spot, however clean its border would otherwise look.
+            Content guard: a candidate that cuts measured face ink
+            (framing_ink_check) is likewise void -- face content is
+            the one thing framing may never trade away; vetoed
+            candidates are remembered for the least-cut fallback."""
             nonlocal best
             if _quad_outside_frame((H0, W0), q_w):
                 scores[name] = "oob"
                 return None
+            if bounds_r is not None:
+                counts, worst = framing_ink_check(frame_used,
+                                                  bounds_r, q_w)
+                if sum(counts) > 0:
+                    scores[name] = ["cut", counts,
+                                    round(float(worst), 1)]
+                    vetoed.append((sum(counts), float(worst), name,
+                                   q_ret, q_w, pref))
+                    return None
             w = _warp3(bgr, q_w)
             qr, negdark = _score3(w)
             scores[name] = [qr, round(-negdark, 4)]
@@ -422,8 +471,8 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
 
         for name, q_ret, q_w, pref in cands:
             _consider(name, q_ret, q_w, pref)
-        if best is not None and env_q is None \
-                and -best[0][1] + 0.02 > 0.25:
+        if env_q is None and (best is None
+                              or -best[0][1] + 0.02 > 0.25):
             # Both legacy framings leave a heavy dark border and the
             # envelope only just missed feasibility: one last-resort
             # tolerance tier (graze 12 / slack 10) may trade a <=12px
@@ -437,8 +486,23 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
                                             extra_tiers=((12.0, 10.0),))
             info["envelope"] = env_info
             if env_q is not None:
-                if _quad_outside_frame((H0, W0), env_q):
+                if best is None:
+                    # Every regular candidate was vetoed (content
+                    # guard) or void: the desperate envelope competes
+                    # through the same guards as everyone else.
+                    _consider("envelope", env_q, env_q, 0.02)
+                elif _quad_outside_frame((H0, W0), env_q):
                     scores["envelope"] = "oob"
+                elif bounds_r is not None and sum(framing_ink_check(
+                        frame_used, bounds_r, env_q)[0]) > 0:
+                    # The graze tiers may trade a hair of apex for a
+                    # clean border among NON-cutting rivals; they may
+                    # never outbid a clean winner by cutting content
+                    # it preserved.
+                    counts, worst = framing_ink_check(frame_used,
+                                                      bounds_r, env_q)
+                    scores["envelope"] = ["cut", counts,
+                                          round(float(worst), 1)]
                 else:
                     w = _warp3(bgr, env_q)
                     qr, negdark = _score3(w)
@@ -450,6 +514,18 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
                         best = (key, "envelope", env_q, w)
                     elif key > best[0]:
                         info["framing_desperate_rejected"] = True
+        if best is None and vetoed:
+            # Every candidate cut measured face ink somewhere. Take
+            # the least-cutting one (fewest violating stations, then
+            # shallowest) and SAY so in the info: a recorded partial
+            # failure, never a silent one.
+            vetoed.sort(key=lambda v: (v[0], v[1]))
+            _c, _w, name, q_ret, q_w, _pref = vetoed[0]
+            w = _warp3(bgr, q_w)
+            qr, negdark = _score3(w)
+            best = ((qr, negdark + _pref), name, q_ret, w)
+            info["framing_ink_fallback"] = {
+                "choice": name, "counts": _c, "worst": round(_w, 1)}
         if best is None:
             # Every candidate sampled outside the source. Paranoia:
             # clamp_quad_to_frame should make this unreachable. Pull
@@ -502,7 +578,7 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
                 and dinfo.get("reason") in ("no_improvement",
                                             "field_too_large") \
                 and float(dinfo.get("max_dev_before") or 0.0) \
-                > GATE_MAX_DEV:
+                > gate_max_dev_px(warped.shape[1]):
             # Bow measured above the gate, but the self-check would
             # not let the arm touch it: flag it so the UI can say so
             # honestly instead of pretending the page came out
