@@ -29,12 +29,12 @@ jobs:
       - name: Stage OCR models
         run: python -c "import rapidocr_onnxruntime,os,shutil; src=os.path.join(os.path.dirname(rapidocr_onnxruntime.__file__),'models'); shutil.copytree(src,'ocr_models'); print(sorted(os.listdir('ocr_models')))"
       - name: Build exe with PyInstaller
-        run: pyinstaller --noconfirm --onefile --windowed --name IDCardProcessor32QN --collect-all tkinterdnd2 --collect-all onnxruntime --collect-all rapidocr_onnxruntime --hidden-import win32print --hidden-import win32ui --hidden-import win32con --hidden-import pywintypes --hidden-import pythoncom --add-data "models/carddetection_scrfd34gkps.onnx;models" --add-data "ocr_models;rapidocr_onnxruntime/models" IDCardProcessor_full.py
+        run: pyinstaller --noconfirm --onedir --windowed --name IDCardProcessor32QN --collect-all tkinterdnd2 --collect-all onnxruntime --collect-all rapidocr_onnxruntime --hidden-import win32print --hidden-import win32ui --hidden-import win32con --hidden-import pywintypes --hidden-import pythoncom --add-data "models/carddetection_scrfd34gkps.onnx;models" --add-data "ocr_models;rapidocr_onnxruntime/models" IDCardProcessor_full.py
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: IDCardProcessor32-win7-quanneng
-          path: dist/IDCardProcessor32QN.exe
+          path: dist/IDCardProcessor32QN/
   build-qt:
     runs-on: windows-2022
     steps:
