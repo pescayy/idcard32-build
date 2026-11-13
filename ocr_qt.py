@@ -164,6 +164,36 @@ def read_card(pil_img, side):
     return _parse_id_front(texts) if side == 'front' else _parse_id_back(texts)
 
 
+def read_card_full(pil_img, side):
+    """同 read_card，但把 OCR 原始行一并带回：(info, texts)。
+
+    面别自动纠正要凭原始行判面别（见 detect_side_by_ocr），解析后的
+    info 不够用；读字只跑一次，行文本随结果回主线程存进槽位。"""
+    texts = _ocr_lines(pil_img)
+    info = _parse_id_front(texts) if side == 'front' else _parse_id_back(texts)
+    return info, texts
+
+
+def detect_side_by_ocr(texts):
+    """只凭 OCR 文本判面别，判不准返回 None（不许猜）：正面看身份
+    号码（17 位+校验位且校验通过）或姓名+住址字段同时出现；反面
+    看签发机关/有效期限字段。两边特征同时出现同样判不准。
+    （与全能版 _detect_side_by_ocr 逐条一致。）"""
+    flat = ''.join(texts).replace(' ', '')
+    front = False
+    m = _re.search(r'[0-9]{17}[0-9Xx]', flat)
+    if m and _id_checksum_ok(m.group(0).upper()):
+        front = True
+    elif any('姓名' in t for t in texts) and any('住址' in t for t in texts):
+        front = True
+    back = any(('签发机关' in t) or ('有效期限' in t) for t in texts)
+    if front and not back:
+        return 'front'
+    if back and not front:
+        return 'back'
+    return None
+
+
 def log_ocr_error(exc):
     """OCR 异常留痕：写到程序旁边的 ocr_error.log，避免窗口版无声失败。"""
     try:

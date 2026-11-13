@@ -4,7 +4,7 @@ Layout follows IDCardMerge v2.2 (see IDCardMerge-v2.2-复刻对照表.md):
 group rows as the main area, settings bar at the bottom, full-width orange
 generate button, centered status line. Small radii: buttons 4px, slots 5px.
 """
-import os, sys, json, threading
+import os, sys, json, threading, queue
 from PySide2.QtCore import Qt, Signal, QUrl, QRectF, QTimer
 from PySide2.QtGui import (QPixmap, QImage, QFont, QPainter, QColor, QPen,
                          QDesktopServices, QPainterPath, QGuiApplication)
@@ -182,8 +182,9 @@ class PairRow(QFrame):
 
 
 class MainWindow(QMainWindow):
-    ocr_done = Signal(int, str, object, str)
+    ocr_done = Signal(int, str, object, str, object, object, object)
     ocr_probe_done = Signal(bool)
+    detect_done = Signal(object)
 
     def __init__(self):
         super().__init__()
@@ -211,6 +212,16 @@ class MainWindow(QMainWindow):
         self.ocr_probe_done.connect(self._on_ocr_probe)
         self._ocr_dead = False
         threading.Thread(target=self._probe_ocr, daemon=True).start()
+        # 边框识别（S1 修复）：与 OCR 同模式——单个后台线程顺序执行，
+        # 结果走 detect_done 信号回主线程应用；识别期间窗口保持响应，
+        # 以等待光标＋状态行作忙碌指示。队列里的任务只携带 (core, 图)
+        # 与回写坐标，回主线程时按图对象身份校验槽位是否仍是那张图。
+        self.detect_done.connect(self._on_detect_done)
+        self._detect_queue = queue.Queue()
+        self._detect_worker = None
+        self._detect_pending = 0        # 已排队未完成的识别数（光标/进度）
+        self._mark_open = False         # 标角窗正开着（防自动再开一个）
+        self._closing = False
 
     # ---------- OCR (full-edition merge; logic in ocr_qt.py) ----------
     def _probe_ocr(self):
@@ -235,20 +246,26 @@ class MainWindow(QMainWindow):
         if data.get('_ocr_key') == id(pil_img):
             return
         data['_ocr_key'] = id(pil_img)
+        # S3 修复：随信号带上槽位 dict 与图对象本身，回写时按身份校验
+        # 「这还是排队时的那个槽、那张图」——只验组号下标时，删组/
+        # 清槽/换图后结果会落到另一张卡头上，导出把甲卡信息记给乙卡。
+        slot = data
+        img = pil_img
 
         def worker():
             err_text = ''
+            texts = []
             try:
-                info = ocr_qt.read_card(pil_img, side)
+                info, texts = ocr_qt.read_card_full(img, side)
             except Exception as e:
                 info = {}
                 err_text = repr(e)
                 ocr_qt.log_ocr_error(e)
-            self.ocr_done.emit(idx, side, info, err_text)
+            self.ocr_done.emit(idx, side, info, err_text, slot, img, texts)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_ocr_done(self, idx, side, info, err_text):
+    def _on_ocr_done(self, idx, side, info, err_text, slot, img, texts):
         if not info and err_text:
             self._ocr_dead = True
             self._refresh_info_btns()
@@ -256,14 +273,57 @@ class MainWindow(QMainWindow):
             return
         if idx < 0 or idx >= len(self.core.pairs):
             return
-        self.core.pairs[idx][side]['ocr'] = info
-        if not info:
+        pair = self.core.pairs[idx]
+        # 身份校验（必须用 is：dict 按值比较会把内容相同的两个槽误判
+        # 为同一个）。槽位 dict 已不在本组（删组/清槽/换槽）→ 弃；
+        # 本组内正反互换是整 dict 搬家，结果跟着图走、写回原 dict 即
+        # 正确落位。槽里的图已不是排队那张（被换掉）→ 弃。
+        if not (slot is pair['front'] or slot is pair['back']):
             return
-        if side == 'front' and info.get('姓名'):
+        if slot.get('processed') is not img or slot.get('_ocr_key') != id(img):
+            return
+        slot['ocr'] = info
+        # 面别纠正：原始行与判定跟着槽位 dict 走（整 dict 搬家时随图
+        # 归位）；两面都判出且正好相反时由 _maybe_swap_pair_sides 对调。
+        # 检查放在本函数末尾，让对调文案不被「已识别」文案盖掉。
+        slot['_ocr_texts'] = texts
+        slot['_side_verdict'] = ocr_qt.detect_side_by_ocr(texts)
+        if not info:
+            self._maybe_swap_pair_sides(idx)
+            return
+        if info.get('姓名'):
             self.set_status('已识别：%s %s' % (info.get('姓名', ''),
                                                info.get('公民身份号码', '')))
-        elif side == 'back' and info.get('签发机关'):
+        elif info.get('签发机关'):
             self.set_status('已识别签发机关：%s' % info.get('签发机关', ''))
+        self._maybe_swap_pair_sides(idx)
+
+    def _maybe_swap_pair_sides(self, idx):
+        """导入面别纠正（与全能版 _maybe_swap_pair_sides 同口径）：一组
+        两面都已处理且都判出面别、且判定与槽位正好相反时，整组对调
+        摆正；任一面判不准就不动、不猜。对调走 swap_pair 同一套整
+        dict 搬家，结果跟着图走。"""
+        if idx < 0 or idx >= len(self.core.pairs):
+            return False
+        pair = self.core.pairs[idx]
+        verdicts = {}
+        for side in ('front', 'back'):
+            slot = pair[side]
+            if slot.get('processed') is None:
+                return False
+            v = slot.get('_side_verdict')
+            if v is None:
+                return False
+            verdicts[side] = v
+        if verdicts.get('front') == 'back' and verdicts.get('back') == 'front':
+            # 先清判定防重复触发：搬家后判定随 dict 走，留着会让后续
+            # 任一次回写再查时误判已对调的组。
+            pair['front']['_side_verdict'] = None
+            pair['back']['_side_verdict'] = None
+            self.swap_pair(idx)
+            self.set_status(f'第{idx + 1}组正反面放反了，已自动对调摆正')
+            return True
+        return False
 
     # ---------- UI construction ----------
     def _build_ui(self):
@@ -497,41 +557,148 @@ class MainWindow(QMainWindow):
                     self, '选择图片', self.last_dir,
                     '图片 (*.jpg *.jpeg *.png *.bmp *.webp *.heic *.heif *.tif *.tiff)')
                 if path:
-                    if not self.import_into_slot(i, slot.side, path):
-                        self.open_mark_dialog(i, slot.side)
+                    # 识别改走后台队列；认不出时由完成回调开标角窗
+                    self.import_into_slot(i, slot.side, path,
+                                          open_mark_on_fail=True)
                 return
 
     def open_mark_dialog(self, idx, side):
         from mark_dialog import MarkDialog
         if self.core.pairs[idx][side]['image'] is None:
             return
-        MarkDialog(self, idx, side).exec_()
+        self._mark_open = True
+        try:
+            MarkDialog(self, idx, side).exec_()
+        finally:
+            self._mark_open = False
 
-    def import_into_slot(self, idx, side, path):
+    # ----- S1: 后台识别队列（单线程顺序执行，信号回主线程） -----
+    def _enqueue_detect(self, idx, side, img, stats=None,
+                        open_mark_on_fail=False):
+        job = {'idx': idx, 'side': side, 'img': img, 'stats': stats,
+               'open_mark': open_mark_on_fail}
+        if stats is not None:
+            stats['pending'] += 1
+        if self._detect_pending == 0:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+        self._detect_pending += 1
+        name = '正面' if side == 'front' else '反面'
+        self.set_status(f'正在识别第 {idx + 1} 组{name}，请稍候…')
+        self._detect_queue.put(job)
+        if self._detect_worker is None or not self._detect_worker.is_alive():
+            self._detect_worker = threading.Thread(
+                target=self._detect_worker_loop, daemon=True)
+            self._detect_worker.start()
+
+    def _detect_worker_loop(self):
+        while True:
+            job = self._detect_queue.get()
+            res = dict(job)
+            res['corners'] = None
+            res['processed'] = None
+            try:
+                self.core.current_marking_side = job['side']
+                corners = self.core.ai_detect_any(job['img'])
+                res['corners'] = corners
+                if corners:
+                    res['processed'] = self.core.process_card(job['img'],
+                                                              corners)
+            except Exception as e:
+                res['error'] = repr(e)
+            try:
+                self.detect_done.emit(res)
+            except RuntimeError:
+                pass
+
+    def _detect_bookkeeping(self, stats):
+        """每个识别任务收尾时调用（无论结果是否被采用）：回收忙碌
+        计数/光标，批量统计 pending 归零时播报汇总。返回 True 表示
+        已播报汇总（调用方不要再用单张状态覆盖它）。"""
+        self._detect_pending = max(0, self._detect_pending - 1)
+        if self._detect_pending == 0:
+            QApplication.restoreOverrideCursor()
+        if stats is not None:
+            stats['pending'] -= 1
+            if stats['pending'] <= 0:
+                msg = (f"{stats['label']}完成：成功 {stats['ok']} 张，"
+                       f"失败 {stats['fail']} 张")
+                if (getattr(self.core, '_ai_error', None)
+                        and not getattr(self.core, '_ai_ran', False)):
+                    msg += '；识别模型不可用，失败的请逐张手动标角'
+                self.set_status(msg)
+                return True
+        return False
+
+    def _on_detect_done(self, res):
+        if getattr(self, '_closing', False):
+            return
+        idx, side, img = res['idx'], res['side'], res['img']
+        stats = res.get('stats')
+        if idx < 0 or idx >= len(self.core.pairs):
+            self._detect_bookkeeping(stats)
+            return
+        data = self.core.pairs[idx][side]
+        if data.get('image') is not img:
+            # 识别期间该槽已被清掉/换了图：结果作废，不落到新图头上
+            self._detect_bookkeeping(stats)
+            return
+        corners, processed = res.get('corners'), res.get('processed')
+        data['points'] = [tuple(p) for p in corners] if corners else None
+        data['processed'] = processed
+        (self.rows[idx].front if side == 'front'
+         else self.rows[idx].back).set_processed(processed)
+        name = '正面' if side == 'front' else '反面'
+        if processed is not None:
+            if stats is not None:
+                stats['ok'] += 1
+            summarized = self._detect_bookkeeping(stats)
+            if not summarized:
+                self.set_status(f'第 {idx + 1} 组{name}导入成功，已自动处理')
+            self._schedule_ocr(idx, side, processed)
+            return
+        if stats is not None:
+            stats['fail'] += 1
+        summarized = self._detect_bookkeeping(stats)
+        # S2 口径：模型缺失/损坏与「照片没认出」分开说，不再冒充照片问题
+        if not summarized:
+            if (getattr(self.core, '_ai_error', None)
+                    and not getattr(self.core, '_ai_ran', False)):
+                self.set_status(
+                    f'第 {idx + 1} 组{name}：识别模型不可用'
+                    '（原因记在程序旁边的 detect_error.log），请手动标角')
+            else:
+                self.set_status(
+                    f'第 {idx + 1} 组{name}未检测到高精度边框，'
+                    '请换一张或稍后手动标角')
+        if res.get('open_mark') and not self._mark_open:
+            self.open_mark_dialog(idx, side)
+
+    def import_into_slot(self, idx, side, path, stats=None,
+                         open_mark_on_fail=False):
+        """同步只做开图与占槽（快），识别排队到后台线程。返回 True=
+        已受理（识别结果异步到达），False=图片打开失败。"""
         try:
             img = Image.open(path)
             img.load()
         except Exception as e:
             self.set_status(f'图片打开失败：{e}')
+            if stats is not None:
+                stats['fail'] += 1
             return False
         self.last_dir = os.path.dirname(path)
         self._sync_core_settings()
-        self.core.current_marking_side = side
-        corners = self.core.ai_detect_any(img)
-        processed = self.core.process_card(img, corners, points_ordered=True) if corners else None
         data = self.core.pairs[idx][side]
         data['image'] = img
         data['path'] = path
-        data['points'] = [tuple(p) for p in corners] if corners else None
-        data['processed'] = processed
-        (self.rows[idx].front if side == 'front' else self.rows[idx].back).set_processed(processed)
-        name = '正面' if side == 'front' else '反面'
-        if processed is not None:
-            self.set_status(f'第 {idx + 1} 组{name}导入成功，已自动处理')
-            self._schedule_ocr(idx, side, processed)
-            return True
-        self.set_status(f'第 {idx + 1} 组{name}未检测到高精度边框，请换一张或稍后手动标角')
-        return False
+        data['points'] = None
+        data['processed'] = None
+        data['ocr'] = {}
+        data['_ocr_key'] = None
+        (self.rows[idx].front if side == 'front'
+         else self.rows[idx].back).set_processed(None)
+        self._enqueue_detect(idx, side, img, stats=stats,
+                             open_mark_on_fail=open_mark_on_fail)
+        return True
 
     def batch_import(self):
         paths, _ = QFileDialog.getOpenFileNames(
@@ -540,17 +707,19 @@ class MainWindow(QMainWindow):
         if paths:
             self.import_files_as_pairs(paths)
 
-    def import_files_as_pairs(self, paths):
+    def import_files_as_pairs(self, paths, stats=None):
         paths = [p for p in paths if p.lower().endswith(IMG_EXTS)]
-        ok = fail = 0
+        if stats is None:
+            stats = {'ok': 0, 'fail': 0, 'pending': 0, 'label': '批量导入'}
         for k in range(0, len(paths), 2):
             idx = self.add_pair()
             for side, p in zip(('front', 'back'), paths[k:k + 2]):
-                if self.import_into_slot(idx, side, p):
-                    ok += 1
-                else:
-                    fail += 1
-        self.set_status(f'批量导入完成：成功 {ok} 张，失败 {fail} 张')
+                self.import_into_slot(idx, side, p, stats=stats)
+        if stats['pending'] == 0:
+            # 全部在开图阶段就失败了：没有异步回调会来播报，这里补上
+            self.set_status(f"{stats['label']}完成：成功 {stats['ok']} 张，"
+                            f"失败 {stats['fail']} 张")
+        return stats
 
     # ---------- drag & drop ----------
     def dragEnterEvent(self, event):
@@ -563,13 +732,17 @@ class MainWindow(QMainWindow):
         if not paths:
             return
         # fill empty slots first, then new pairs
+        stats = {'ok': 0, 'fail': 0, 'pending': 0, 'label': '拖入导入'}
         rest = list(paths)
         for i, pair in enumerate(self.core.pairs):
             for side in ('front', 'back'):
                 if rest and pair[side]['image'] is None:
-                    self.import_into_slot(i, side, rest.pop(0))
+                    self.import_into_slot(i, side, rest.pop(0), stats=stats)
         if rest:
-            self.import_files_as_pairs(rest)
+            self.import_files_as_pairs(rest, stats=stats)
+        elif stats['pending'] == 0 and (stats['ok'] or stats['fail']):
+            self.set_status(f"拖入导入完成：成功 {stats['ok']} 张，"
+                            f"失败 {stats['fail']} 张")
 
     # ---------- settings ----------
     def _sync_core_settings(self):
@@ -634,6 +807,7 @@ class MainWindow(QMainWindow):
         self._sync_core_settings()
 
     def closeEvent(self, event):
+        self._closing = True     # 后台识别/OCR 的迟到结果一律不再应用
         self._save_settings()
         super().closeEvent(event)
 
@@ -1258,8 +1432,14 @@ class PreviewDialog(QDialog):
         d = self._ask_folder('选择保存文件夹')
         if not d:
             return
-        for name, img in items:
-            img.convert('RGB').save(os.path.join(d, name), quality=95)
+        # S4: 写文件全程守卫，失败弹错误框（与主窗信息导出口径一致），
+        # 不再让异常穿出槽函数、用户侧无声无息
+        try:
+            for name, img in items:
+                img.convert('RGB').save(os.path.join(d, name), quality=95)
+        except Exception as e:
+            QMessageBox.critical(self, '错误', f'导出失败：{e}')
+            return
         self._remember(d)
         self.win.set_status(f'裁剪图已导出到 {d}')
         report_saved(self, d, f'已导出 {len(items)} 张裁剪图')
@@ -1271,9 +1451,13 @@ class PreviewDialog(QDialog):
         d = self._ask_folder('选择保存文件夹')
         if not d:
             return
-        for i, p in enumerate(pages):
-            p.save(os.path.join(d, f'{self._page_base(i)}_IDCard_{i + 1}.jpg'),
-                   quality=95, dpi=(300, 300))
+        try:
+            for i, p in enumerate(pages):
+                p.save(os.path.join(d, f'{self._page_base(i)}_IDCard_{i + 1}.jpg'),
+                       quality=95, dpi=(300, 300))
+        except Exception as e:
+            QMessageBox.critical(self, '错误', f'导出失败：{e}')
+            return
         self._remember(d)
         self.win.set_status(f'JPG 已导出到 {d}')
         report_saved(self, d, f'已导出 {len(pages)} 页 JPG')
@@ -1285,11 +1469,15 @@ class PreviewDialog(QDialog):
         d = self._ask_folder('选择保存文件夹')
         if not d:
             return
-        for i, p in enumerate(pages):
-            data = self.core._pages_to_pdf_bytes([p])
-            with open(os.path.join(
-                    d, f'{self._page_base(i)}_IDCard_{i + 1}.pdf'), 'wb') as f:
-                f.write(data)
+        try:
+            for i, p in enumerate(pages):
+                data = self.core._pages_to_pdf_bytes([p])
+                with open(os.path.join(
+                        d, f'{self._page_base(i)}_IDCard_{i + 1}.pdf'), 'wb') as f:
+                    f.write(data)
+        except Exception as e:
+            QMessageBox.critical(self, '错误', f'导出失败：{e}')
+            return
         self._remember(d)
         self.win.set_status(f'单页 PDF 已导出到 {d}')
         report_saved(self, d, f'已导出 {len(pages)} 个单页 PDF')
@@ -1306,9 +1494,13 @@ class PreviewDialog(QDialog):
         pages = self._pages()
         if not pages:
             return
-        data = self.core._pages_to_pdf_bytes(pages)
-        with open(path, 'wb') as f:
-            f.write(data)
+        try:
+            data = self.core._pages_to_pdf_bytes(pages)
+            with open(path, 'wb') as f:
+                f.write(data)
+        except Exception as e:
+            QMessageBox.critical(self, '错误', f'导出失败：{e}')
+            return
         self._remember(os.path.dirname(path))
         self.win.set_status(f'合并 PDF 已导出：{path}')
         report_saved(self, os.path.dirname(path),
