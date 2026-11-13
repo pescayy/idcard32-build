@@ -11,10 +11,10 @@
 - 自动流程对不上纸边（fallback / no_quad）→ 手动标角窗（复用标角画布）
   框纸面四角后拉正调光；竖拍照片可用「旋转90°」转正后重处理。
 """
-import os, sys, tempfile, shutil
+import os, sys, threading, tempfile, shutil
 import numpy as np
 import cv2
-from PySide2.QtCore import Qt
+from PySide2.QtCore import Qt, QObject, Signal
 from PySide2.QtGui import QPixmap
 from PySide2.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                                QLabel, QFileDialog, QMessageBox)
@@ -32,6 +32,15 @@ from bigdoc import dark_border_fraction
 from lic_enhance import enhance_license
 
 DARK_WARN = 0.08   # 任一边黑边占比超过此值 → 提示疑似黑边
+
+
+class _ProcBridge(QObject):
+    """执照管线跨线程信号桥（模块级长命对象）：工作线程只往它身上发
+    信号，弹窗销毁后连接自动断开，迟到结果无人接收、安全丢弃。"""
+    done = Signal(int, object)
+
+
+_PROC_BRIDGE = _ProcBridge()
 
 
 def imread_bgr(path):
@@ -104,7 +113,12 @@ class LicenseDialog(QDialog):
         self.src_path = None
         self.result = None        # process_license 返回 dict 或手动流程同构 dict
         self.warped = None        # 当前可导出的 BGR 图
-        self._detector_cache = None
+        # S1: 管线改后台线程跑；_proc_seq 每发起一次递增，完成回主
+        # 线程时序号/源图对不上即弃（旋转、换图都会取代旧的）
+        self._proc_seq = 0
+        self._busy = False
+        self._processing_src = None
+        _PROC_BRIDGE.done.connect(self._on_proc_done)
 
         lay = QVBoxLayout(self)
         top = QHBoxLayout()
@@ -149,13 +163,17 @@ class LicenseDialog(QDialog):
         return OUT_A4
 
     def _detector(self):
-        det = getattr(self.win.core, 'detector_ai', None)
-        if det is not None:
-            return det
-        if self._detector_cache is None:
-            from core import CardDetectorAI
-            self._detector_cache = CardDetectorAI(DEFAULT_MODEL)
-        return self._detector_cache
+        """共用 core 的唯一检测器（S5 修复）：旧实现查的
+        core.detector_ai 从未被赋值、永远落空，于是每次开执照窗都
+        在 UI 线程自建第二个 40MB 模型，且构造在管线异常守卫之外、
+        模型缺失能直接穿出槽函数。现在统一走 core.get_ai_detector
+        （懒加载＋缓存＋失败闩锁＋留痕）；模型不可用时返回 None，
+        管线按它自己的守卫降级。本方法会触发构造，只在后台线程
+        调用（见 _process 的 worker）。"""
+        get = getattr(self.win.core, 'get_ai_detector', None)
+        if get is not None:
+            return get()
+        return getattr(self.win.core, 'detector_ai', None)
 
     def _sync_buttons(self):
         has_src = self.src_bgr is not None
@@ -199,17 +217,66 @@ class LicenseDialog(QDialog):
         self._process()
         return True
 
+    def _set_busy(self, b):
+        """处理中：全部动作钮禁用＋信息行提示（S1 的忙碌指示）；
+        结束时按当前状态恢复（导出钮经 _sync_buttons 门闩）。"""
+        self._busy = b
+        if b:
+            self.info.setText('正在处理，请稍候…')
+            for w in (self.import_b, self.mark_b, self.rotate_b,
+                      self.jpg_b, self.pdf_b):
+                w.setEnabled(False)
+        else:
+            self.import_b.setEnabled(True)
+            self._sync_buttons()
+
     def _process(self):
+        """管线在后台线程跑（S1：旧实现同步跑完整管线＋首次构造
+        模型，全程冻窗、无任何提示）。完成经信号回主线程，序号或
+        源图对不上（已被旋转/换图的新一轮取代）即弃。"""
         if self.src_bgr is None:
             return
-        res = process_license(self.src_bgr, detector=self._detector(),
-                              out_size=self._out_size())
+        self._proc_seq += 1
+        seq = self._proc_seq
+        src = self.src_bgr
+        self._processing_src = src
+        out_size = self._out_size()
+        self._set_busy(True)
+
+        def worker():
+            try:
+                res = process_license(src, detector=self._detector(),
+                                      out_size=out_size)
+            except Exception as exc:
+                # process_license 本有守卫，这里是双保险：无论如何都
+                # 要给主线程一个完成回执，否则忙碌态永不解除
+                res = {'status': 'no_quad', 'route': None, 'flat': False,
+                       'warped': None, 'paper_quad': None, 'fallback': None,
+                       'dewarp_skipped_high_bow': False,
+                       'info': {'reason': 'pipeline_error',
+                                'error': f'{type(exc).__name__}: {exc}'}}
+            _PROC_BRIDGE.done.emit(seq, res)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_proc_done(self, seq, res):
+        if seq != self._proc_seq or self._processing_src is not self.src_bgr:
+            return    # 迟到结果：已被新一轮处理取代，弃
         self.result = res
         if res['status'] != 'ok':
             self.warped = None
             self._show_bgr(self.src_bgr)
-            self.info.setText('没认出执照边框，请点「手动标角」框出纸面四角')
-            self._sync_buttons()
+            # S2 口径：模型不可用与照片没认出分开说
+            if getattr(self.win.core, '_ai_error', None):
+                self.info.setText('识别模型不可用（原因记在程序旁边的 '
+                                  'detect_error.log），请点「手动标角」'
+                                  '框出纸面四角')
+            elif res['info'].get('error'):
+                self.info.setText(f"自动处理出错（{res['info']['error']}），"
+                                  '请点「手动标角」框出纸面四角')
+            else:
+                self.info.setText('没认出执照边框，请点「手动标角」框出纸面四角')
+            self._set_busy(False)
             return
         self.warped = res['warped']
         self._show_bgr(self.warped)
@@ -224,7 +291,7 @@ class LicenseDialog(QDialog):
         if note:
             notes.append(note)
         self.info.setText('；'.join(notes) if notes else '处理完成，可导出')
-        self._sync_buttons()
+        self._set_busy(False)
 
     def rotate_source(self):
         if self.src_bgr is None:
@@ -285,7 +352,12 @@ class LicenseDialog(QDialog):
             return
         if not path.lower().endswith(('.jpg', '.jpeg')):
             path += '.jpg'
-        self._pil().save(path, quality=95, dpi=(200, 200))
+        # S4: 写文件守卫，失败弹错误框（与主窗信息导出口径一致）
+        try:
+            self._pil().save(path, quality=95, dpi=(200, 200))
+        except Exception as e:
+            QMessageBox.critical(self, '错误', f'导出失败：{e}')
+            return
         self._after_save(path)
 
     def export_pdf(self):
@@ -304,8 +376,13 @@ class LicenseDialog(QDialog):
         if data is None:
             QMessageBox.warning(self, '提示', 'PDF 生成失败，请改用导出 JPG')
             return
-        with open(path, 'wb') as f:
-            f.write(data)
+        # S4: 写文件守卫，失败弹错误框（与主窗信息导出口径一致）
+        try:
+            with open(path, 'wb') as f:
+                f.write(data)
+        except Exception as e:
+            QMessageBox.critical(self, '错误', f'导出失败：{e}')
+            return
         self._after_save(path)
 
     def _license_pdf_bytes(self):
