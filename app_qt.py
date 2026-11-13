@@ -1323,6 +1323,25 @@ class MainWindow(QMainWindow):
                      f'已导出 TXT：{os.path.basename(path)}')
 
     # ---------- preview & export ----------
+    def _layout_sig(self):
+        """图集签名（预览关窗留存的判据）：按 core.compute_layout 的
+        收集序（组序×正反序）逐槽取 (path, id(image), id(processed))。
+        不许用布局图的 id：compute_layout 的 prep() 每次 convert 都
+        产生新图对象、id 必变，签名永不相等、留存永不触发（F1 根因）。
+        槽里的 image/processed 由槽字典持有，图集未变时 id 稳定；
+        换图（path 与两 id 全换）、重处理（识别/微调必赋新 processed
+        对象）、增删组槽（序列变长变短）任一发生，签名必变、自动
+        回落新布局。须在 generate_preview 的暂存状态下调用（与
+        compute_layout 实际消费的槽集一致）。"""
+        keys = []
+        for pair in self.core.pairs:
+            for side in ('front', 'back'):
+                data = pair[side]
+                if data['processed'] is not None:
+                    keys.append((data.get('path'), id(data['image']),
+                                 id(data['processed'])))
+        return tuple(keys)
+
     def generate_preview(self):
         self._sync_core_settings()
         stash = []
@@ -1342,11 +1361,12 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, '提示', '没有可生成的图片数据')
                 return
             # 自由排版手动结果留存（按 Merge：锁定/关窗不丢）：上次
-            # 预览关窗时按「页内图身份签名」存下的布局副本，图集未
-            # 变（签名逐图 id 一致且页/卡数同构）时原样带回——拖动
-            # 位置与面板的改尺寸/旋转/增强一并保留；任一图被重处理
-            # 或增删，签名即不符，自动回落到 core 新算的布局。
-            sig = tuple(id(img) for page in layout for img, _x, _y in page)
+            # 预览关窗时按「图集签名」存下的布局副本，图集未变（签名
+            # 一致且页/卡数同构）时原样带回——拖动位置与面板的改尺
+            # 寸/旋转/增强一并保留；任一图被重处理或增删，签名即不
+            # 符，自动回落到 core 新算的布局。签名取槽位稳定身份
+            # （_layout_sig），不取布局图 id（prep 必造新对象，F1）。
+            sig = self._layout_sig()
             saved = getattr(self, '_free_saved', None)
             if (saved is not None and saved[0] == sig
                     and len(saved[1]) == len(layout)
