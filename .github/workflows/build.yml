@@ -57,7 +57,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-qt.txt
       - name: Build with PyInstaller (onedir)
-        run: pyinstaller --noconfirm --onedir --windowed --name IDCardMuse --collect-all onnxruntime --collect-all rapidocr_onnxruntime --add-data "models/carddetection_scrfd34gkps.onnx;models" app_qt.py
+        run: pyinstaller --noconfirm --onedir --windowed --name IDCardMuse --collect-all onnxruntime --collect-all rapidocr_onnxruntime --hidden-import lic_wedgecut --hidden-import lic_edge_refine --add-data "models/carddetection_scrfd34gkps.onnx;models" --add-data "icons;icons" app_qt.py
       - name: Verify onedir layout
         run: |
           Get-ChildItem dist/IDCardMuse | Select-Object Name,Length | Format-Table -AutoSize
