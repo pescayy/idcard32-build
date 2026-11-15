@@ -65,6 +65,31 @@ def icon(name):
         _icon_cache[name] = QIcon(os.path.join(ICONS_DIR, name + '.svg'))
     return _icon_cache[name]
 
+
+def _asset_bytes(filename):
+    """icons/ 下的二进制素材（头像图/窗口图标）：仓库里以 .b64 文本存放
+    （推送通道送不了二进制），构建若未在 CI 解包，运行时自己解。"""
+    p = os.path.join(ICONS_DIR, filename)
+    if os.path.exists(p):
+        with open(p, 'rb') as f:
+            return f.read()
+    if os.path.exists(p + '.b64'):
+        import base64
+        with open(p + '.b64', 'rb') as f:
+            return base64.b64decode(f.read())
+    return None
+
+
+def _app_qicon():
+    """窗口图标：app.ico 优先，其次头像 PNG；都没有返回空图标。"""
+    for fn in ('app.ico', 'app-icon-master.png'):
+        data = _asset_bytes(fn)
+        if data:
+            pm = QPixmap()
+            if pm.loadFromData(data):
+                return QIcon(pm)
+    return QIcon()
+
 try:
     import pillow_heif
     pillow_heif.register_heif_opener()
@@ -286,7 +311,10 @@ class TitleBar(QWidget):
         lay.setSpacing(0)
         self._icon = QLabel(self)
         self._icon.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        _pm = QPixmap(os.path.join(ICONS_DIR, 'app-icon-master.png'))
+        _pm = QPixmap()
+        _data = _asset_bytes('app-icon-master.png')
+        if _data:
+            _pm.loadFromData(_data)
         if not _pm.isNull():
             self._icon.setPixmap(_pm.scaled(18, 18, Qt.KeepAspectRatio,
                                             Qt.SmoothTransformation))
@@ -362,9 +390,9 @@ class MainWindow(QMainWindow):
         # 图标＋自绘标题栏（标题居中，照 Merge）：原生标题栏在
         # Win10/Server 上文字靠左、做不到居中，故去边框自绘。
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
-        _ico = os.path.join(ICONS_DIR, 'app.ico')
-        if os.path.exists(_ico):
-            self.setWindowIcon(QIcon(_ico))
+        _qi = _app_qicon()
+        if not _qi.isNull():
+            self.setWindowIcon(_qi)
         self._titlebar = TitleBar(self)
         self.setMenuWidget(self._titlebar)
         # 客户区照 Merge 实测 1000×650（MERGE-UI-MEASURE.md §1/§11）
@@ -2777,9 +2805,9 @@ class PreviewDialog(QDialog):
 
 def main():
     app = QApplication(sys.argv)
-    _app_ico = os.path.join(ICONS_DIR, 'app.ico')
-    if os.path.exists(_app_ico):
-        app.setWindowIcon(QIcon(_app_ico))
+    _qi = _app_qicon()
+    if not _qi.isNull():
+        app.setWindowIcon(_qi)
     # 界面字体照 Merge 实测＝仿宋（MERGE-UI-MEASURE.md §2/§9）。Qt 按
     # 族名链回退：目标机 Win7 系统自带仿宋，本机开发用 Noto Serif CJK
     # 顶替渲染。字号口径 2026-11-15 晚修正：Merge 是 Fyne 应用，其 14
