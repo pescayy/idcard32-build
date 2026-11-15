@@ -72,7 +72,7 @@ jobs:
         with:
           name: IDCardMuse-win7-qt
           path: dist/IDCardMuse
-    build-qt64:
+build-qt64:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
