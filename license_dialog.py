@@ -53,7 +53,7 @@ def imread_bgr(path):
 
 def _btn_style():
     return (f'QPushButton {{ background: {BLUE}; color: white; border: none;'
-            ' border-radius: 4px; padding: 6px 14px; font-size: 13.5px; }'
+            ' border-radius: 4px; padding: 6px 14px; font-size: 18px; }'
             'QPushButton:hover { background: #2569D1; }'
             'QPushButton:disabled { background: #A9C6F5; }')
 
@@ -90,7 +90,7 @@ class LicenseMarkDialog(QDialog):
         confirm_b.setFixedHeight(42)
         confirm_b.setStyleSheet(
             f'QPushButton {{ background: {BLUE}; color: white; border: none;'
-            ' border-radius: 4px; font-size: 15px; font-weight: bold; }')
+            ' border-radius: 4px; font-size: 20px; font-weight: bold; }')
         confirm_b.clicked.connect(self._confirm)
         lay.addWidget(confirm_b)
         self.canvas.fit()
@@ -153,12 +153,12 @@ class LicenseDialog(QDialog):
         self.view.setAlignment(Qt.AlignCenter)
         self.view.setStyleSheet(
             'background: white; border: 1px solid #D5DBE3; border-radius: 5px;'
-            ' color: #8A94A3; font-size: 14px;')
+            ' color: #8A94A3; font-size: 19px;')
         lay.addWidget(self.view, 1)
 
         self.info = QLabel('就绪')
         self.info.setAlignment(Qt.AlignCenter)
-        self.info.setStyleSheet('color: #5B6470; font-size: 13px;')
+        self.info.setStyleSheet('color: #5B6470; font-size: 17px;')
         lay.addWidget(self.info)
         self._sync_buttons()
 

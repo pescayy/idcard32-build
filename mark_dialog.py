@@ -200,14 +200,14 @@ class MarkDialog(QDialog):
         lay.addWidget(self.canvas, 1)
 
         self.hint = QLabel('')
-        self.hint.setStyleSheet('color: #5B6470; font-size: 13px;')
+        self.hint.setStyleSheet('color: #5B6470; font-size: 17px;')
         lay.addWidget(self.hint)
 
         self.confirm_b = QPushButton('✓ 确认微调')
         self.confirm_b.setFixedHeight(42)
         self.confirm_b.setStyleSheet(
             f'QPushButton {{ background: {BLUE}; color: white; border: none;'
-            ' border-radius: 4px; font-size: 15px; font-weight: bold; }')
+            ' border-radius: 4px; font-size: 20px; font-weight: bold; }')
         self.confirm_b.clicked.connect(self.confirm)
         lay.addWidget(self.confirm_b)
 

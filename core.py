@@ -73,6 +73,23 @@ class CardDetectorAI:
             self._cv_net = cv2.dnn.readNet(onnxmodel)
         self.keep_ratio, self.fmc = True, 3
         self._feat_stride_fpn, self._num_anchors = [8, 16, 32], 4
+        self._anchor_cache = {}
+
+    def _anchors_for(self, stride, height, width):
+        """Anchor-center grid for one FPN level, built once and cached:
+        the input is always 640x640, so the grids never change between
+        calls (the old code rebuilt all three mgrid stacks per detect)."""
+        key = (stride, height, width)
+        ac = self._anchor_cache.get(key)
+        if ac is None:
+            ac = np.stack(np.mgrid[:height, :width][::-1],
+                          axis=-1).astype(np.float32)
+            ac = (ac * stride).reshape((-1, 2))
+            if self._num_anchors > 1:
+                ac = np.stack([ac] * self._num_anchors,
+                              axis=1).reshape((-1, 2))
+            self._anchor_cache[key] = ac
+        return ac
 
     def resize_image(self, srcimg):
         padh, padw, newh, neww = 0, 0, self.inpHeight, self.inpWidth
@@ -143,19 +160,29 @@ class CardDetectorAI:
         scores_list, bboxes_list, kpss_list = [], [], []
         for idx, stride in enumerate(self._feat_stride_fpn):
             scores = outs[idx * self.fmc][0]
-            bbox_preds = outs[idx * self.fmc + 1][0] * stride
-            kps_preds = outs[idx * self.fmc + 2][0] * stride
+            bbox_preds = outs[idx * self.fmc + 1][0]
+            kps_preds = outs[idx * self.fmc + 2][0]
             height, width = blob.shape[2] // stride, blob.shape[3] // stride
-            anchor_centers = np.stack(np.mgrid[:height, :width][::-1], axis=-1).astype(np.float32)
-            anchor_centers = (anchor_centers * stride).reshape((-1, 2))
-            if self._num_anchors > 1:
-                anchor_centers = np.stack([anchor_centers] * self._num_anchors, axis=1).reshape((-1, 2))
+            anchor_centers = self._anchors_for(stride, height, width)
             # Original keeps a candidate only when score > 0.5 (strict).
+            # Speed fix (2026-11-15): filter by score FIRST, then run the
+            # bbox/kps distance transforms only on the surviving rows.
+            # The old order transformed all ~33k anchors per stride set
+            # and threw ~99% of the work away. distance2bbox/kps are
+            # row-independent, so the kept rows are bit-identical --
+            # verified against the pre-fix baseline (corners + processed
+            # image hashes on the synthetic sample set).
             pos_inds = np.where(scores > self.confThreshold)[0]
-            bboxes = self.distance2bbox(anchor_centers, bbox_preds)
-            scores_list.append(scores[pos_inds]); bboxes_list.append(bboxes[pos_inds])
-            kpss = self.distance2kps(anchor_centers, kps_preds).reshape((-1, 4, 2))
-            kpss_list.append(kpss[pos_inds])
+            scores_list.append(scores[pos_inds])
+            if len(pos_inds) == 0:
+                bboxes_list.append(np.empty((0, 4), dtype=np.float32))
+                kpss_list.append(np.empty((0, 4, 2), dtype=np.float32))
+                continue
+            ac = anchor_centers[pos_inds]
+            bboxes_list.append(self.distance2bbox(
+                ac, bbox_preds[pos_inds] * stride))
+            kpss_list.append(self.distance2kps(
+                ac, kps_preds[pos_inds] * stride).reshape((-1, 4, 2)))
         if not scores_list:
             return None
         scores = np.vstack(scores_list).ravel(); bboxes = np.vstack(bboxes_list); kpss = np.vstack(kpss_list)

@@ -76,9 +76,9 @@ except Exception:
 # 只覆盖它写明的属性，其余尺寸属性仍由此表兜底。
 GLOBAL_QSS = (
     'QPushButton { min-height: 34px; }'
-    'QComboBox { min-height: 32px; font-size: 14px; }'
-    'QLineEdit { min-height: 32px; font-size: 14px; }'
-    'QMenu { font-size: 14px; padding: 4px 0; min-width: 220px; }'
+    'QComboBox { min-height: 32px; font-size: 19px; }'
+    'QLineEdit { min-height: 32px; font-size: 19px; }'
+    'QMenu { font-size: 19px; padding: 4px 0; min-width: 220px; }'
     'QMenu::item { padding: 8px 26px; }'
     f'QMenu::item:selected {{ background: {BLUE}; color: white; }}'
 )
@@ -145,7 +145,7 @@ class SlotWidget(QFrame):
         self.button.setFixedSize(212, 36)
         self.button.setStyleSheet(
             f'QPushButton {{ background: {GRAY_BTN}; color: {INK}; border: none;'
-            ' border-radius: 4px; font-size: 14px; min-height: 36px; }'
+            ' border-radius: 4px; font-size: 19px; min-height: 36px; }'
             'QPushButton:hover { background: #ECECEC; }')
         self.button.clicked.connect(lambda: self.import_clicked.emit(self))
         lay.addWidget(self.button)
@@ -193,7 +193,7 @@ class PairRow(QFrame):
         rail.addSpacing(46)
         self.num = QLabel('')
         self.num.setAlignment(Qt.AlignCenter)
-        self.num.setStyleSheet(f'color: {INK}; font-size: 14px;')
+        self.num.setStyleSheet(f'color: {INK}; font-size: 19px;')
         num_row = QHBoxLayout()
         num_row.addStretch(1)
         num_row.addWidget(self.num)
@@ -241,7 +241,7 @@ class PairRow(QFrame):
         self.swap.setFixedSize(30, 30)
         self.swap.setStyleSheet(
             f'QPushButton {{ background: {GRAY_BTN}; color: {INK}; border: none;'
-            ' border-radius: 4px; font-size: 15px; min-height: 30px;'
+            ' border-radius: 4px; font-size: 20px; min-height: 30px;'
             ' padding: 0px; }'
             'QPushButton:hover { background: #ECECEC; }')
         self.swap.clicked.connect(lambda: win.swap_pair(self.index))
@@ -258,7 +258,7 @@ class PairRow(QFrame):
     @staticmethod
     def _btn_style():
         return (f'QPushButton {{ background: {BAR_BG}; border: none; border-radius: 4px;'
-                ' padding: 8px 14px; font-size: 14px; color: #333; }'
+                ' padding: 8px 14px; font-size: 19px; color: #333; }'
                 f'QPushButton:hover {{ background: #E2E7EE; }}')
 
 
@@ -302,6 +302,13 @@ class MainWindow(QMainWindow):
         self.ocr_probe_done.connect(self._on_ocr_probe)
         self._ocr_dead = False
         threading.Thread(target=self._probe_ocr, daemon=True).start()
+        # 启动预热（2026-11-15 速度修）：模型加载/首跑开销挪到开机
+        # 空闲期，不算在第一次导入头上，见 _preload_models。
+        threading.Thread(target=self._preload_models, daemon=True).start()
+        # 读字串行锁 + 识别空闲条件（2026-11-15 速度修）：OCR 不许与
+        # 识别并发抢 CPU，读字任务之间也排队，见 _schedule_ocr。
+        self._ocr_lock = threading.Lock()
+        self._idle_cond = threading.Condition()
         # 边框识别（S1 修复）：与 OCR 同模式——单个后台线程顺序执行，
         # 结果走 detect_done 信号回主线程应用；识别期间窗口保持响应，
         # 以等待光标＋状态行作忙碌指示。队列里的任务只携带 (core, 图)
@@ -317,6 +324,25 @@ class MainWindow(QMainWindow):
     # ---------- OCR (full-edition merge; logic in ocr_qt.py) ----------
     def _probe_ocr(self):
         self.ocr_probe_done.emit(ocr_qt.ocr_available())
+
+    def _preload_models(self):
+        """启动预热（2026-11-15 速度修）：窗口出来后在后台把检测模型
+        建好并空跑一次推理——首次导入要付的模型加载与首跑开销挪到
+        开机空闲期，第一次点导入就是热态。原版 Merge 的「秒识别」
+        体感大半来自没有把这笔账算在导入头上。
+        只预热检测、不预热 OCR 引擎：实测教训——OCR 引擎构建要几秒，
+        用户开机后立刻导入时它还在建，反而成了新的抢 CPU 源头；
+        OCR 首次构建成本落在第一次读字任务里（已改成等识别空闲才
+        跑，用户等的是卡面出图，不等读字结果），不必预热。
+        失败一律静默：真用时原有路径会如实报错（_ai_error /
+        _ocr_dead），预热不许抢先改这些状态。"""
+        try:
+            det = self.core.get_ai_detector()
+            if det is not None:
+                import numpy as _np
+                det.detect(_np.zeros((480, 640, 3), dtype='uint8'))
+        except Exception:
+            pass
 
     def _on_ocr_probe(self, ok):
         if not ok:
@@ -346,12 +372,22 @@ class MainWindow(QMainWindow):
         def worker():
             err_text = ''
             texts = []
-            try:
-                info, texts = ocr_qt.read_card_full(img, side)
-            except Exception as e:
-                info = {}
-                err_text = repr(e)
-                ocr_qt.log_ocr_error(e)
+            info = {}
+            # 2026-11-15 速度修：读字排队串行，且必须等识别队列空闲
+            # 才开跑。此前每张卡处理完立刻另起线程全速 OCR，与下一
+            # 张的识别并发抢 CPU，两边都被拖慢（即「打架」）；识别
+            # 是用户正等着的事，读字是后台活，永远让识别先行。
+            with self._ocr_lock:
+                with self._idle_cond:
+                    while (self._detect_pending > 0
+                           and not self._closing):
+                        self._idle_cond.wait(timeout=0.5)
+                try:
+                    info, texts = ocr_qt.read_card_full(img, side)
+                except Exception as e:
+                    info = {}
+                    err_text = repr(e)
+                    ocr_qt.log_ocr_error(e)
             self.ocr_done.emit(idx, side, info, err_text, slot, img, texts)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -439,7 +475,7 @@ class MainWindow(QMainWindow):
         self.lic_btn.setFixedSize(142, 37)
         self.lic_btn.setStyleSheet(
             f'QPushButton {{ background: {BLUE}; color: white; border: none;'
-            ' border-radius: 4px; font-size: 14px; min-height: 37px; }'
+            ' border-radius: 4px; font-size: 19px; min-height: 37px; }'
             f'QPushButton:hover {{ background: {BLUE_HOVER}; }}')
         self.lic_btn.clicked.connect(self.open_license_flow)
         top.addWidget(self.lic_btn)
@@ -464,7 +500,7 @@ class MainWindow(QMainWindow):
         self.hint = QLabel('请分别添加证件正面和背面，支持批量导入。')
         self.hint.setAlignment(Qt.AlignCenter)
         self.hint.setFixedHeight(40)
-        self.hint.setStyleSheet(f'color: {INK}; font-size: 14px;')
+        self.hint.setStyleSheet(f'color: {INK}; font-size: 19px;')
         root.addWidget(self.hint)
         root.addWidget(self._sep())
 
@@ -490,7 +526,7 @@ class MainWindow(QMainWindow):
         ctrl.addSpacing(57)
         lab = QLabel('控制列数')
         lab.setAlignment(Qt.AlignCenter)
-        lab.setStyleSheet(f'color: {INK}; font-size: 14px;')
+        lab.setStyleSheet(f'color: {INK}; font-size: 19px;')
         lab.setFixedWidth(72)
         ctrl.addWidget(lab)
         ctrl.addSpacing(14)
@@ -532,10 +568,10 @@ class MainWindow(QMainWindow):
         self.batch_btn = QPushButton('批量导入（按列数分组）')
         self.batch_btn.setIcon(icon('folder_white'))
         self.batch_btn.setIconSize(QSize(16, 16))
-        self.batch_btn.setFixedSize(197, 38)
+        self.batch_btn.setFixedSize(248, 38)
         self.batch_btn.setStyleSheet(
             f'QPushButton {{ background: {BLUE}; color: white; border: none;'
-            ' border-radius: 4px; font-size: 14px; min-height: 38px; }'
+            ' border-radius: 4px; font-size: 19px; min-height: 38px; }'
             f'QPushButton:hover {{ background: {BLUE_HOVER}; }}')
         self.batch_btn.clicked.connect(self.batch_import)
         brow.addWidget(self.batch_btn)
@@ -560,11 +596,13 @@ class MainWindow(QMainWindow):
         self.wm_preset.currentIndexChanged.connect(self._on_wm_preset)
         self.wm_size_c = self._param_combo(prow, '字号：', WM_SIZE_ITEMS, '小 (36)')
         self.wm_color_c = self._param_combo(prow, '颜色：', WM_COLOR_ITEMS,
-                                           '黑色 （默认）')
+                                           '黑色 （默认）', w=155)
         self.wm_opacity_c = self._param_combo(
-            prow, '透明度(%)：', [str(i) for i in range(10, 101, 10)], '50')
+            prow, '透明度(%)：', [str(i) for i in range(10, 101, 10)], '50',
+            w=100)
         self.wm_rows_c = self._param_combo(
-            prow, '行数：', [str(i) for i in range(1, 11)], '3', last=True)
+            prow, '行数：', [str(i) for i in range(1, 11)], '3', last=True,
+            w=95)
         prow.addStretch(1)
         root.addLayout(prow)
 
@@ -574,14 +612,14 @@ class MainWindow(QMainWindow):
         crow.setContentsMargins(8, 6, 8, 0)
         crow.setSpacing(0)
         clab = QLabel('自定义内容：')
-        clab.setStyleSheet(f'color: {INK}; font-size: 14px;')
+        clab.setStyleSheet(f'color: {INK}; font-size: 19px;')
         crow.addWidget(clab)
         self.wm_custom = QLineEdit()
         self.wm_custom.setPlaceholderText('请输入自定义水印内容...')
         self.wm_custom.setFixedSize(360, 32)
         self.wm_custom.setStyleSheet(
             f'QLineEdit {{ background: {COMBO_BG}; color: {INK}; border: none;'
-            ' border-radius: 4px; padding-left: 9px; font-size: 14px; }')
+            ' border-radius: 4px; padding-left: 9px; font-size: 19px; }')
         crow.addWidget(self.wm_custom)
         crow.addStretch(1)
         self.wm_custom_row.setVisible(False)
@@ -610,7 +648,7 @@ class MainWindow(QMainWindow):
         self.gen_btn.setFixedHeight(38)
         self.gen_btn.setStyleSheet(
             f'QPushButton {{ background: {ORANGE}; color: white; border: none;'
-            ' border-radius: 4px; font-size: 14px; min-height: 38px; }'
+            ' border-radius: 4px; font-size: 19px; min-height: 38px; }'
             f'QPushButton:hover {{ background: {ORANGE_HOVER}; }}')
         self.gen_btn.clicked.connect(self.generate_preview)
         grow.addWidget(self.gen_btn)
@@ -622,7 +660,7 @@ class MainWindow(QMainWindow):
         self.status = QLabel('就绪')
         self.status.setAlignment(Qt.AlignCenter)
         self.status.setFixedHeight(47)
-        self.status.setStyleSheet(f'color: {INK}; font-size: 14px;')
+        self.status.setStyleSheet(f'color: {INK}; font-size: 19px;')
         root.addWidget(self.status)
 
     @staticmethod
@@ -638,7 +676,7 @@ class MainWindow(QMainWindow):
         # 钉到目标高：QSS 的 min-height 会覆盖 setFixedHeight 的下限，
         # 写 0 会被布局按 sizeHint 压矮（实测 37→22）。
         return (f'QPushButton {{ background: {GRAY_BTN}; color: {INK}; border: none;'
-                f' border-radius: 4px; font-size: 14px; min-height: {h}px;'
+                f' border-radius: 4px; font-size: 19px; min-height: {h}px;'
                 ' padding-left: 10px; padding-right: 10px; }'
                 'QPushButton:hover { background: #ECECEC; }')
 
@@ -646,24 +684,24 @@ class MainWindow(QMainWindow):
     def _radio_qss():
         # 单选照 Merge 实拍：未选＝浅灰环、已选＝灰环＋蓝盘；间距视觉对齐
         return (
-            f'QRadioButton {{ color: {INK}; font-size: 14px; spacing: 9px; }}'
+            f'QRadioButton {{ color: {INK}; font-size: 19px; spacing: 9px; }}'
             'QRadioButton::indicator { width: 18px; height: 18px; }'
             f'QRadioButton::indicator:unchecked {{ image: url({ICONS_DIR}/radio_unchecked.svg); }}'
             f'QRadioButton::indicator:checked {{ image: url({ICONS_DIR}/radio_checked.svg); }}')
 
-    def _param_combo(self, prow, label, items, current, last=False):
+    def _param_combo(self, prow, label, items, current, last=False, w=125):
         lab = QLabel(label)
-        lab.setStyleSheet(f'color: {INK}; font-size: 14px;')
+        lab.setStyleSheet(f'color: {INK}; font-size: 19px;')
         prow.addWidget(lab)
         prow.addSpacing(4)
         combo = QComboBox()
         combo.addItems(items)
         if current in items:
             combo.setCurrentText(current)
-        combo.setFixedSize(125, 32)
+        combo.setFixedSize(w, 32)
         combo.setStyleSheet(
             f'QComboBox {{ background: {COMBO_BG}; color: {INK}; border: none;'
-            ' border-radius: 4px; padding-left: 9px; font-size: 14px;'
+            ' border-radius: 4px; padding-left: 9px; font-size: 19px;'
             ' min-height: 32px; }'
             'QComboBox::drop-down { border: none; width: 26px; }'
             f'QComboBox::down-arrow {{ image: url({ICONS_DIR}/down_arrow.svg);'
@@ -698,7 +736,7 @@ class MainWindow(QMainWindow):
         c.addItems(items)
         c.setCurrentText(current)
         c.setStyleSheet('QComboBox { border-radius: 4px; padding: 5px 8px;'
-                        ' background: white; font-size: 14px; }')
+                        ' background: white; font-size: 19px; }')
         return c
 
     # ---------- pairs ----------
@@ -908,6 +946,8 @@ class MainWindow(QMainWindow):
         self._detect_pending = max(0, self._detect_pending - 1)
         if self._detect_pending == 0:
             QApplication.restoreOverrideCursor()
+            with self._idle_cond:
+                self._idle_cond.notify_all()
         if stats is not None:
             stats['pending'] -= 1
             if stats['pending'] <= 0:
@@ -1061,7 +1101,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _primary_style():
         return (f'QPushButton {{ background: {BLUE}; color: white; border: none;'
-                ' border-radius: 4px; padding: 9px 18px; font-size: 14px; }'
+                ' border-radius: 4px; padding: 9px 18px; font-size: 19px; }'
                 'QPushButton:hover { background: #2569D1; }')
 
     def _sync_core_settings(self):
@@ -1551,7 +1591,7 @@ class PageView(QWidget):
         page_w = self.pw * self.scale
         page_h = self._page_h()
         label_font = QFont()
-        label_font.setPixelSize(13)
+        label_font.setPixelSize(17)
         for pi, page in enumerate(self.layout):
             top = self._page_top(pi)
             px, py = int(self.ox), int(top + self.LABEL_H)
@@ -1592,7 +1632,7 @@ class PageView(QWidget):
                 s = self.core.mm_to_pixel
                 tag = f'{img.width / s:.1f} x {img.height / s:.1f} mm'
                 tf = QFont()
-                tf.setPixelSize(11)
+                tf.setPixelSize(15)
                 qp.setFont(tf)
                 fm = qp.fontMetrics()
                 tw = fm.horizontalAdvance(tag) + 12
@@ -1758,6 +1798,13 @@ class PreviewDialog(QDialog):
                 self._src_map = [[next(_it) for _ in page]
                                  for page in self.layout]
         self.setWindowTitle('可交互排版预览（支持拖放）')
+        # 标准窗口钮（2026-11-15 晚照原版修）：QDialog 默认带上下文
+        # 帮助「？」钮且无最小化/最大化——原版三钮俱全、双击顶栏可
+        # 放大看整页排版。改成普通顶层窗口标志：最小化/最大化/关闭
+        # 齐全、无问号钮，双击标题栏最大化走系统原生行为。
+        self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint
+                            | Qt.WindowMaximizeButtonHint
+                            | Qt.WindowCloseButtonHint)
         # 窗 1050×650 居中（原版 v2.2 本体真数，PREVIEW-GEOMETRY.md）
         self.resize(1050, 650)
         scr = QGuiApplication.primaryScreen()
@@ -1773,12 +1820,12 @@ class PreviewDialog(QDialog):
         # 高 36、图标 18px、圆角 4。
         gray_qss = (
             f'QPushButton {{ background: {GRAY_BTN}; color: {INK}; border: none;'
-            ' border-radius: 4px; padding: 0px 14px; font-size: 14px;'
+            ' border-radius: 4px; padding: 0px 14px; font-size: 19px;'
             ' min-height: 36px; }'
             'QPushButton:hover { background: #ECECEC; }')
         color_qss = lambda bg, hover, fg='white': (
             f'QPushButton {{ background: {bg}; color: {fg}; border: none;'
-            ' border-radius: 4px; padding: 0px 14px; font-size: 14px;'
+            ' border-radius: 4px; padding: 0px 14px; font-size: 19px;'
             ' min-height: 36px; }'
             f'QPushButton:hover {{ background: {hover}; }}')
         top = QHBoxLayout()
@@ -1889,7 +1936,7 @@ class PreviewDialog(QDialog):
         def color_qss(bg, hover):
             return (f'QPushButton {{ background: {bg}; color: white;'
                     ' border: none; border-radius: 4px; padding: 0px 14px;'
-                    ' font-size: 14px; min-height: 36px; }'
+                    ' font-size: 19px; min-height: 36px; }'
                     f'QPushButton:hover {{ background: {hover}; }}')
 
         def sep():
@@ -1906,7 +1953,7 @@ class PreviewDialog(QDialog):
                 pic.setPixmap(icon(icn).pixmap(QSize(15, 15)))
                 row.addWidget(pic)
             lab = QLabel(text)
-            lab.setStyleSheet(f'color: {INK}; font-size: 14px;')
+            lab.setStyleSheet(f'color: {INK}; font-size: 19px;')
             row.addWidget(lab)
             row.addStretch(1)
             return row
@@ -1953,7 +2000,7 @@ class PreviewDialog(QDialog):
         self.layout_combo.setStyleSheet(
             f'QComboBox {{ background: {COMBO_BG}; color: {INK};'
             ' border: none; border-radius: 4px; padding-left: 9px;'
-            ' font-size: 14px; min-height: 32px; }'
+            ' font-size: 19px; min-height: 32px; }'
             'QComboBox::drop-down { border: none; width: 26px; }'
             f'QComboBox::down-arrow {{ image: url({ICONS_DIR}/down_arrow.svg);'
             ' width: 12px; height: 12px; }'
@@ -1991,7 +2038,7 @@ class PreviewDialog(QDialog):
         frow.addWidget(fill_b, 1)
         self.all_sel_check = QCheckBox('全选图片')
         self.all_sel_check.setStyleSheet(
-            f'QCheckBox {{ color: {INK}; font-size: 14px; spacing: 6px; }}'
+            f'QCheckBox {{ color: {INK}; font-size: 19px; spacing: 6px; }}'
             'QCheckBox::indicator { width: 18px; height: 18px; }'
             f'QCheckBox::indicator:unchecked {{ image: url({ICONS_DIR}/checkbox_unchecked.svg); }}'
             f'QCheckBox::indicator:checked {{ image: url({ICONS_DIR}/checkbox_checked.svg); }}')
@@ -2004,7 +2051,7 @@ class PreviewDialog(QDialog):
         v.addLayout(header('物理尺寸微调', 'wrench_dark'))
         edit_qss = (f'QLineEdit {{ background: white; color: {INK};'
                     ' border: 1px solid #D9D9D9; border-radius: 4px;'
-                    ' padding: 0px 6px; font-size: 14px; min-height: 32px; }')
+                    ' padding: 0px 6px; font-size: 19px; min-height: 32px; }')
         step_qss = (f'QPushButton {{ background: {GRAY_BTN}; color: {INK};'
                     ' border: none; border-radius: 4px; min-height: 32px; }'
                     'QPushButton:hover { background: #ECECEC; }')
@@ -2021,7 +2068,7 @@ class PreviewDialog(QDialog):
             row = QHBoxLayout()
             row.setSpacing(4)
             lab = QLabel(label)
-            lab.setStyleSheet(f'color: {INK}; font-size: 14px;')
+            lab.setStyleSheet(f'color: {INK}; font-size: 19px;')
             row.addWidget(lab)
             minus = step_btn('minus_dark')
             plus = step_btn('plus_dark')
@@ -2041,7 +2088,7 @@ class PreviewDialog(QDialog):
         wpart = QHBoxLayout()
         wpart.setSpacing(4)
         wlab = QLabel('宽：')
-        wlab.setStyleSheet(f'color: {INK}; font-size: 14px;')
+        wlab.setStyleSheet(f'color: {INK}; font-size: 19px;')
         wpart.addWidget(wlab)
         self.w_minus = step_btn('minus_dark')
         self.w_plus = step_btn('plus_dark')
@@ -2052,7 +2099,7 @@ class PreviewDialog(QDialog):
         hpart = QHBoxLayout()
         hpart.setSpacing(4)
         hlab = QLabel('高：')
-        hlab.setStyleSheet(f'color: {INK}; font-size: 14px;')
+        hlab.setStyleSheet(f'color: {INK}; font-size: 19px;')
         hpart.addWidget(hlab)
         self.h_minus = step_btn('minus_dark')
         self.h_plus = step_btn('plus_dark')
@@ -2109,7 +2156,7 @@ class PreviewDialog(QDialog):
 
         # ---- 💡 提示：三行（exe 原文逐字，冒号为半角） ----
         hint = QLabel('💡 提示:\n开启自由排版后\n可通过拖拽移动选中图')
-        hint.setStyleSheet(f'color: {INK}; font-size: 14px;')
+        hint.setStyleSheet(f'color: {INK}; font-size: 19px;')
         v.addWidget(hint)
         v.addStretch(1)
 
@@ -2590,15 +2637,18 @@ class PreviewDialog(QDialog):
 
 def main():
     app = QApplication(sys.argv)
-    # 界面字体照 Merge 实测＝仿宋（MERGE-UI-MEASURE.md §2/§9：正文墨高
-    # 12px ≈ 14px 字号）。Qt 按族名链回退：目标机 Win7 系统自带仿宋，
-    # 本机开发用 Noto Serif CJK 顶替渲染。字号用像素口径与实测对齐。
+    # 界面字体照 Merge 实测＝仿宋（MERGE-UI-MEASURE.md §2/§9）。Qt 按
+    # 族名链回退：目标机 Win7 系统自带仿宋，本机开发用 Noto Serif CJK
+    # 顶替渲染。字号口径 2026-11-15 晚修正：Merge 是 Fyne 应用，其 14
+    # 是点（pt），96dpi 下 ≈18.7px em；此前按 14px 设导致同机同屏实测
+    # 文字墨高只有原版 2/3（视频帧实测 8 对 12），故全界面按 ×4/3 升
+    # 到 19px 档（样式表各档同步：14→19、15→20、13→17）。
     _fams = QFontDatabase().families()
     for fam in ('FangSong', '仿宋', 'STFangsong', 'Noto Serif CJK SC',
                 'SimSun', 'Microsoft YaHei'):
         if fam in _fams:
             _f = QFont(fam)
-            _f.setPixelSize(14)
+            _f.setPixelSize(19)
             app.setFont(_f)
             break
     app.setStyleSheet(GLOBAL_QSS)

@@ -90,7 +90,7 @@ class SettingsDialog(QDialog):
         hint = QLabel('打印出来的证件偏大就往小调、偏小就往大调；100% 为不调整。'
                       '只影响打印，不影响导出文件。')
         hint.setWordWrap(True)
-        hint.setStyleSheet('color: #5B6470; font-size: 12.5px;')
+        hint.setStyleSheet('color: #5B6470; font-size: 17px;')
         f3.addWidget(hint)
         lay.addWidget(g3)
 
