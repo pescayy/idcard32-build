@@ -432,19 +432,24 @@ def _refine_corners_np(img_rgb, corners, rng=None, stats=None):
     t_start = time.monotonic()
     deadline = t_start + _REFINE_TIME_BUDGET_S
     h, w = img_rgb.shape[:2]
-    chans = [img_rgb[:, :, c].astype(np.int32) for c in range(3)]
+    chans = [img_rgb[:, :, c] for c in range(3)]
     offs = np.arange(_REFINE_SCAN_LO,
                      _REFINE_SCAN_HI + 0.5 * _REFINE_SCAN_STEP,
                      _REFINE_SCAN_STEP)
 
     def sobel_resp(xs, ys):
-        """三通道完整 Sobel 幅值的最大值（原版响应函数）。"""
+        """三通道完整 Sobel 幅值的最大值（原版响应函数）。
+        只对采样点的 3x3 邻域取值现算（原版按点读像素）：旧写法先把
+        整图三通道转 int32 再采样，大图上转换本身就吃掉精修九成时间
+        （2.2MP 实测 0.133s/0.149s），结果与逐点算逐位一致。"""
         best = None
         for ch in chans:
-            gx = ((ch[ys - 1, xs + 1] + 2 * ch[ys, xs + 1] + ch[ys + 1, xs + 1])
-                  - (ch[ys - 1, xs - 1] + 2 * ch[ys, xs - 1] + ch[ys + 1, xs - 1]))
-            gy = ((ch[ys + 1, xs - 1] + 2 * ch[ys + 1, xs] + ch[ys + 1, xs + 1])
-                  - (ch[ys - 1, xs - 1] + 2 * ch[ys - 1, xs] + ch[ys - 1, xs + 1]))
+            def g(dy, dx):
+                return ch[ys + dy, xs + dx].astype(np.int32)
+            gx = ((g(-1, 1) + 2 * g(0, 1) + g(1, 1))
+                  - (g(-1, -1) + 2 * g(0, -1) + g(1, -1)))
+            gy = ((g(1, -1) + 2 * g(1, 0) + g(1, 1))
+                  - (g(-1, -1) + 2 * g(-1, 0) + g(-1, 1)))
             mag = np.sqrt(gx.astype(np.float64) ** 2
                           + gy.astype(np.float64) ** 2)
             best = mag if best is None else np.maximum(best, mag)

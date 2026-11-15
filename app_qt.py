@@ -6,7 +6,7 @@ generate button, centered status line. Small radii: buttons 4px, slots 5px.
 """
 import os, sys, json, threading, queue
 import numpy as np
-from PySide2.QtCore import Qt, Signal, QUrl, QRectF, QTimer, QSize, QEvent
+from PySide2.QtCore import Qt, Signal, QUrl, QRectF, QTimer, QSize, QEvent, QPoint
 from PySide2.QtGui import (QPixmap, QImage, QFont, QPainter, QColor, QPen,
                          QDesktopServices, QPainterPath, QGuiApplication,
                          QIcon, QFontDatabase)
@@ -262,6 +262,94 @@ class PairRow(QFrame):
                 f'QPushButton:hover {{ background: #E2E7EE; }}')
 
 
+class TitleBar(QWidget):
+    """自绘标题栏：图标在左、标题居中、窗口钮在右（照 Merge 的观感）。
+    原生标题栏在 Win10/Server 上文字强制靠左、做不到居中，故自绘；
+    Win7 原生虽居中，自绘后各系统表现一致。"""
+
+    HEIGHT = 34
+    BTN_W = 46
+
+    def __init__(self, window):
+        super().__init__(window)
+        self._win = window
+        self._drag_from = None
+        self.setFixedHeight(self.HEIGHT)
+        self.setStyleSheet('background: #FFFFFF;')
+        # 标题铺满整条居中（图标与按钮浮在其上、两侧留白对称，是真居中）
+        self._title = QLabel(window.windowTitle(), self)
+        self._title.setAlignment(Qt.AlignCenter)
+        self._title.setStyleSheet('color: #333333; font-size: 15px;')
+        self._title.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(9, 0, 0, 0)
+        lay.setSpacing(0)
+        self._icon = QLabel(self)
+        self._icon.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        _pm = QPixmap(os.path.join(ICONS_DIR, 'app-icon-master.png'))
+        if not _pm.isNull():
+            self._icon.setPixmap(_pm.scaled(18, 18, Qt.KeepAspectRatio,
+                                            Qt.SmoothTransformation))
+        self._icon.setFixedWidth(27)
+        lay.addWidget(self._icon)
+        lay.addStretch(1)
+        self._btn_min = self._mk_btn('─', '#E5E5E5', '#333333')
+        self._btn_max = self._mk_btn('▢', '#E5E5E5', '#333333')
+        self._btn_close = self._mk_btn('✕', '#E81123', '#FFFFFF')
+        self._btn_min.clicked.connect(window.showMinimized)
+        self._btn_max.clicked.connect(self._toggle_max)
+        self._btn_close.clicked.connect(window.close)
+        lay.addWidget(self._btn_min)
+        lay.addWidget(self._btn_max)
+        lay.addWidget(self._btn_close)
+        self._line = QFrame(self)
+        self._line.setStyleSheet('background: #E3E3E3;')
+        self._line.setFixedHeight(1)
+
+    def _mk_btn(self, text, hover_bg, hover_fg):
+        b = QPushButton(text, self)
+        b.setFixedSize(self.BTN_W, self.HEIGHT)
+        b.setStyleSheet(
+            'QPushButton { background: transparent; border: none;'
+            ' font-size: 13px; color: #333333; }'
+            f'QPushButton:hover {{ background: {hover_bg}; color: {hover_fg}; }}')
+        return b
+
+    def _toggle_max(self):
+        if self._win.isMaximized():
+            self._win.showNormal()
+        else:
+            self._win.showMaximized()
+        self.refresh()
+
+    def refresh(self):
+        self._btn_max.setText('❐' if self._win.isMaximized() else '▢')
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._title.setGeometry(0, 0, self.width(), self.HEIGHT)
+        self._line.setGeometry(0, self.HEIGHT - 1, self.width(), 1)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton and not self._win.isMaximized():
+            self._drag_from = ev.globalPos() - self._win.frameGeometry().topLeft()
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if self._drag_from is not None and ev.buttons() & Qt.LeftButton:
+            self._win.move(ev.globalPos() - self._drag_from)
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        self._drag_from = None
+        super().mouseReleaseEvent(ev)
+
+    def mouseDoubleClickEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            self._toggle_max()
+        super().mouseDoubleClickEvent(ev)
+
+
 class MainWindow(QMainWindow):
     ocr_done = Signal(int, str, object, str, object, object, object)
     ocr_probe_done = Signal(bool)
@@ -271,6 +359,14 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('IDCardMuse 智能证件合并工具v1.0 by xm 2026-11')
+        # 图标＋自绘标题栏（标题居中，照 Merge）：原生标题栏在
+        # Win10/Server 上文字靠左、做不到居中，故去边框自绘。
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
+        _ico = os.path.join(ICONS_DIR, 'app.ico')
+        if os.path.exists(_ico):
+            self.setWindowIcon(QIcon(_ico))
+        self._titlebar = TitleBar(self)
+        self.setMenuWidget(self._titlebar)
         # 客户区照 Merge 实测 1000×650（MERGE-UI-MEASURE.md §1/§11）
         self.resize(1000, 650)
         self.setMinimumSize(900, 620)
@@ -322,6 +418,50 @@ class MainWindow(QMainWindow):
         self._closing = False
 
     # ---------- OCR (full-edition merge; logic in ocr_qt.py) ----------
+    def changeEvent(self, ev):
+        super().changeEvent(ev)
+        if ev.type() == QEvent.WindowStateChange and hasattr(self, '_titlebar'):
+            self._titlebar.refresh()
+
+    def nativeEvent(self, eventType, message):
+        # 无边框窗口在 Windows 下靠 WM_NCHITTEST 找回边缘拉伸
+        if sys.platform == 'win32' and eventType == 'windows_generic_MSG' \
+                and not self.isMaximized():
+            try:
+                import ctypes
+                from ctypes import wintypes
+                msg = wintypes.MSG.from_address(int(message))
+                if msg.message == 0x0084:  # WM_NCHITTEST
+                    x = ctypes.c_short(msg.lParam & 0xFFFF).value
+                    y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
+                    p = self.mapFromGlobal(QPoint(x, y))
+                    b = 6
+                    w, h = self.width(), self.height()
+                    left, right = p.x() <= b, p.x() >= w - b - 1
+                    top, bottom = p.y() <= b, p.y() >= h - b - 1
+                    code = None
+                    if top and left:
+                        code = 13
+                    elif top and right:
+                        code = 14
+                    elif bottom and left:
+                        code = 16
+                    elif bottom and right:
+                        code = 17
+                    elif left:
+                        code = 10
+                    elif right:
+                        code = 11
+                    elif top:
+                        code = 12
+                    elif bottom:
+                        code = 15
+                    if code is not None:
+                        return True, code
+            except Exception:
+                pass
+        return super().nativeEvent(eventType, message)
+
     def _probe_ocr(self):
         self.ocr_probe_done.emit(ocr_qt.ocr_available())
 
@@ -2637,6 +2777,9 @@ class PreviewDialog(QDialog):
 
 def main():
     app = QApplication(sys.argv)
+    _app_ico = os.path.join(ICONS_DIR, 'app.ico')
+    if os.path.exists(_app_ico):
+        app.setWindowIcon(QIcon(_app_ico))
     # 界面字体照 Merge 实测＝仿宋（MERGE-UI-MEASURE.md §2/§9）。Qt 按
     # 族名链回退：目标机 Win7 系统自带仿宋，本机开发用 Noto Serif CJK
     # 顶替渲染。字号口径 2026-11-15 晚修正：Merge 是 Fyne 应用，其 14
