@@ -64,6 +64,60 @@ _BASE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL = os.path.join(_BASE, "models", "carddetection_scrfd34gkps.onnx")
 
 
+def warp_manual(bgr, corners, midpoints=None, out_size=OUT_A4):
+    """手动调整拉平（调整四角窗回传）：corners 为原图四角
+    （TL,TR,BR,BL）；midpoints 为四边弧上中点（边 i＝
+    corners[i]→corners[(i+1)%4]），任一中点偏离直线中点
+    >6px 视为有弧，走 Coons 弧面网格 remap 把卷曲捋平；
+    否则普通透视，与旧手动路径同结果。"""
+    W, H = out_size
+    P = [tuple(map(float, p)) for p in corners]
+    bow = 0.0
+    if midpoints is not None and len(midpoints) == 4:
+        M = [tuple(map(float, p)) for p in midpoints]
+        for i in range(4):
+            cx = (P[i][0] + P[(i + 1) % 4][0]) / 2.0
+            cy = (P[i][1] + P[(i + 1) % 4][1]) / 2.0
+            bow = max(bow, ((M[i][0] - cx) ** 2
+                            + (M[i][1] - cy) ** 2) ** 0.5)
+    if midpoints is None or bow <= 6.0:
+        dst = np.array([[0, 0], [W - 1, 0], [W - 1, H - 1], [0, H - 1]],
+                       np.float32)
+        Mx = cv2.getPerspectiveTransform(np.asarray(P, np.float32), dst)
+        return cv2.warpPerspective(bgr, Mx, (W, H))
+    C = [(2 * M[i][0] - (P[i][0] + P[(i + 1) % 4][0]) / 2.0,
+          2 * M[i][1] - (P[i][1] + P[(i + 1) % 4][1]) / 2.0)
+         for i in range(4)]
+
+    def bez(p0, c, p1, t):
+        u = 1.0 - t
+        return (u * u * p0[0] + 2 * u * t * c[0] + t * t * p1[0],
+                u * u * p0[1] + 2 * u * t * c[1] + t * t * p1[1])
+
+    us = np.linspace(0.0, 1.0, W, dtype=np.float64)
+    vs = np.linspace(0.0, 1.0, H, dtype=np.float64)
+
+    def edge_pts(p0, c, p1, ts):
+        return np.stack(bez(p0, c, p1, ts), axis=-1)
+
+    top = edge_pts(P[0], C[0], P[1], us)          # (W,2) v=0
+    bot = edge_pts(P[3], C[2], P[2], us)          # (W,2) v=1
+    lft = edge_pts(P[0], C[3], P[3], vs)          # (H,2) u=0
+    rgt = edge_pts(P[1], C[1], P[2], vs)          # (H,2) u=1
+    U, V = np.meshgrid(us, vs)                    # (H,W)
+    sx = ((1 - V) * top[None, :, 0] + V * bot[None, :, 0]
+          + (1 - U) * lft[:, None, 0] + U * rgt[:, None, 0]
+          - ((1 - U) * (1 - V) * P[0][0] + U * (1 - V) * P[1][0]
+             + (1 - U) * V * P[3][0] + U * V * P[2][0]))
+    sy = ((1 - V) * top[None, :, 1] + V * bot[None, :, 1]
+          + (1 - U) * lft[:, None, 1] + U * rgt[:, None, 1]
+          - ((1 - U) * (1 - V) * P[0][1] + U * (1 - V) * P[1][1]
+             + (1 - U) * V * P[3][1] + U * V * P[2][1]))
+    return cv2.remap(bgr, sx.astype(np.float32), sy.astype(np.float32),
+                     cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                     borderValue=(255, 255, 255))
+
+
 def order_quad(pts):
     p = np.asarray(pts, np.float64)
     s = p.sum(1)

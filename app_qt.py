@@ -1454,6 +1454,9 @@ class MainWindow(QMainWindow):
         self.last_dir = os.path.dirname(path)
         self._save_settings()
         bgr = np.ascontiguousarray(rgb[:, :, ::-1])
+        self._lic_src_bgr = bgr
+        self._lic_quad = None
+        self._lic_mids = None
         stem = os.path.splitext(os.path.basename(path))[0].strip() or '执照'
         self.set_status('正在处理营业执照，请稍候…')
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -1495,13 +1498,40 @@ class MainWindow(QMainWindow):
         warped = res['warped']      # BGR ndarray，OUT_A4 = 2339×1654
         pil = Image.fromarray(np.ascontiguousarray(warped[:, :, ::-1]))
         stem = res.get('_stem', '执照')
+        q = res.get('paper_quad')
+        self._lic_quad = ([tuple(map(float, p)) for p in q]
+                          if q is not None else None)
+        self._lic_mids = None
         self.set_status('营业执照处理完成')
         dlg = PreviewDialog(self, [[(pil, 0.0, 0.0)]],
                             page_px=pil.size, page_mm=(297.0, 210.0),
                             base_name=stem,
                             crop_items=[[(f'{stem}_Crop_P1_1.jpg', pil)]],
-                            images_mode=True)
+                            images_mode=True,
+                            mark_cb=self._lic_mark_adjust)
         dlg.exec_()
+
+    def _lic_mark_adjust(self, parent):
+        """执照预览窗「调整四角」回调：在原图上拖四角＋边中点拉弧，
+        确认后按新框重拉平、回传新页图；取消回 None。"""
+        src = getattr(self, '_lic_src_bgr', None)
+        if src is None:
+            return None
+        from mark_dialog import LicenseMarkDialog
+        from lic_pipeline import warp_manual, OUT_A4
+        pil_src = Image.fromarray(np.ascontiguousarray(src[:, :, ::-1]))
+        dlg = LicenseMarkDialog(
+            parent, pil_src,
+            seed_points=getattr(self, '_lic_quad', None),
+            seed_midpoints=getattr(self, '_lic_mids', None))
+        if dlg.exec_() != QDialog.Accepted or not dlg.result_points:
+            return None
+        self._lic_quad = [tuple(p) for p in dlg.result_points]
+        self._lic_mids = ([tuple(p) for p in dlg.result_midpoints]
+                          if dlg.result_midpoints else None)
+        warped = warp_manual(src, self._lic_quad, self._lic_mids,
+                             out_size=OUT_A4)
+        return Image.fromarray(np.ascontiguousarray(warped[:, :, ::-1]))
 
     def open_settings_dialog(self):
         from settings_dialog import SettingsDialog
@@ -1962,10 +1992,14 @@ class PreviewDialog(QDialog):
     增强、💡 提示：三行原文。锁定后被拖的卡留在新位置。"""
 
     def __init__(self, win, layout, page_px=None, page_mm=None,
-                 base_name=None, crop_items=None, images_mode=False):
+                 base_name=None, crop_items=None, images_mode=False,
+                 mark_cb=None):
         super().__init__(win)
         self.win = win
         self.core = win.core
+        # 执照页专用：调整四角回调（主窗提供，点开标角窗拖角/拉弧，
+        # 回传新页图后本窗换图）；身份证页为 None、无此钮。
+        self.mark_cb = mark_cb
         # 布局副本：拖动与面板操作都改这份，即本窗的工作状态；
         # 身份证模式关窗时由 MainWindow 按图身份签名留存、再次生成
         # 原样带回（按 Merge：手动排版不丢）。
@@ -2045,6 +2079,12 @@ class PreviewDialog(QDialog):
         crop_b.clicked.connect(self.export_crops)
         top.addWidget(crop_b)
         self.top_buttons['导出裁剪'] = crop_b
+        if mark_cb is not None:
+            mark_b = QPushButton('调整四角')
+            mark_b.setStyleSheet(color_qss(BLUE, BLUE_HOVER))
+            mark_b.clicked.connect(self._on_mark_adjust)
+            top.addWidget(mark_b)
+            self.top_buttons['调整四角'] = mark_b
         for text, fn, qss, icn in (
                 ('导出为 JPG', self.export_jpg,
                  color_qss(BLUE, BLUE_HOVER), 'image_white'),
@@ -2091,6 +2131,25 @@ class PreviewDialog(QDialog):
         self.panel = self._build_free_panel()
         body.addWidget(self.panel)
         self.view.sel_changed.connect(self._sync_panel_from_sel)
+
+    def _on_mark_adjust(self):
+        """执照页「调整四角」：回调在原图上拖角/拉弧，回传新页图
+        后替换本页图与裁剪导出底图，画布按新图 id 自然刷新。"""
+        if self.mark_cb is None:
+            return
+        new_pil = self.mark_cb(self)
+        if new_pil is None:
+            return
+        if self.layout and self.layout[0]:
+            self.layout[0][0][0] = new_pil
+        if self.crop_items_override:
+            try:
+                _name = self.crop_items_override[0][0][0]
+            except Exception:
+                _name = None
+            if _name:
+                self.crop_items_override = [[(_name, new_pil)]]
+        self.view.update()
 
     def toggle_free(self):
         """自由排版开关（原版 func27＋补取专节）：文案双态、恒橙；

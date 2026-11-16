@@ -45,6 +45,11 @@ class MarkCanvas(QWidget):
         self.img = pil_img
         self.qimg = pil_to_qimage(pil_img)
         self.points = []          # image coords [(x, y), ...] up to 4
+        # 弧线模式（可选，执照调整四角用）：midpoints[i] 是边 i
+        # （points[i]→points[(i+1)%4]）弧上的中点，位于曲线上；
+        # None＝关（身份证标角窗行为不变）。
+        self.midpoints = None
+        self._drag_mid = None
         self.scale = 1.0
         self.off = QPointF(0, 0)  # view coords of image top-left
         self._drag_idx = None
@@ -90,6 +95,29 @@ class MarkCanvas(QWidget):
         return ((v.x() - self.off.x()) / self.scale,
                 (v.y() - self.off.y()) / self.scale)
 
+    @staticmethod
+    def _bez(p0, pc, p1, t):
+        u = 1.0 - t
+        return (u * u * p0[0] + 2 * u * t * pc[0] + t * t * p1[0],
+                u * u * p0[1] + 2 * u * t * pc[1] + t * t * p1[1])
+
+    def edge_control(self, i):
+        """边 i 的二次贝塞尔控制点：由弧上中点 M 反解
+        （B(0.5)＝0.25P0＋0.5C＋0.25P1＝M → C＝2M－(P0＋P1)/2）。"""
+        p0 = self.points[i]
+        p1 = self.points[(i + 1) % 4]
+        m = self.midpoints[i]
+        return (2 * m[0] - (p0[0] + p1[0]) / 2.0,
+                2 * m[1] - (p0[1] + p1[1]) / 2.0)
+
+    def seed_midpoints(self):
+        """中点复位到各边直线中点（无弧）。"""
+        if len(self.points) == 4:
+            self.midpoints = [
+                ((self.points[i][0] + self.points[(i + 1) % 4][0]) / 2.0,
+                 (self.points[i][1] + self.points[(i + 1) % 4][1]) / 2.0)
+                for i in range(4)]
+
     # ----- painting -----
     def paintEvent(self, event):
         from PySide2.QtGui import QPainterPath
@@ -109,13 +137,30 @@ class MarkCanvas(QWidget):
             vs = [self.to_view(p) for p in self.points]
             n = len(vs)
             edges = n if n == 4 else n - 1
+            arc = self.midpoints is not None and n == 4
             for i in range(edges):
-                qp.drawLine(vs[i], vs[(i + 1) % n])
+                if arc:
+                    c = self.edge_control(i)
+                    prev = vs[i]
+                    for k in range(1, 17):
+                        bp = self._bez(self.points[i], c,
+                                       self.points[(i + 1) % 4], k / 16.0)
+                        cur = self.to_view(bp)
+                        qp.drawLine(prev, cur)
+                        prev = cur
+                else:
+                    qp.drawLine(vs[i], vs[(i + 1) % n])
         for p in self.points:
             v = self.to_view(p)
             qp.setPen(QPen(QColor('white'), 2))
             qp.setBrush(QBrush(GREEN))
             qp.drawEllipse(v, HANDLE_R, HANDLE_R)
+        if self.midpoints is not None and len(self.points) == 4:
+            for m in self.midpoints:
+                v = self.to_view(m)
+                qp.setPen(QPen(QColor('white'), 2))
+                qp.setBrush(QBrush(QColor('#F5A623')))
+                qp.drawEllipse(v, 8, 8)
         qp.end()
 
     # ----- interaction -----
@@ -126,12 +171,25 @@ class MarkCanvas(QWidget):
                 return i
         return None
 
+    def _hit_mid(self, pos):
+        if self.midpoints is None or len(self.points) != 4:
+            return None
+        for i, m in enumerate(self.midpoints):
+            v = self.to_view(m)
+            if (v.x() - pos.x()) ** 2 + (v.y() - pos.y()) ** 2 <= 15 ** 2:
+                return i
+        return None
+
     def mousePressEvent(self, event):
         if event.button() != Qt.LeftButton:
             return
         idx = self._hit_handle(event.pos())
         if idx is not None:
             self._drag_idx = idx
+            return
+        mid = self._hit_mid(event.pos())
+        if mid is not None:
+            self._drag_mid = mid
             return
         self._user_view = True
         self._pan_start = event.pos()
@@ -142,7 +200,21 @@ class MarkCanvas(QWidget):
             x, y = self.to_image(event.pos())
             x = min(max(x, 0), self.img.width - 1)
             y = min(max(y, 0), self.img.height - 1)
+            old_p = self.points[self._drag_idx]
             self.points[self._drag_idx] = (x, y)
+            if self.midpoints is not None and len(self.points) == 4:
+                # 角移动时相邻两边的中点跟随平移，弧形不被拖散
+                dx, dy = x - old_p[0], y - old_p[1]
+                for ei in (self._drag_idx, (self._drag_idx - 1) % 4):
+                    mx, my = self.midpoints[ei]
+                    self.midpoints[ei] = (mx + dx, my + dy)
+            self.changed.emit()
+            self.update()
+        elif self._drag_mid is not None:
+            x, y = self.to_image(event.pos())
+            x = min(max(x, 0), self.img.width - 1)
+            y = min(max(y, 0), self.img.height - 1)
+            self.midpoints[self._drag_mid] = (x, y)
             self.changed.emit()
             self.update()
         elif self._pan_start is not None:
@@ -151,6 +223,7 @@ class MarkCanvas(QWidget):
 
     def mouseReleaseEvent(self, event):
         self._drag_idx = None
+        self._drag_mid = None
         self._pan_start = None
 
     def wheelEvent(self, event):
@@ -307,4 +380,64 @@ class MarkDialog(QDialog):
         (row.front if self.side == 'front' else row.back).set_processed(processed)
         name = '正面' if self.side == 'front' else '反面'
         self.win.set_status(f'第 {self.idx + 1} 组{name}微调完成')
+        self.accept()
+
+
+class LicenseMarkDialog(QDialog):
+    """执照调整四角：拖动四角到纸面边缘，确认后回传四角（原图坐标）。"""
+
+    def __init__(self, parent, pil_img, seed_points=None,
+                 seed_midpoints=None):
+        super().__init__(parent)
+        self.result_points = None
+        self.result_midpoints = None
+        self.setWindowTitle('调整四角（拖四角对纸边，边中点可拉弧）')
+        # 标准窗口钮（同 PreviewDialog 2026-11-15 修法）：QDialog 默认
+        # 带上下文帮助「？」钮且无最小化/最大化——改成普通顶层窗口
+        # 标志：最小化/最大化/关闭齐全、无问号钮，可最大化后拖角。
+        self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint
+                            | Qt.WindowMaximizeButtonHint
+                            | Qt.WindowCloseButtonHint)
+        iw, ih = pil_img.width, pil_img.height
+        cw = 980
+        ch = int(cw * ih / iw)
+        if ch > 700:
+            ch = 700
+            cw = int(ch * iw / ih)
+        if ch < 380:
+            ch = 380
+        self.resize(cw + 20, ch + 66)
+        self.setStyleSheet('background: white;')
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+        self.canvas = MarkCanvas(pil_img)
+        lay.addWidget(self.canvas, 1)
+        if seed_points and len(seed_points) == 4:
+            self.canvas.points = [tuple(map(float, p)) for p in seed_points]
+        else:
+            w, h = iw, ih
+            self.canvas.points = [(0.12 * w, 0.12 * h), (0.88 * w, 0.12 * h),
+                                  (0.88 * w, 0.88 * h), (0.12 * w, 0.88 * h)]
+        if seed_midpoints and len(seed_midpoints) == 4:
+            self.canvas.midpoints = [tuple(map(float, p))
+                                     for p in seed_midpoints]
+        else:
+            self.canvas.seed_midpoints()
+        confirm_b = QPushButton('✓ 确认标角')
+        confirm_b.setFixedHeight(42)
+        confirm_b.setStyleSheet(
+            f'QPushButton {{ background: {BLUE}; color: white; border: none;'
+            ' border-radius: 4px; font-size: 20px; font-weight: bold; }')
+        confirm_b.clicked.connect(self._confirm)
+        lay.addWidget(confirm_b)
+        self.canvas.fit()
+
+    def _confirm(self):
+        if len(self.canvas.points) != 4:
+            return
+        self.result_points = [tuple(p) for p in self.canvas.points]
+        if self.canvas.midpoints is not None:
+            self.result_midpoints = [tuple(p)
+                                     for p in self.canvas.midpoints]
         self.accept()
