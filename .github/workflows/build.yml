@@ -73,11 +73,25 @@ jobs:
           if (Test-Path dist/IDCardMuse/tk) { throw "SLIM GATE FAIL: tk directory present" }
           if (Test-Path dist/IDCardMuse/tcl8) { throw "SLIM GATE FAIL: tcl8 directory present" }
           if ($files.Count -gt 1000) { throw "SLIM GATE FAIL: file count $($files.Count) over 1000" }
-      - name: Upload artifact
+      - name: Write installer script
+        run: python -c "import base64; open('installer-build.iss','wb').write(base64.b64decode('OyBJRENhcmRNdXNlIGluc3RhbGxlciBzY3JpcHQgKElubm8gU2V0dXAgNikKOyBDb21waWxlZCBieSB0aGUgR2l0SHViIEFjdGlvbnMgd29ya2Zsb3cgd2l0aCBkZWZpbmVzOgo7ICAgL0RTb3VyY2VEaXI9PGFicyBwYXRoIHRvIFB5SW5zdGFsbGVyIG9uZWRpciBvdXRwdXQ+CjsgICAvRE91dERpcj08YWJzIHBhdGggZm9yIHRoZSBzZXR1cCBleGU+CjsgICAvRE91dEJhc2U9PHNldHVwIGV4ZSBiYXNlIG5hbWUsIGUuZy4gSURDYXJkTXVzZS0xMTE4LVNldHVwMzI+CjsgICAvREFwcFZlcj08dmVyc2lvbiBsYWJlbCwgZS5nLiAxMTE4Pgo7ICAgL0RBcmNoNjQ9MSAob25seSBmb3IgdGhlIDY0LWJpdCBwYWNrYWdlKQoKI2lmbmRlZiBTb3VyY2VEaXIKICAjZGVmaW5lIFNvdXJjZURpciAiZGlzdFxJRENhcmRNdXNlIgojZW5kaWYKI2lmbmRlZiBPdXREaXIKICAjZGVmaW5lIE91dERpciAiaW5zdGFsbGVyLW91dCIKI2VuZGlmCiNpZm5kZWYgT3V0QmFzZQogICNkZWZpbmUgT3V0QmFzZSAiSURDYXJkTXVzZS1TZXR1cCIKI2VuZGlmCiNpZm5kZWYgQXBwVmVyCiAgI2RlZmluZSBBcHBWZXIgIjExMTgiCiNlbmRpZgoKW1NldHVwXQpBcHBJZD17e0I3RTJDNEExLTlEM0YtNEU1OC1BNkMxLTJGNUQ4RTRCNzA5M319CkFwcE5hbWU9SURDYXJkTXVzZQpBcHBWZXJzaW9uPXsjQXBwVmVyfQpBcHBQdWJsaXNoZXI9SURDYXJkTXVzZQpEZWZhdWx0RGlyTmFtZT17bG9jYWxhcHBkYXRhfVxQcm9ncmFtc1xJRENhcmRNdXNlCkRlZmF1bHRHcm91cE5hbWU9SURDYXJkTXVzZQpEaXNhYmxlUHJvZ3JhbUdyb3VwUGFnZT15ZXMKUHJpdmlsZWdlc1JlcXVpcmVkPWxvd2VzdApPdXRwdXREaXI9eyNPdXREaXJ9Ck91dHB1dEJhc2VGaWxlbmFtZT17I091dEJhc2V9CkNvbXByZXNzaW9uPWx6bWEyL21heApTb2xpZENvbXByZXNzaW9uPXllcwpXaXphcmRTdHlsZT1tb2Rlcm4KVW5pbnN0YWxsRGlzcGxheUljb249e2FwcH1cSURDYXJkTXVzZS5leGUKQ2xvc2VBcHBsaWNhdGlvbnM9eWVzCiNpZmRlZiBBcmNoNjQKQXJjaGl0ZWN0dXJlc0FsbG93ZWQ9eDY0Y29tcGF0aWJsZQojZW5kaWYKI2lmIEZpbGVFeGlzdHMoImljb25zXGFwcC5pY28iKQpTZXR1cEljb25GaWxlPWljb25zXGFwcC5pY28KI2VsaWYgRmlsZUV4aXN0cygiLi5caWNvbnNcYXBwLmljbyIpClNldHVwSWNvbkZpbGU9Li5caWNvbnNcYXBwLmljbwojZW5kaWYKCltGaWxlc10KU291cmNlOiAieyNTb3VyY2VEaXJ9XCoiOyBEZXN0RGlyOiAie2FwcH0iOyBGbGFnczogaWdub3JldmVyc2lvbiByZWN1cnNlc3ViZGlycyBjcmVhdGVhbGxzdWJkaXJzCgpbSWNvbnNdCk5hbWU6ICJ7YXV0b3Byb2dyYW1zfVxJRENhcmRNdXNlIjsgRmlsZW5hbWU6ICJ7YXBwfVxJRENhcmRNdXNlLmV4ZSIKTmFtZTogInthdXRvZGVza3RvcH1cSURDYXJkTXVzZSI7IEZpbGVuYW1lOiAie2FwcH1cSURDYXJkTXVzZS5leGUiCgpbUnVuXQpGaWxlbmFtZTogInthcHB9XElEQ2FyZE11c2UuZXhlIjsgRGVzY3JpcHRpb246ICJMYXVuY2ggSURDYXJkTXVzZSI7IEZsYWdzOiBub3dhaXQgcG9zdGluc3RhbGwgc2tpcGlmc2lsZW50CgpbTGFuZ3VhZ2VzXQpOYW1lOiAiY24iOyBNZXNzYWdlc0ZpbGU6ICJjb21waWxlcjpMYW5ndWFnZXNcQ2hpbmVzZVNpbXBsaWZpZWQuaXNsIgo='))"
+      - name: Build installer (Inno Setup)
+        run: |
+          $iscc = @("C:\Program Files (x86)\Inno Setup 6\ISCC.exe", "C:\Program Files\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue; if ($cmd) { $iscc = $cmd.Source } }
+          if (-not $iscc) { choco install innosetup -y --no-progress; $iscc = @("C:\Program Files (x86)\Inno Setup 6\ISCC.exe", "C:\Program Files\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1 }
+          if (-not $iscc) { throw "Inno Setup compiler (ISCC.exe) not found" }
+          Write-Host "ISCC: $iscc"
+          $isl = Join-Path (Split-Path $iscc) "Languages\ChineseSimplified.isl"
+          if (-not (Test-Path $isl)) { (Get-Content installer-build.iss -Raw) -replace "(?s)\[Languages\].*", "" | Set-Content installer-build.iss -Encoding UTF8; Write-Host "ChineseSimplified.isl missing; installer will use default language" }
+          & $iscc /DSourceDir="$PWD\dist\IDCardMuse" /DOutDir="$PWD\installer-out" /DOutBase="IDCardMuse-1118-Setup32" /DAppVer="1118" installer-build.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          Get-ChildItem installer-out | Select-Object Name,Length | Format-Table -AutoSize
+      - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: IDCardMuse-win7-qt
-          path: dist/IDCardMuse
+          name: IDCardMuse-win7-qt-setup
+          path: installer-out/*.exe
 
 
   build-qt64:
