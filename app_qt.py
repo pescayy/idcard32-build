@@ -287,10 +287,29 @@ class PairRow(QFrame):
                 f'QPushButton:hover {{ background: #E2E7EE; }}')
 
 
+def _win_btn_icon(kind):
+    """标题栏最大化/还原钮图标：用画笔画，不用字体字符——'▢/❐' 在
+    Server 2022 上缺字形、渲染成一个小点（2026-11-16 ying 截图实证）。"""
+    pm = QPixmap(28, 28)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setPen(QPen(QColor('#333333'), 2))
+    if kind == 'restore':
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(11, 5, 12, 12)
+        p.setBrush(QColor('#FFFFFF'))
+        p.drawRect(5, 11, 12, 12)
+    else:
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(6, 6, 16, 16)
+    p.end()
+    return QIcon(pm)
+
+
 class TitleBar(QWidget):
-    """自绘标题栏：图标在左、标题居中、窗口钮在右（照 Merge 的观感）。
-    原生标题栏在 Win10/Server 上文字强制靠左、做不到居中，故自绘；
-    Win7 原生虽居中，自绘后各系统表现一致。"""
+    """自绘标题栏：图标在左、标题居中、窗口钮在右。
+    注：meger 最大化时标题其实靠左（原生标题栏），居中不是照它——
+    2026-11-16 ying 拍板：不用改，在中间就中间，居中保留为定案。"""
 
     HEIGHT = 34
     BTN_W = 46
@@ -322,7 +341,9 @@ class TitleBar(QWidget):
         lay.addWidget(self._icon)
         lay.addStretch(1)
         self._btn_min = self._mk_btn('─', '#E5E5E5', '#333333')
-        self._btn_max = self._mk_btn('▢', '#E5E5E5', '#333333')
+        self._btn_max = self._mk_btn('', '#E5E5E5', '#333333')
+        self._btn_max.setIcon(_win_btn_icon('max'))
+        self._btn_max.setIconSize(QSize(14, 14))
         self._btn_close = self._mk_btn('✕', '#E81123', '#FFFFFF')
         self._btn_min.clicked.connect(window.showMinimized)
         self._btn_max.clicked.connect(self._toggle_max)
@@ -351,7 +372,7 @@ class TitleBar(QWidget):
         self.refresh()
 
     def refresh(self):
-        self._btn_max.setText('❐' if self._win.isMaximized() else '▢')
+        self._btn_max.setIcon(_win_btn_icon('restore' if self._win.isMaximized() else 'max'))
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
@@ -387,8 +408,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('IDCardMuse 智能证件合并工具v1.0 by xm 2026-11')
-        # 图标＋自绘标题栏（标题居中，照 Merge）：原生标题栏在
-        # Win10/Server 上文字靠左、做不到居中，故去边框自绘。
+        # 图标＋自绘标题栏（标题居中，ying 2026-11-16 拍板保留；
+        # meger 实为靠左，居中是自家定案，不是照它）。
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         _qi = _app_qicon()
         if not _qi.isNull():
@@ -421,6 +442,12 @@ class MainWindow(QMainWindow):
         self.add_pair()
         self._restore_settings_ui()
         self.setAcceptDrops(True)
+        # 拖放双保险（2026-11-16 ying 云电脑实测：从文件夹拖图进主窗是
+        # 🚫、meger 却随便放都行）：主窗虽开了接收，拖放事件要穿过滚动
+        # 区层层子控件才到主窗，中途被吞。故滚动区视口也开接收、事件
+        # 转主窗处理，落点在滚动区内任何位置都算数（照 meger 整窗可放）。
+        self.scroll.viewport().setAcceptDrops(True)
+        self.scroll.viewport().installEventFilter(self)
         # OCR（全能版并入）：后台线程回主线程走信号，不直接碰控件
         self.ocr_done.connect(self._on_ocr_done)
         self.ocr_probe_done.connect(self._on_ocr_probe)
@@ -1241,6 +1268,18 @@ class MainWindow(QMainWindow):
         return stats
 
     # ---------- drag & drop ----------
+    def eventFilter(self, obj, event):
+        # 滚动区视口的拖放转主窗处理（见 __init__ 拖放双保险注）
+        if obj is self.scroll.viewport():
+            if event.type() in (QEvent.DragEnter, QEvent.DragMove):
+                if event.mimeData().hasUrls():
+                    event.acceptProposedAction()
+                    return True
+            elif event.type() == QEvent.Drop:
+                self.dropEvent(event)
+                return True
+        return super().eventFilter(obj, event)
+
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()

@@ -179,6 +179,12 @@ class MarkDialog(QDialog):
         self.img = data['image']
         self.result_points = None
         self.setWindowTitle('手动微调边缘（拖拽四角）')
+        # 标准窗口钮（同 PreviewDialog 2026-11-15 修法）：QDialog 默认
+        # 带上下文帮助「？」钮且无最小化/最大化——改成普通顶层窗口
+        # 标志：最小化/最大化/关闭齐全、无问号钮，可最大化后拖角。
+        self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint
+                            | Qt.WindowMaximizeButtonHint
+                            | Qt.WindowCloseButtonHint)
         # size the window to the photo's aspect, like the original
         iw, ih = self.img.width, self.img.height
         cw = 980

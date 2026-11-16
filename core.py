@@ -4,6 +4,10 @@
 import os, sys, glob, gc, io, json, math, base64, tempfile, time, shutil, threading
 import numpy as np
 import cv2
+from thread_budget import BUDGET as _THREAD_BUDGET, \
+    INFERENCE_LOCK as _INFERENCE_LOCK, apply_cv2_budget as _apply_cv2_budget
+
+_apply_cv2_budget()
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter, ImageOps
 try:
     import img2pdf
@@ -63,7 +67,7 @@ class CardDetectorAI:
             # recognition wait (2026-11-12). Detection behavior is
             # unchanged; only the thread budget is capped.
             _opts = _ort.SessionOptions()
-            _opts.intra_op_num_threads = max(1, (os.cpu_count() or 2) - 1)
+            _opts.intra_op_num_threads = _THREAD_BUDGET
             _opts.inter_op_num_threads = 1
             self._sess = _ort.InferenceSession(onnxmodel, sess_options=_opts,
                                               providers=['CPUExecutionProvider'])
@@ -134,11 +138,16 @@ class CardDetectorAI:
         img, newh, neww, padh, padw = self.resize_image(srcimg)
         blob = cv2.dnn.blobFromImage(img, 1.0 / 128, (self.inpWidth, self.inpHeight),
                                      (127.5, 127.5, 127.5), swapRB=True)
-        if self._sess is not None:
-            raw = self._sess.run(None, {self._iname: blob})
-        else:
-            self._cv_net.setInput(blob)
-            raw = self._cv_net.forward(self._cv_net.getUnconnectedOutLayersNames())
+        # Global inference queue (thread_budget): a detection run never
+        # overlaps an OCR run or another detection, so the per-session
+        # thread budget is the process-wide budget, not a multiplier.
+        with _INFERENCE_LOCK:
+            if self._sess is not None:
+                raw = self._sess.run(None, {self._iname: blob})
+            else:
+                self._cv_net.setInput(blob)
+                raw = self._cv_net.forward(
+                    self._cv_net.getUnconnectedOutLayersNames())
         # Both runtimes return the same 9 SCRFD heads, but NOT in the
         # same order: ORT hands them back interleaved per FPN level,
         # OpenCV DNN grouped by type (all scores, then all bboxes,

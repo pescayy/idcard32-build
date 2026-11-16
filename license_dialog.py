@@ -65,6 +65,12 @@ class LicenseMarkDialog(QDialog):
         super().__init__(parent)
         self.result_points = None
         self.setWindowTitle('手动标角（拖动四角到纸面边缘）')
+        # 标准窗口钮（同 PreviewDialog 2026-11-15 修法）：QDialog 默认
+        # 带上下文帮助「？」钮且无最小化/最大化——改成普通顶层窗口
+        # 标志：最小化/最大化/关闭齐全、无问号钮，可最大化后拖角。
+        self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint
+                            | Qt.WindowMaximizeButtonHint
+                            | Qt.WindowCloseButtonHint)
         iw, ih = pil_img.width, pil_img.height
         cw = 980
         ch = int(cw * ih / iw)

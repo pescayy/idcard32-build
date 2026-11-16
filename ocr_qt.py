@@ -21,6 +21,9 @@ import traceback
 
 from PIL import Image
 
+from thread_budget import BUDGET as _THREAD_BUDGET, \
+    INFERENCE_LOCK as _INFERENCE_LOCK
+
 _OCR_ENGINE = None
 _OCR_LOCK = _threading.Lock()
 _OCR_IMPORT_OK = None  # None=未探 / True / False（只探 import，不构造引擎）
@@ -63,7 +66,13 @@ def _get_ocr_engine():
                 except Exception:
                     pass
                 from rapidocr_onnxruntime import RapidOCR
-                _OCR_ENGINE = RapidOCR()
+                # Global thread budget (thread_budget): RapidOCR's
+                # three sessions each defaulted to all cores; the
+                # global kwargs land in its Global config and are
+                # propagated to Det/Cls/Rec (1.4.4 update mechanism).
+                _OCR_ENGINE = RapidOCR(
+                    intra_op_num_threads=_THREAD_BUDGET,
+                    inter_op_num_threads=1)
     return _OCR_ENGINE
 
 
@@ -86,7 +95,10 @@ def _ocr_lines(pil_img):
         bg.paste(pil_img, mask=pil_img.split()[-1])
     else:
         bg = pil_img.convert('RGB')
-    result, _elapse = engine(_np.asarray(bg))
+    # Global inference queue (thread_budget): OCR never overlaps a
+    # detection run; callers queue strictly on the one lock.
+    with _INFERENCE_LOCK:
+        result, _elapse = engine(_np.asarray(bg))
     items = []
     if result:
         for box, text, score in result:

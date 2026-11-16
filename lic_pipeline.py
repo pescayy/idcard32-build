@@ -370,6 +370,162 @@ EDGE_REFINE_EDGE_STAGE = False
 EDGE_REFINE_JOINT_STAGE = False
 
 
+# ---------- two-frame formula expansion (2026-11-16, batch 1118) ----------
+# The paper quad is COMPUTED from the detected frame quad, never searched
+# for in the photo (searching was the old expand route's disease: shadows
+# and desk seams pose as paper edges). Construction, calibrated on the
+# 30-photo gold set (~/workspace/idcard-audit/license-twoframe-v2):
+#   sheet dims are implied by the frame dims and the gap fractions
+#   (whole-paper base -- pushing by frame-based amounts was the first
+#   "red frame too small" bug); each DOCUMENT edge line of the frame
+#   quad is offset outward by frac * sheet_dim and the new corners are
+#   the intersections of adjacent offset lines (near-parallel edges
+#   fall back to the averaged-corner push). Push amounts attach to
+#   document edges, not photo edges: the document top edge (the one the
+#   emblem rides on) always takes the top fraction, however the photo
+#   is rotated -- attaching by photo edge cost 6/30 emblem escapes.
+# Fractions: flat-subset medians (top 0.1379 / bot 0.06002 / sides
+# 0.0437+0.04106), then two ying-approved adjustments, both re-measured
+# on all 30: sides aligned to the larger value 0.0437 (corner median
+# 22.2 -> 22.1, no gate change) and the top raised to 0.145 as emblem
+# insurance (worst emblem margin 13.6 -> 22.1 px, corner median 26.4;
+# the 0.152 variant cost corner 36.3 and was rejected).
+PAPER_FRAC = {"top": 0.145, "right": 0.0437, "bot": 0.06002,
+              "left": 0.0437}
+_FQ_CORNERS = [(0, 1), (1, 2), (2, 3), (3, 0)]
+_FQ_SIN_TOL = 0.02
+# Emblem probe geometry on the 2048x1429 template canvas (frame rect
+# (105,220)-(1951,1335); upright emblem centre (1035,223), measured).
+_FQ_CANVAS = (2048, 1429)
+_FQ_FRAME = np.array([[105, 220], [1951, 220], [1951, 1335],
+                      [105, 1335]], np.float32)
+_FQ_EMBLEM_ZONES = [(1035, 223), (1900, 780), (1021, 1332), (160, 770)]
+
+
+def _fq_outward_normal(q, cen, ei):
+    a, b = _FQ_CORNERS[ei]
+    e = q[b] - q[a]
+    n = np.array([-e[1], e[0]], float)
+    n /= np.linalg.norm(n)
+    mid = (q[a] + q[b]) / 2
+    if np.dot(mid - cen, n) < 0:
+        n = -n
+    return n
+
+
+def _fq_push_intersect(q, amounts):
+    """Offset each edge line outward by amounts[ei]; corners are the
+    intersections of adjacent offset lines. Near-parallel adjacent
+    edges fall back to the averaged-corner push for that corner.
+    Returns (quad, n_fallback_corners, min_abs_sin)."""
+    cen = q.mean(axis=0)
+    pts, dirs = [], []
+    for ei in range(4):
+        a, b = _FQ_CORNERS[ei]
+        n = _fq_outward_normal(q, cen, ei)
+        pts.append(q[a] + n * amounts[ei])
+        dirs.append(q[b] - q[a])
+    disp = [_fq_outward_normal(q, cen, ei) * amounts[ei]
+            for ei in range(4)]
+    avg = q.copy()
+    for j in range(4):
+        avg[j] = q[j] + (disp[(j - 1) % 4] + disp[j]) / 2
+    out = q.copy()
+    nfb, min_sin = 0, 1.0
+    for j in range(4):
+        e_prev, e_next = (j - 1) % 4, j
+        d1, d2 = dirs[e_prev], dirs[e_next]
+        cross = d1[0] * d2[1] - d1[1] * d2[0]
+        sinv = abs(cross) / (np.linalg.norm(d1) * np.linalg.norm(d2))
+        min_sin = min(min_sin, float(sinv))
+        if sinv < _FQ_SIN_TOL:
+            out[j] = avg[j]
+            nfb += 1
+            continue
+        rhs = pts[e_next] - pts[e_prev]
+        t = (rhs[0] * d2[1] - rhs[1] * d2[0]) / cross
+        out[j] = pts[e_prev] + t * d1
+    return out, nfb, min_sin
+
+
+def _fq_docorder(geo, top_idx):
+    return np.array([geo[(top_idx + i) % 4] for i in range(4)])
+
+
+def _fq_geoorder(doc, top_idx):
+    out = np.empty((4, 2))
+    for i in range(4):
+        out[(top_idx + i) % 4] = doc[i]
+    return out
+
+
+def emblem_top_edge_index(bgr, frame_quad):
+    """Which geometric edge of the frame quad is the document's top
+    edge (the one the emblem rides on): 0..3, or None when the emblem
+    cannot be located. Warps the frame to the template canvas and
+    looks for the red emblem ink near the four side zones -- the
+    pipeline's own direction evidence (emblem position), the same
+    measurement the gold calibration used."""
+    q = np.asarray(frame_quad, np.float32)
+    H = cv2.getPerspectiveTransform(q, _FQ_FRAME)
+    w = cv2.warpPerspective(bgr, H, _FQ_CANVAS)
+    b, g, r = cv2.split(w.astype(int))
+    red = ((r - b > 25) & (r - g > 15) & (r > 100)).astype(np.uint8)
+    n, _lab, stats, cent = cv2.connectedComponentsWithStats(red, 8)
+    best = None
+    for i in range(1, n):
+        area = int(stats[i][4])
+        if area <= 800:
+            continue
+        # The emblem is a compact disc (~244x268 on this canvas,
+        # squeezed to ~400x150 when the document sits sideways in the
+        # warp); elongated red background objects (folder edges, desk
+        # items) and thin footer strips are not it, however large.
+        bw, bh = int(stats[i][2]), int(stats[i][3])
+        if not (90 <= bw <= 520 and 90 <= bh <= 520
+                and 0.34 <= bw / bh <= 3.0):
+            continue
+        cx, cy = float(cent[i][0]), float(cent[i][1])
+        for zi, (zx, zy) in enumerate(_FQ_EMBLEM_ZONES):
+            dist = ((cx - zx) ** 2 + (cy - zy) ** 2) ** 0.5
+            if dist <= 380 and (best is None or dist < best[0]):
+                best = (dist, zi)
+    return None if best is None else int(best[1])
+
+
+def formula_paper_quad(bgr, frame_quad):
+    """Two-frame formula: paper quad computed from the frame quad.
+    Returns (paper_quad, info); paper_quad is None when the emblem
+    cannot be located (caller falls back to the search route).
+    Flat scans short-circuit exactly like expand_to_paper_edge."""
+    q = np.asarray(frame_quad, float)
+    if is_flat_scan(bgr, q):
+        H, W = bgr.shape[:2]
+        paper = np.array([[0, 0], [W - 1, 0], [W - 1, H - 1],
+                          [0, H - 1]], float)
+        return paper, {"flat_scan": True, "paper_route": "formula",
+                       "skipped_expansion": True}
+    top_idx = emblem_top_edge_index(bgr, q)
+    if top_idx is None:
+        return None, {"paper_route": "formula_no_emblem"}
+    doc = _fq_docorder(q, top_idx)
+    doc_w = (np.linalg.norm(doc[1] - doc[0])
+             + np.linalg.norm(doc[2] - doc[3])) / 2
+    doc_h = (np.linalg.norm(doc[3] - doc[0])
+             + np.linalg.norm(doc[2] - doc[1])) / 2
+    sheet_w = doc_w / (1.0 - PAPER_FRAC["left"] - PAPER_FRAC["right"])
+    sheet_h = doc_h / (1.0 - PAPER_FRAC["top"] - PAPER_FRAC["bot"])
+    amounts = [PAPER_FRAC["top"] * sheet_h,
+               PAPER_FRAC["right"] * sheet_w,
+               PAPER_FRAC["bot"] * sheet_h,
+               PAPER_FRAC["left"] * sheet_w]
+    final_doc, nfb, msin = _fq_push_intersect(doc, amounts)
+    return _fq_geoorder(final_doc, top_idx), {
+        "paper_route": "formula", "formula_top_edge": int(top_idx),
+        "formula_fallback_corners": int(nfb),
+        "formula_min_sin": round(float(msin), 4)}
+
+
 def _process_with_cands(bgr, cands, detector, out_size, tone):
     """The pipeline proper, given pre-detected candidate quads."""
     # Try each candidate quad until one reconciles with the A4 paper edge.
@@ -425,7 +581,30 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
     cands = refined_cands
     for quad, r in cands:
         try:
-            p_try, i_try = expand_to_paper_edge(bgr, quad)
+            # Two-frame formula first (2026-11-16): the paper quad is
+            # computed from the frame quad. Only when the emblem cannot
+            # be located does the candidate fall back to the old
+            # search-the-photo expansion.
+            p_try, i_try = formula_paper_quad(bgr, quad)
+            if p_try is not None and i_try.get("paper_route") == "formula" \
+                    and not i_try.get("flat_scan"):
+                # The computed paper legitimately extends past the
+                # photo's borders when the licence fills the frame
+                # (the true paper edge is simply not in the photo).
+                # Clip the corners into the image (geometry only, no
+                # fabricated pixels) so the framing stage's
+                # out-of-frame guard scores the candidate instead of
+                # voiding it into the emergency fallback.
+                H0, W0 = bgr.shape[:2]
+                q_clip = np.asarray(p_try, float).copy()
+                q_clip[:, 0] = np.clip(q_clip[:, 0], 0, W0 - 1)
+                q_clip[:, 1] = np.clip(q_clip[:, 1], 0, H0 - 1)
+                if not np.allclose(q_clip, p_try):
+                    i_try = dict(i_try)
+                    i_try["formula_clipped"] = True
+                    p_try = q_clip
+            if p_try is None:
+                p_try, i_try = expand_to_paper_edge(bgr, quad)
         except Exception as exc:
             # A degenerate candidate must not kill the photo: log it
             # and let the next candidate try (2026-11-11 douyin n08).
@@ -454,15 +633,23 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
 
     info = dict(info)
     info["edge_refine"] = edge_refine_infos
-    try:
-        paper2, cinfo = converge_corners(bgr, paper)
-    except Exception as exc:
-        # Degenerate paper quad: keep the unconverged quad and let the
-        # framing layer's own validation (and, failing that, the
-        # process_license entry guard) decide the outcome, instead of
-        # throwing the photo away here.
+    formula_route = info.get("paper_route") == "formula"
+    if formula_route:
+        # The formula quad IS the calibrated deliverable; converge
+        # belongs to the search route and would drag it back toward
+        # photo-edge evidence the formula deliberately ignores.
         paper2 = paper
-        cinfo = {"converge_failed": f"{type(exc).__name__}: {exc}"}
+        cinfo = {"skipped": "formula_route"}
+    else:
+        try:
+            paper2, cinfo = converge_corners(bgr, paper)
+        except Exception as exc:
+            # Degenerate paper quad: keep the unconverged quad and let
+            # the framing layer's own validation (and, failing that,
+            # the process_license entry guard) decide the outcome,
+            # instead of throwing the photo away here.
+            paper2 = paper
+            cinfo = {"converge_failed": f"{type(exc).__name__}: {exc}"}
     info = dict(info)
     info["converge_info"] = cinfo
     warp_src = bgr
@@ -474,7 +661,7 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
     bounds_r = None
 
     flat = bool(info.get("flat_scan"))
-    if fallback is None and not flat:
+    if fallback is None and not flat and not formula_route:
         # Local corner refinement (2026-11-12): the converged quad's
         # corners are intersections of two full-length lines descended
         # from the detector's frame chord, and gold-set scoring showed
@@ -517,11 +704,27 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
                         for k in ("top", "bottom", "left", "right"))
             return (1 if _qr_readable(w) else 0), -worst
 
-        fc_q, fc_info = clamp_quad_to_frame((H0, W0), paper2,
-                                            frame_used)
-        info["frame_clamp"] = fc_info
-        te_q, te_info = tighten_edges(bgr, fc_q, frame_used)
-        info["tighten"] = te_info
+        if formula_route:
+            # The formula quad is the calibrated deliverable (same
+            # reasoning as the converge skip): tighten/envelope exist
+            # to repair the search route's uncertainty, and their
+            # evidence is blind to the emblem's pale apex -- on
+            # Image-14-55-30 the tighten arm moved the top edge
+            # 111 px inward and clipped the emblem rim (final margin
+            # -2.8 px) while the formula quad itself held +108.7 px.
+            # The formula candidate still faces the guards below
+            # (out-of-frame void, ink veto with least-cut fallback);
+            # it simply has no rivals.
+            fc_q = te_q = env_q = None
+            info["frame_clamp"] = {"skipped": "formula_route"}
+            info["tighten"] = {"skipped": "formula_route"}
+            info["envelope"] = {"skipped": "formula_route"}
+        else:
+            fc_q, fc_info = clamp_quad_to_frame((H0, W0), paper2,
+                                                frame_used)
+            info["frame_clamp"] = fc_info
+            te_q, te_info = tighten_edges(bgr, fc_q, frame_used)
+            info["tighten"] = te_info
         # The envelope's target margins stay the physical sizes
         # (250/370 output px = 21mm / 31mm on the old 300dpi
         # canvas, scaled with the canvas): the envelope is a
@@ -536,9 +739,10 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
         # the same round -- see SPEC-FIT-RUN.md.
         m_lr = 250.0 * out_w / 3508.0
         m_tb = 370.0 * out_h / 2480.0
-        env_q, env_info = envelope_quad(bgr, frame_used, out_size,
-                                        m_lr=m_lr, m_tb=m_tb)
-        info["envelope"] = env_info
+        if not formula_route:
+            env_q, env_info = envelope_quad(bgr, frame_used, out_size,
+                                            m_lr=m_lr, m_tb=m_tb)
+            info["envelope"] = env_info
 
         # Face-content guard (2026-11-13, emblem diagnosis): measure
         # once where the licence face's own ink reaches on each edge
@@ -563,9 +767,12 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
             _ink, _ext, _oob = _robustify_bounds(*_b[:3])
             bounds_r = (_ink, _ext, _oob, _b[3])
 
-        cands = [("expand", paper2, paper2, 0.0),
-                 ("tighten", te_q, te_q, 0.01)]
-        if bounds_r is not None:
+        if formula_route:
+            cands = [("expand", paper2, paper2, 0.0)]
+        else:
+            cands = [("expand", paper2, paper2, 0.0),
+                     ("tighten", te_q, te_q, 0.01)]
+        if bounds_r is not None and not formula_route:
             g_q, g_counts, g_worst = guard_quad_to_ink(
                 frame_used, bounds_r, te_q)
             info["ink_guard"] = {
@@ -613,7 +820,7 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
 
         for name, q_ret, q_w, pref in cands:
             _consider(name, q_ret, q_w, pref)
-        if env_q is None and (best is None
+        if not formula_route and env_q is None and (best is None
                               or -best[0][1] + 0.02 > 0.25):
             # Both legacy framings leave a heavy dark border and the
             # envelope only just missed feasibility: one last-resort
@@ -672,8 +879,10 @@ def _process_with_cands(bgr, cands, detector, out_size, tone):
             # Every candidate sampled outside the source. Paranoia:
             # clamp_quad_to_frame should make this unreachable. Pull
             # the tighten quad's corners into the frame numerically
-            # (geometry only) rather than print filled pixels.
-            q_clip = te_q.copy()
+            # (geometry only) rather than print filled pixels. The
+            # formula route has no tighten quad; its own quad is the
+            # one to clip.
+            q_clip = (te_q if te_q is not None else paper2).copy()
             q_clip[:, 0] = np.clip(q_clip[:, 0], 0, W0 - 1)
             q_clip[:, 1] = np.clip(q_clip[:, 1], 0, H0 - 1)
             scores["tighten_clipped"] = "fallback"
