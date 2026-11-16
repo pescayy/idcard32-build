@@ -1499,8 +1499,15 @@ class MainWindow(QMainWindow):
         pil = Image.fromarray(np.ascontiguousarray(warped[:, :, ::-1]))
         stem = res.get('_stem', '执照')
         q = res.get('paper_quad')
-        self._lic_quad = ([tuple(map(float, p)) for p in q]
-                          if q is not None else None)
+        self._lic_quad = None
+        if q is not None:
+            geo = [tuple(map(float, p)) for p in q]
+            # 定向：管线回传的 paper_quad 是照片几何序，而它的出图
+            # 已按文档序回正（竖拍/倒拍靠国徽定向）。手动调整若照
+            # 几何序硬套，调整完必然躺倒——在这里先测出文档序的
+            # 旋转量，把种子换成文档序，手动拉正才同样回正。
+            rot = self._lic_doc_rot(self._lic_src_bgr, geo, warped)
+            self._lic_quad = [geo[(rot + i) % 4] for i in range(4)]
         self._lic_mids = None
         self.set_status('营业执照处理完成')
         dlg = PreviewDialog(self, [[(pil, 0.0, 0.0)]],
@@ -1510,6 +1517,27 @@ class MainWindow(QMainWindow):
                             images_mode=True,
                             mark_cb=self._lic_mark_adjust)
         dlg.exec_()
+
+    def _lic_doc_rot(self, bgr, geo, warped):
+        """测文档序旋转量：几何四角循环移位四种里，哪一种透视
+        拉正的结果与管线出图一致，即文档序相对几何序的旋转量。
+        管线出图未调色（tone 关），同四角同变换应逐像素吻合。"""
+        import cv2
+        H, W = warped.shape[:2]
+        dst = np.array([[0, 0], [W - 1, 0], [W - 1, H - 1], [0, H - 1]],
+                       np.float32)
+        ref = cv2.resize(warped, (256, 178)).astype(np.float32)
+        best, best_d = 0, None
+        for r in range(4):
+            cand = np.array([geo[(r + i) % 4] for i in range(4)],
+                            np.float32)
+            Mx = cv2.getPerspectiveTransform(cand, dst)
+            w = cv2.warpPerspective(bgr, Mx, (W, H))
+            d = float(np.abs(cv2.resize(w, (256, 178)).astype(np.float32)
+                             - ref).mean())
+            if best_d is None or d < best_d:
+                best, best_d = r, d
+        return best
 
     def _lic_mark_adjust(self, parent):
         """执照预览窗「调整四角」回调：在原图上拖四角＋边中点拉弧，
