@@ -29,7 +29,7 @@ jobs:
       - name: Stage OCR models
         run: python -c "import rapidocr_onnxruntime,os,shutil; src=os.path.join(os.path.dirname(rapidocr_onnxruntime.__file__),'models'); shutil.copytree(src,'ocr_models'); print(sorted(os.listdir('ocr_models')))"
       - name: Build exe with PyInstaller
-        run: pyinstaller --noconfirm --onedir --windowed --name IDCardProcessor32QN --collect-all tkinterdnd2 --collect-all onnxruntime --collect-all rapidocr_onnxruntime --hidden-import win32print --hidden-import win32ui --hidden-import win32con --hidden-import pywintypes --hidden-import pythoncom --add-data "models/carddetection_scrfd34gkps.onnx;models" --add-data "ocr_models;rapidocr_onnxruntime/models" IDCardProcessor_full.py
+        run: pyinstaller --noconfirm --onedir --windowed --name IDCardProcessor32QN --collect-all tkinterdnd2 --collect-all onnxruntime --collect-all rapidocr-onnxruntime --hidden-import win32print --hidden-import win32ui --hidden-import win32con --hidden-import pywintypes --hidden-import pythoncom --add-data "models/carddetection_scrfd34gkps.onnx;models" --add-data "ocr_models;rapidocr_onnxruntime/models" IDCardProcessor_full.py
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -59,7 +59,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-qt.txt
       - name: Build with PyInstaller (onedir)
-        run: pyinstaller --noconfirm --onedir --windowed --name IDCardMuse --icon icons/app.ico --collect-all onnxruntime --collect-all rapidocr_onnxruntime --exclude-module tkinter --exclude-module _tkinter --exclude-module onnxruntime.transformers --exclude-module onnxruntime.tools --exclude-module onnxruntime.quantization --exclude-module onnxruntime.backend --exclude-module onnxruntime.datasets --hidden-import lic_wedgecut --hidden-import lic_edge_refine --add-data "models/carddetection_scrfd34gkps.onnx;models" --add-data "icons;icons" app_qt.py
+        run: pyinstaller --noconfirm --onedir --windowed --name IDCardMuse --icon icons/app.ico --collect-all onnxruntime --collect-all rapidocr_onnxruntime --exclude-module tkinter --exclude-module _tkinter --exclude-module onnxruntime.transformers --exclude-module onnxruntime.tools --exclude-module onnxruntime.quantization --exclude-module onnxruntime.backend --exclude-module onnxruntime.datasets --add-data "models/carddetection_scrfd34gkps.onnx;models" --add-data "icons;icons" app_qt.py
       - name: Verify onedir layout + slimming gate
         run: |
           Get-ChildItem dist/IDCardMuse | Select-Object Name,Length | Format-Table -AutoSize
@@ -84,7 +84,7 @@ jobs:
           Write-Host "ISCC: $iscc"
           $isl = Join-Path (Split-Path $iscc) "Languages\ChineseSimplified.isl"
           if (-not (Test-Path $isl)) { (Get-Content installer-build.iss -Raw) -replace "(?s)\[Languages\].*", "" | Set-Content installer-build.iss -Encoding UTF8; Write-Host "ChineseSimplified.isl missing; installer will use default language" }
-          & $iscc /DSourceDir="$PWD\dist\IDCardMuse" /DOutDir="$PWD\installer-out" /DOutBase="IDCardMuse-1118-Setup32" /DAppVer="1118" installer-build.iss
+          & $iscc /DSourceDir="$PWD\dist\IDCardMuse" /DOutDir="$PWD\installer-out" /DOutBase="IDCardMuse-1119-Setup32" /DAppVer="1119" installer-build.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
           Get-ChildItem installer-out | Select-Object Name,Length | Format-Table -AutoSize
       - name: Upload installer artifact
@@ -118,7 +118,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-qt.txt
       - name: Build with PyInstaller (onedir)
-        run: pyinstaller --noconfirm --onedir --windowed --name IDCardMuse --icon icons/app.ico --collect-all onnxruntime --collect-all rapidocr_onnxruntime --exclude-module tkinter --exclude-module _tkinter --exclude-module onnxruntime.transformers --exclude-module onnxruntime.tools --exclude-module onnxruntime.quantization --exclude-module onnxruntime.backend --exclude-module onnxruntime.datasets --hidden-import lic_wedgecut --hidden-import lic_edge_refine --add-data "models/carddetection_scrfd34gkps.onnx;models" --add-data "icons;icons" app_qt.py
+        run: pyinstaller --noconfirm --onedir --windowed --name IDCardMuse --icon icons/app.ico --collect-all onnxruntime --collect-all rapidocr_onnxruntime --exclude-module tkinter --exclude-module _tkinter --exclude-module onnxruntime.transformers --exclude-module onnxruntime.tools --exclude-module onnxruntime.quantization --exclude-module onnxruntime.backend --exclude-module onnxruntime.datasets --add-data "models/carddetection_scrfd34gkps.onnx;models" --add-data "icons;icons" app_qt.py
       - name: Verify onedir layout + slimming gate
         run: |
           Get-ChildItem dist/IDCardMuse | Select-Object Name,Length | Format-Table -AutoSize
@@ -137,4 +137,3 @@ jobs:
         with:
           name: IDCardMuse-win64-qt
           path: dist/IDCardMuse
-
