@@ -59,19 +59,27 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-qt.txt
       - name: Build with PyInstaller (onedir)
-        run: pyinstaller --noconfirm --onedir --windowed --name IDCardMuse --icon icons/app.ico --collect-all onnxruntime --collect-all rapidocr_onnxruntime --hidden-import lic_wedgecut --hidden-import lic_edge_refine --add-data "models/carddetection_scrfd34gkps.onnx;models" --add-data "icons;icons" app_qt.py
-      - name: Verify onedir layout
+        run: pyinstaller --noconfirm --onedir --windowed --name IDCardMuse --icon icons/app.ico --collect-all onnxruntime --collect-all rapidocr_onnxruntime --exclude-module tkinter --exclude-module _tkinter --exclude-module onnxruntime.transformers --exclude-module onnxruntime.tools --exclude-module onnxruntime.quantization --exclude-module onnxruntime.backend --exclude-module onnxruntime.datasets --hidden-import lic_wedgecut --hidden-import lic_edge_refine --add-data "models/carddetection_scrfd34gkps.onnx;models" --add-data "icons;icons" app_qt.py
+      - name: Verify onedir layout + slimming gate
         run: |
           Get-ChildItem dist/IDCardMuse | Select-Object Name,Length | Format-Table -AutoSize
           $m = Get-Item dist/IDCardMuse/models/carddetection_scrfd34gkps.onnx
           Write-Host "model bytes next to exe: $($m.Length)"
-          $total = (Get-ChildItem dist/IDCardMuse -Recurse -File | Measure-Object Length -Sum).Sum
+          $files = Get-ChildItem dist/IDCardMuse -Recurse -File
+          $total = ($files | Measure-Object Length -Sum).Sum
           Write-Host "onedir total bytes: $total"
+          Write-Host "onedir file count: $($files.Count)"
+          if (Test-Path dist/IDCardMuse/tcl) { throw "SLIM GATE FAIL: tcl directory present" }
+          if (Test-Path dist/IDCardMuse/tk) { throw "SLIM GATE FAIL: tk directory present" }
+          if (Test-Path dist/IDCardMuse/tcl8) { throw "SLIM GATE FAIL: tcl8 directory present" }
+          if ($files.Count -gt 1000) { throw "SLIM GATE FAIL: file count $($files.Count) over 1000" }
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: IDCardMuse-win7-qt
           path: dist/IDCardMuse
+
+
   build-qt64:
     runs-on: windows-2022
     steps:
@@ -96,16 +104,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-qt.txt
       - name: Build with PyInstaller (onedir)
-        run: pyinstaller --noconfirm --onedir --windowed --name IDCardMuse --icon icons/app.ico --collect-all onnxruntime --collect-all rapidocr_onnxruntime --hidden-import lic_wedgecut --hidden-import lic_edge_refine --add-data "models/carddetection_scrfd34gkps.onnx;models" --add-data "icons;icons" app_qt.py
-      - name: Verify onedir layout
+        run: pyinstaller --noconfirm --onedir --windowed --name IDCardMuse --icon icons/app.ico --collect-all onnxruntime --collect-all rapidocr_onnxruntime --exclude-module tkinter --exclude-module _tkinter --exclude-module onnxruntime.transformers --exclude-module onnxruntime.tools --exclude-module onnxruntime.quantization --exclude-module onnxruntime.backend --exclude-module onnxruntime.datasets --hidden-import lic_wedgecut --hidden-import lic_edge_refine --add-data "models/carddetection_scrfd34gkps.onnx;models" --add-data "icons;icons" app_qt.py
+      - name: Verify onedir layout + slimming gate
         run: |
           Get-ChildItem dist/IDCardMuse | Select-Object Name,Length | Format-Table -AutoSize
           $m = Get-Item dist/IDCardMuse/models/carddetection_scrfd34gkps.onnx
           Write-Host "model bytes next to exe: $($m.Length)"
-          $total = (Get-ChildItem dist/IDCardMuse -Recurse -File | Measure-Object Length -Sum).Sum
+          $files = Get-ChildItem dist/IDCardMuse -Recurse -File
+          $total = ($files | Measure-Object Length -Sum).Sum
           Write-Host "onedir total bytes: $total"
+          Write-Host "onedir file count: $($files.Count)"
+          if (Test-Path dist/IDCardMuse/tcl) { throw "SLIM GATE FAIL: tcl directory present" }
+          if (Test-Path dist/IDCardMuse/tk) { throw "SLIM GATE FAIL: tk directory present" }
+          if (Test-Path dist/IDCardMuse/tcl8) { throw "SLIM GATE FAIL: tcl8 directory present" }
+          if ($files.Count -gt 1000) { throw "SLIM GATE FAIL: file count $($files.Count) over 1000" }
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: IDCardMuse-win64-qt
           path: dist/IDCardMuse
+
