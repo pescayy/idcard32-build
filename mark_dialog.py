@@ -384,14 +384,17 @@ class MarkDialog(QDialog):
 
 
 class LicenseMarkDialog(QDialog):
-    """执照调整四角：拖动四角到纸面边缘，确认后回传四角（原图坐标）。"""
+    """执照调整四角：拖动四角到纸面边缘，确认后回传四角（原图坐标）。
+    弧线默认关：开窗只有四角（日常快调）；纸面卷曲时点「开启弧线
+    调整」才亮出四边中点（橙点），避免平常多管四个点、误拖伤图
+    （2026-11-16 ying 实测反馈后改）。"""
 
     def __init__(self, parent, pil_img, seed_points=None,
                  seed_midpoints=None):
         super().__init__(parent)
         self.result_points = None
         self.result_midpoints = None
-        self.setWindowTitle('调整四角（拖四角对纸边，边中点可拉弧）')
+        self.setWindowTitle('调整四角（拖四角对齐纸边）')
         # 标准窗口钮（同 PreviewDialog 2026-11-15 修法）：QDialog 默认
         # 带上下文帮助「？」钮且无最小化/最大化——改成普通顶层窗口
         # 标志：最小化/最大化/关闭齐全、无问号钮，可最大化后拖角。
@@ -419,11 +422,20 @@ class LicenseMarkDialog(QDialog):
             w, h = iw, ih
             self.canvas.points = [(0.12 * w, 0.12 * h), (0.88 * w, 0.12 * h),
                                   (0.88 * w, 0.88 * h), (0.12 * w, 0.88 * h)]
-        if seed_midpoints and len(seed_midpoints) == 4:
-            self.canvas.midpoints = [tuple(map(float, p))
-                                     for p in seed_midpoints]
-        else:
-            self.canvas.seed_midpoints()
+        # 弧线种子先存下，开启时才挂上画布；带弧种子进来＝上次拉过
+        # 弧，直接以开启态开窗，免得用户以为弧被丢了。
+        self._seed_mids = ([tuple(map(float, p)) for p in seed_midpoints]
+                           if seed_midpoints and len(seed_midpoints) == 4
+                           else None)
+        self.arc_b = QPushButton('开启弧线调整（纸面卷曲时用）')
+        self.arc_b.setFixedHeight(38)
+        self.arc_b.setStyleSheet(
+            'QPushButton { background: #F2F3F5; color: #20242B;'
+            ' border: none; border-radius: 4px; font-size: 18px; }')
+        self.arc_b.clicked.connect(self._toggle_arc)
+        lay.addWidget(self.arc_b)
+        if self._seed_mids is not None:
+            self._toggle_arc()
         confirm_b = QPushButton('✓ 确认标角')
         confirm_b.setFixedHeight(42)
         confirm_b.setStyleSheet(
@@ -432,6 +444,22 @@ class LicenseMarkDialog(QDialog):
         confirm_b.clicked.connect(self._confirm)
         lay.addWidget(confirm_b)
         self.canvas.fit()
+
+    def _toggle_arc(self):
+        """弧线开关：开＝挂上四边中点（有种子用种子，否则各边直线
+        中点起步）；关＝摘掉中点、边恢复直线，已拉的弧暂存种子，
+        再开时回到关前的弧形。"""
+        if self.canvas.midpoints is None:
+            if self._seed_mids is not None:
+                self.canvas.midpoints = [tuple(p) for p in self._seed_mids]
+            else:
+                self.canvas.seed_midpoints()
+            self.arc_b.setText('关闭弧线调整（边恢复直线）')
+        else:
+            self._seed_mids = [tuple(p) for p in self.canvas.midpoints]
+            self.canvas.midpoints = None
+            self.arc_b.setText('开启弧线调整（纸面卷曲时用）')
+        self.canvas.update()
 
     def _confirm(self):
         if len(self.canvas.points) != 4:
